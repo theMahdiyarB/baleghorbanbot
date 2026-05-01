@@ -146,23 +146,39 @@ def main_menu_keyboard():
             ],
             [
                 {"text": "📄 نتایج HTML", "callback_data": "mode_html_search"},
-                {"text": "📑 PDF از صفحه", "callback_data": "mode_pdf"},
+                {"text": "🗜 ZIP آفلاین", "callback_data": "mode_zip"},
             ],
             [
-                {"text": "🗜 آرشیو ZIP آفلاین", "callback_data": "mode_zip"},
-                {"text": "📥 دانلود مخزن GitHub", "callback_data": "mode_github"},
-            ],
-            [
+                {"text": "📥 GitHub دانلود", "callback_data": "mode_github"},
                 {"text": "🌐 ترجمه متن", "callback_data": "mode_translate"},
-                {"text": "🖼 OCR (متن از عکس)", "callback_data": "mode_ocr"},
             ],
             [
+                {"text": "🖼 OCR متن از عکس", "callback_data": "mode_ocr"},
                 {"text": "📚 مقاله علمی", "callback_data": "mode_scholar"},
+            ],
+            [
+                {"text": "📖 ویکی‌پدیا", "callback_data": "mode_wiki"},
                 {"text": "📺 یوتیوب", "callback_data": "mode_youtube"},
             ],
             [
                 {"text": "🎵 دانلود موسیقی MP3", "callback_data": "mode_music"},
                 {"text": "📌 پینترست", "callback_data": "mode_pinterest"},
+            ],
+            [
+                {"text": "🖼 تصاویر گوگل", "callback_data": "mode_gimages"},
+                {"text": "📷 Pexels عکس رایگان", "callback_data": "mode_pexels"},
+            ],
+            [
+                {"text": "💱 تبدیل ارز", "callback_data": "mode_currency"},
+                {"text": "🌐 اطلاعات IP/دامنه", "callback_data": "mode_iplookup"},
+            ],
+            [
+                {"text": "🔗 کوتاه‌سازی لینک", "callback_data": "mode_shorten"},
+                {"text": "🔍 باز کردن لینک کوتاه", "callback_data": "mode_expand"},
+            ],
+            [
+                {"text": "📋 اشتراک‌گذاری متن", "callback_data": "mode_paste"},
+                {"text": "📱 ساخت QR کد", "callback_data": "mode_qr"},
             ],
             [
                 {"text": "📊 اطلاعات کاربری", "callback_data": "stats"},
@@ -546,44 +562,72 @@ def youtube_search(query: str, max_results: int = 8) -> list[dict]:
 
 def youtube_download(url: str, audio_only: bool = False) -> Optional[tuple[bytes, str]]:
     """Download YouTube video/audio, trimming video to fit 50 MB limit."""
+    import shutil
+    ffmpeg_path = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+    ffmpeg_dir = str(Path(ffmpeg_path).parent)
+
     with tempfile.TemporaryDirectory() as tmp:
         out_tpl = os.path.join(tmp, "%(title).60s.%(ext)s")
-        cmd = ["yt-dlp", "--no-playlist", "-o", out_tpl,
-               "--no-warnings", "--no-check-certificate"]
+        base_cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "-o", out_tpl,
+            "--no-warnings",
+            "--no-check-certificate",
+            "--ffmpeg-location", ffmpeg_dir,
+            "--geo-bypass",
+            "--extractor-args", "youtube:player_client=android,web",
+            "--socket-timeout", "30",
+            "--retries", "3",
+        ]
         if audio_only:
-            cmd += [
-                "-x", "--audio-format", "mp3", "--audio-quality", "5",
+            cmd = base_cmd + [
+                "-x",
+                "--audio-format", "mp3",
+                "--audio-quality", "5",
                 "-f", "bestaudio/best",
+                url,
             ]
         else:
-            # Download best mp4 ≤ 720p; fallback to any mp4
-            cmd += [
+            cmd = base_cmd + [
                 "-f",
                 "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]"
                 "/bestvideo[ext=mp4]+bestaudio"
-                "/best[ext=mp4]/best",
+                "/best[ext=mp4]/best[height<=720]/best",
                 "--merge-output-format", "mp4",
+                url,
             ]
-        cmd.append(url)
         try:
-            proc = subprocess.run(cmd, capture_output=True, timeout=180)
+            proc = subprocess.run(cmd, capture_output=True, timeout=240)
+            stderr_text = proc.stderr.decode(errors="replace")
             if proc.returncode != 0:
-                log.error("yt-dlp stderr: %s", proc.stderr.decode(errors="replace")[:500])
-                return None
+                log.error("yt-dlp stderr: %s", stderr_text[:600])
+                # Try fallback with tv_embedded client for geo-restricted videos
+                if "not available in your country" in stderr_text or "geo" in stderr_text.lower():
+                    log.info("Retrying with tv_embedded client…")
+                    cmd2 = [c if c != "android,web" else "android,tv_embedded" for c in cmd]
+                    proc2 = subprocess.run(cmd2, capture_output=True, timeout=240)
+                    if proc2.returncode != 0:
+                        log.error("yt-dlp fallback stderr: %s",
+                                  proc2.stderr.decode(errors="replace")[:400])
+                        return None
+                else:
+                    return None
+
             files = list(Path(tmp).glob("*"))
             if not files:
                 return None
             f = files[0]
             data = f.read_bytes()
 
-            # If video is too large, trim it to fit 49 MB using ffmpeg
+            # Trim oversized videos with ffmpeg
             if not audio_only and len(data) > MAX_FILE_SIZE - 1024 * 1024:
                 log.info("Video too large (%d MB), trimming…", len(data) // 1024 // 1024)
-                trimmed = _trim_video_ffmpeg(f, tmp)
+                trimmed = _trim_video_ffmpeg(f, tmp, ffmpeg_dir)
                 if trimmed:
                     data, f = trimmed
 
-            return data, f.name
+            return data, Path(f).name
         except subprocess.TimeoutExpired:
             log.error("yt-dlp timeout")
             return None
@@ -592,28 +636,27 @@ def youtube_download(url: str, audio_only: bool = False) -> Optional[tuple[bytes
             return None
 
 
-def _trim_video_ffmpeg(src: Path, tmp: str) -> Optional[tuple[bytes, Path]]:
-    """Trim video to ~48 MB using ffmpeg by re-encoding at lower bitrate."""
+def _trim_video_ffmpeg(src: Path, tmp: str, ffmpeg_dir: str = "/usr/bin") -> Optional[tuple[bytes, Path]]:
+    """Re-encode video to fit ~48 MB."""
     out_path = Path(tmp) / ("trimmed_" + src.name)
-    # Target 48 MB total for ~300s; compute bitrate
     target_bytes = 48 * 1024 * 1024
+    ffprobe = str(Path(ffmpeg_dir) / "ffprobe")
+    ffmpeg  = str(Path(ffmpeg_dir) / "ffmpeg")
     try:
-        # Get duration
         probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", str(src)],
             capture_output=True, text=True, timeout=30,
         )
         duration = float(probe.stdout.strip() or "300")
         video_bitrate = max(300, int((target_bytes * 8) / duration / 1000) - 128)
-        ffmpeg_cmd = [
-            "ffmpeg", "-y", "-i", str(src),
-            "-c:v", "libx264", "-b:v", f"{video_bitrate}k",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            str(out_path),
-        ]
-        subprocess.run(ffmpeg_cmd, capture_output=True, timeout=300, check=True)
+        subprocess.run(
+            [ffmpeg, "-y", "-i", str(src),
+             "-c:v", "libx264", "-b:v", f"{video_bitrate}k",
+             "-c:a", "aac", "-b:a", "128k",
+             "-movflags", "+faststart", str(out_path)],
+            capture_output=True, timeout=300, check=True,
+        )
         data = out_path.read_bytes()
         return data, out_path
     except Exception as e:
@@ -698,15 +741,369 @@ def pinterest_search(query: str) -> list[dict]:
             results.append({"url": img_url, "title": query})
             if len(results) >= 12:
                 break
-        return results
+def pinterest_search(query: str) -> list[dict]:
+    """Search Pinterest — tries API, then HTML scrape, then Google Images fallback."""
+    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+          "AppleWebKit/537.36 (KHTML, like Gecko) "
+          "Chrome/122.0.0.0 Safari/537.36")
+
+    def _extract_from_html(text: str) -> list[dict]:
+        seen: set[str] = set()
+        found = []
+        for pattern in [
+            r'"orig":\s*\{"url":"(https://i\.pinimg\.com/[^"]+)"',
+            r'"736x":\s*\{"url":"(https://i\.pinimg\.com/[^"]+)"',
+            r'"(https://i\.pinimg\.com/originals/[^"]+\.(?:jpg|jpeg|png|webp))"',
+            r'"(https://i\.pinimg\.com/736x/[^"]+\.(?:jpg|jpeg|png|webp))"',
+        ]:
+            for u in re.findall(pattern, text):
+                clean = u.replace("\\u002F", "/")
+                if clean not in seen:
+                    seen.add(clean)
+                    found.append({"url": clean, "title": query})
+                if len(found) >= 12:
+                    return found
+        return found
+
+    # Strategy 1: Resource API
+    try:
+        r = requests.get(
+            "https://www.pinterest.com/resource/BaseSearchResource/get/",
+            headers={"User-Agent": UA, "X-Requested-With": "XMLHttpRequest",
+                     "Accept": "application/json", "Referer": "https://www.pinterest.com/"},
+            params={
+                "source_url": f"/search/pins/?q={urllib.parse.quote(query)}",
+                "data": json.dumps({"options": {"query": query, "scope": "pins"}, "context": {}}),
+                "_": str(int(time.time() * 1000)),
+            },
+            timeout=20,
+        )
+        if r.status_code == 200 and r.text.strip().startswith("{"):
+            pins = (r.json().get("resource_response", {}).get("data", {}).get("results", []))
+            results = []
+            for pin in pins:
+                for size in ("orig", "736x", "474x"):
+                    img_url = pin.get("images", {}).get(size, {}).get("url", "")
+                    if img_url:
+                        results.append({"url": img_url, "title": pin.get("title") or query})
+                        break
+                if len(results) >= 12:
+                    break
+            if results:
+                return results
     except Exception as e:
-        log.error("pinterest scrape error: %s", e)
+        log.error("Pinterest API: %s", e)
+
+    # Strategy 2: HTML scrape
+    try:
+        r2 = requests.get(
+            f"https://www.pinterest.com/search/pins/?q={urllib.parse.quote(query)}&rs=typed",
+            headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
+            timeout=25,
+        )
+        results = _extract_from_html(r2.text)
+        if results:
+            return results
+    except Exception as e:
+        log.error("Pinterest HTML: %s", e)
+
+    # Strategy 3: Google Images fallback
+    try:
+        g = google_images_search(f"pinterest {query}", 8)
+        return [{"url": x["img"], "title": query} for x in g if x.get("img")][:8]
+    except Exception as e:
+        log.error("Pinterest Google fallback: %s", e)
         return []
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Stats helpers
+# NEW: Google Images search
 # ══════════════════════════════════════════════════════════════════════════════
+
+def google_images_search(query: str, max_results: int = 8) -> list[dict]:
+    """Scrape Google Images for image URLs."""
+    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+          "AppleWebKit/537.36 (KHTML, like Gecko) "
+          "Chrome/122.0.0.0 Safari/537.36")
+    params = {
+        "q": query, "tbm": "isch", "hl": "fa", "gl": "ir",
+        "safe": "off", "num": str(max_results),
+    }
+    try:
+        r = requests.get("https://www.google.com/search",
+                         params=params,
+                         headers={"User-Agent": UA, "Accept-Language": "fa,en;q=0.9"},
+                         timeout=20)
+        text = r.text
+        # Extract image data from Google's JSON blobs
+        raw_imgs = re.findall(r'\["(https://[^"]+\.(?:jpg|jpeg|png|webp|gif))",[0-9]+,[0-9]+\]', text)
+        results = []
+        seen: set[str] = set()
+        for img_url in raw_imgs:
+            if img_url in seen or "google" in img_url:
+                continue
+            seen.add(img_url)
+            results.append({"img": img_url, "title": query})
+            if len(results) >= max_results:
+                break
+        # Second pattern if first returns nothing
+        if not results:
+            for m in re.finditer(r'"ou":"(https://[^"]+)"', text):
+                u = m.group(1)
+                if u not in seen:
+                    seen.add(u)
+                    results.append({"img": u, "title": query})
+                if len(results) >= max_results:
+                    break
+        return results
+    except Exception as e:
+        log.error("google_images error: %s", e)
+        return []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEW: Pexels (free stock photos)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def pexels_search(query: str, per_page: int = 8) -> list[dict]:
+    """Search Pexels free stock photos by scraping (no API key needed)."""
+    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+          "AppleWebKit/537.36 (KHTML, like Gecko) "
+          "Chrome/122.0.0.0 Safari/537.36")
+    try:
+        r = requests.get(
+            f"https://www.pexels.com/search/{urllib.parse.quote(query)}/",
+            headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
+            timeout=20,
+        )
+        soup = BeautifulSoup(r.text, "html.parser")
+        results = []
+        for img_tag in soup.select("img[srcset], img[src]")[:per_page * 3]:
+            # Pexels uses srcset — grab the largest
+            srcset = img_tag.get("srcset", "")
+            src = img_tag.get("src", "")
+            img_url = ""
+            if srcset:
+                parts = [p.strip().split(" ")[0] for p in srcset.split(",") if p.strip()]
+                img_url = parts[-1] if parts else src
+            else:
+                img_url = src
+            if not img_url or "data:" in img_url:
+                continue
+            if not img_url.startswith("http"):
+                img_url = "https://www.pexels.com" + img_url
+            alt = img_tag.get("alt", query)
+            results.append({"url": img_url, "title": alt})
+            if len(results) >= per_page:
+                break
+        return results
+    except Exception as e:
+        log.error("pexels_search error: %s", e)
+        return []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEW: Wikipedia
+# ══════════════════════════════════════════════════════════════════════════════
+
+def wikipedia_search(query: str, lang: str = "fa") -> list[dict]:
+    """Search Wikipedia and return list of matching articles."""
+    try:
+        r = requests.get(
+            f"https://{lang}.wikipedia.org/w/api.php",
+            params={
+                "action": "search", "list": "search", "srsearch": query,
+                "srlimit": 8, "format": "json", "utf8": 1,
+            },
+            headers={"User-Agent": "BaleWebBot/1.0"},
+            timeout=15,
+        )
+        data = r.json()
+        results = []
+        for item in data.get("query", {}).get("search", []):
+            results.append({
+                "title": item["title"],
+                "snippet": BeautifulSoup(item.get("snippet", ""), "html.parser").get_text(),
+                "url": f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(item['title'].replace(' ', '_'))}",
+            })
+        return results
+    except Exception as e:
+        log.error("wikipedia_search error: %s", e)
+        return []
+
+
+def wikipedia_article(title: str, lang: str = "fa") -> Optional[str]:
+    """Get full plain-text of a Wikipedia article."""
+    try:
+        r = requests.get(
+            f"https://{lang}.wikipedia.org/w/api.php",
+            params={
+                "action": "query", "titles": title,
+                "prop": "extracts", "exintro": 0, "explaintext": 1,
+                "format": "json", "utf8": 1,
+            },
+            headers={"User-Agent": "BaleWebBot/1.0"},
+            timeout=20,
+        )
+        pages = r.json().get("query", {}).get("pages", {})
+        for page in pages.values():
+            return page.get("extract", "")
+        return None
+    except Exception as e:
+        log.error("wikipedia_article error: %s", e)
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEW: Currency converter (using free exchange API)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def currency_convert(amount: float, from_cur: str, to_cur: str) -> Optional[str]:
+    """Convert currency using exchangerate.host (free)."""
+    try:
+        r = requests.get(
+            "https://api.exchangerate.host/convert",
+            params={"from": from_cur.upper(), "to": to_cur.upper(), "amount": amount},
+            timeout=15,
+        )
+        data = r.json()
+        if data.get("success"):
+            result = data["result"]
+            return f"{amount:,.2f} {from_cur.upper()} = {result:,.2f} {to_cur.upper()}"
+    except Exception as e:
+        log.error("currency error: %s", e)
+    # Fallback: try frankfurter
+    try:
+        r2 = requests.get(
+            f"https://api.frankfurter.app/latest?from={from_cur.upper()}&to={to_cur.upper()}",
+            timeout=15,
+        )
+        data2 = r2.json()
+        rate = data2.get("rates", {}).get(to_cur.upper())
+        if rate:
+            result = amount * rate
+            return f"{amount:,.2f} {from_cur.upper()} = {result:,.4f} {to_cur.upper()}"
+    except Exception as e:
+        log.error("currency fallback error: %s", e)
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEW: IP / website info lookup
+# ══════════════════════════════════════════════════════════════════════════════
+
+def ip_lookup(target: str) -> str:
+    """Look up IP or domain info."""
+    try:
+        # Resolve domain to IP if needed
+        ip = target.strip()
+        if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
+            import socket
+            ip = socket.gethostbyname(ip)
+        r = requests.get(f"https://ipapi.co/{ip}/json/", timeout=15)
+        d = r.json()
+        if d.get("error"):
+            return "❌ اطلاعاتی یافت نشد."
+        lines = [
+            f"🌐 *اطلاعات IP: {ip}*\n",
+            f"🏳 کشور: {d.get('country_name', '—')} ({d.get('country_code', '')})",
+            f"🏙 شهر: {d.get('city', '—')} / {d.get('region', '—')}",
+            f"📡 اپراتور: {d.get('org', '—')}",
+            f"🕐 منطقه زمانی: {d.get('timezone', '—')}",
+            f"📍 مختصات: {d.get('latitude', '—')}, {d.get('longitude', '—')}",
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        log.error("ip_lookup error: %s", e)
+        return "❌ خطا در جستجوی IP."
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEW: URL shortener / expander
+# ══════════════════════════════════════════════════════════════════════════════
+
+def shorten_url(long_url: str) -> str:
+    """Shorten URL using TinyURL (no auth needed)."""
+    try:
+        r = requests.get(
+            f"https://tinyurl.com/api-create.php?url={urllib.parse.quote(long_url)}",
+            timeout=15,
+        )
+        if r.status_code == 200 and r.text.startswith("http"):
+            return r.text.strip()
+        return "❌ خطا در کوتاه‌سازی لینک."
+    except Exception as e:
+        log.error("shorten_url error: %s", e)
+        return "❌ خطا در کوتاه‌سازی لینک."
+
+
+def expand_url(short_url: str) -> str:
+    """Follow redirects to find the final URL."""
+    try:
+        r = requests.head(short_url, allow_redirects=True, timeout=15)
+        final = r.url
+        hops = len(r.history)
+        return f"🔗 لینک نهایی:\n{final}\n\n_(تعداد ریدایرکت: {hops})_"
+    except Exception as e:
+        log.error("expand_url error: %s", e)
+        return "❌ خطا در بازکردن لینک."
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEW: Pastebin-style text share via paste.rs (free, no auth)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def paste_text(content: str) -> Optional[str]:
+    """Upload text to paste.rs and return public URL."""
+    try:
+        r = requests.post(
+            "https://paste.rs/",
+            data=content.encode("utf-8"),
+            headers={"Content-Type": "text/plain"},
+            timeout=15,
+        )
+        if r.status_code in (200, 201) and r.text.startswith("http"):
+            return r.text.strip()
+        return None
+    except Exception as e:
+        log.error("paste_text error: %s", e)
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEW: QR Code generator
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_qr(text: str) -> Optional[bytes]:
+    """Generate a QR code image for the given text."""
+    try:
+        import qrcode  # type: ignore
+        qr = qrcode.QRCode(version=1, box_size=10, border=4)
+        qr.add_data(text)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        return buf.read()
+    except ImportError:
+        # Fallback: use online API
+        try:
+            r = requests.get(
+                f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={urllib.parse.quote(text)}",
+                timeout=15,
+            )
+            if r.status_code == 200:
+                return r.content
+        except Exception:
+            pass
+        return None
+    except Exception as e:
+        log.error("generate_qr error: %s", e)
+        return None
+
+
+
 
 def init_user(chat_id: int):
     if chat_id not in user_stats:
@@ -746,41 +1143,26 @@ def stats_text(chat_id: int) -> str:
 
 HELP_TEXT = """❓ *راهنمای دستیار وب*
 
-🔎 *جستجو در وب*
-کلمه یا عبارت مورد نظر را تایپ کنید — تا ۱۰ نتیجه با عنوان و لینک می‌گیرید.
-
-📄 *نتایج HTML*
-همان جستجو ولی به‌صورت فایل HTML که می‌توانید ذخیره کنید.
-
-🌐 *باز کردن سایت*
-آدرس URL وارد کنید تا محتوای صفحه دریافت شود.
-
-📑 *PDF از صفحه*
-آدرس URL وارد کنید — یک فایل HTML از صفحه می‌گیرید.
-
-🗜 *ZIP آفلاین*
-آدرس URL وارد کنید — صفحه + منابع آن در قالب ZIP.
-
-📥 *GitHub*
-لینک مخزن GitHub بدهید — ZIP کل مخزن دانلود می‌شود.
-
-🌐 *ترجمه*
-زبان مقصد را انتخاب کنید، سپس متن را ارسال کنید.
-
-🖼 *OCR*
-عکس حاوی متن ارسال کنید یا روی عکس /ocr بفرستید.
-
-📚 *مقاله علمی*
-عنوان یا کلمه‌کلیدی مقاله را جستجو کنید.
-
-📺 *یوتیوب*
-لینک ویدیو برای دانلود یا کلمه برای جستجو وارد کنید.
-
-🎵 *موسیقی MP3*
-نام آهنگ یا آرتیست — اولین نتیجه یوتیوب را MP3 دانلود می‌کند.
-
-📌 *پینترست*
-کلمه کلیدی — تصاویر از پینترست می‌گیرید."""
+🔎 *جستجو در وب* — تا ۱۰ نتیجه از DuckDuckGo با صفحه‌بندی
+📄 *نتایج HTML* — نتایج جستجو به فایل HTML
+🌐 *باز کردن سایت* — دریافت متن و HTML هر صفحه
+🗜 *ZIP آفلاین* — صفحه + منابع در قالب ZIP
+📥 *GitHub* — دانلود کل مخزن به ZIP
+🌐 *ترجمه* — ۶ زبان، پشتیبانی از متن طولانی
+🖼 *OCR* — استخراج متن از عکس + PDF
+📚 *مقاله علمی* — جستجو Google Scholar با صفحه‌بندی
+📖 *ویکی‌پدیا* — جستجو و خواندن مقاله (فارسی/انگلیسی)
+📺 *یوتیوب* — دانلود ویدیو یا جستجو
+🎵 *موسیقی MP3* — دانلود MP3 از یوتیوب
+📌 *پینترست* — جستجو و دانلود تصاویر
+🖼 *تصاویر گوگل* — جستجو و دانلود عکس از گوگل
+📷 *Pexels* — عکس‌های رایگان با کیفیت بالا
+💱 *تبدیل ارز* — نرخ روز (مثال: 100 USD to IRR)
+🌐 *IP/دامنه* — اطلاعات موقعیت و اپراتور
+🔗 *کوتاه‌سازی لینک* — با TinyURL
+🔍 *بازکردن لینک کوتاه* — یافتن URL اصلی
+📋 *اشتراک متن* — آپلود متن و گرفتن لینک
+📱 *QR کد* — ساخت QR از هر متن یا لینک"""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -930,6 +1312,15 @@ def handle_callback(cb: dict):
         "mode_scholar":    ("scholar",         "📚 عنوان یا کلمه‌کلیدی مقاله را بنویسید:"),
         "mode_music":      ("music",           "🎵 نام آهنگ یا آرتیست را بنویسید:"),
         "mode_pinterest":  ("pinterest",       "📌 کلمه کلیدی برای جستجو در پینترست:"),
+        "mode_gimages":    ("gimages",         "🖼 کلمه کلیدی برای جستجوی تصاویر گوگل:"),
+        "mode_pexels":     ("pexels",          "📷 کلمه کلیدی برای جستجو در Pexels:"),
+        "mode_currency":   ("currency",        "💱 تبدیل ارز را وارد کنید:\nمثال: 100 USD to IRR\nیا: 50 EUR to USD"),
+        "mode_iplookup":   ("iplookup",        "🌐 آدرس IP یا دامنه را وارد کنید:\nمثال: 8.8.8.8 یا google.com"),
+        "mode_shorten":    ("shorten",         "🔗 لینک بلند را برای کوتاه‌سازی وارد کنید:"),
+        "mode_expand":     ("expand",          "🔍 لینک کوتاه را برای بازکردن وارد کنید:"),
+        "mode_paste":      ("paste",           "📋 متن مورد نظر برای اشتراک‌گذاری را ارسال کنید:"),
+        "mode_qr":         ("qr",              "📱 متن یا لینک مورد نظر برای ساخت QR کد را وارد کنید:"),
+        "mode_wiki":       ("wiki",            "📖 موضوع مورد نظر را برای جستجو در ویکی‌پدیا بنویسید:"),
     }
 
     if data in mode_map:
