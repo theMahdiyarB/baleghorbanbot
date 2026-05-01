@@ -178,6 +178,20 @@ def cancel_keyboard():
     }
 
 
+def pagination_keyboard(prev_cb: str, next_cb: str, page: int, has_next: bool) -> dict:
+    """Generic prev/next keyboard."""
+    row = []
+    if page > 0:
+        row.append({"text": "◀️ صفحه قبل", "callback_data": prev_cb})
+    if has_next:
+        row.append({"text": "صفحه بعد ▶️", "callback_data": next_cb})
+    buttons = []
+    if row:
+        buttons.append(row)
+    buttons.append([{"text": "🏠 منوی اصلی", "callback_data": "cancel"}])
+    return {"inline_keyboard": buttons}
+
+
 def translate_keyboard():
     langs = [
         ("🇮🇷 فارسی", "fa"), ("🇬🇧 انگلیسی", "en"),
@@ -212,47 +226,91 @@ def youtube_keyboard():
 # Feature implementations
 # ══════════════════════════════════════════════════════════════════════════════
 
-def web_search(query: str, max_results: int = 10) -> list[dict]:
-    """DuckDuckGo HTML scrape."""
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; BaleBot/1.0)"}
-    url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
+def web_search(query: str, max_results: int = 10, page: int = 0) -> list[dict]:
+    """DuckDuckGo HTML scrape with page support."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "fa,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    # DDG paginates with &s= offset (multiples of 30) via POST
+    data = {"q": query, "b": "", "kl": "ir-fa"}
+    if page > 0:
+        data["s"] = str(page * 30)
+        data["dc"] = str(page * 30 + 1)
+        data["v"] = "l"
+        data["o"] = "json"
+        data["nextParams"] = ""
     try:
-        r = requests.get(url, headers=headers, timeout=15)
+        r = requests.post(
+            "https://html.duckduckgo.com/html/",
+            data=data,
+            headers=headers,
+            timeout=20,
+        )
         soup = BeautifulSoup(r.text, "html.parser")
         results = []
-        for a in soup.select("a.result__a")[:max_results]:
-            href = a.get("href", "")
-            # DuckDuckGo wraps URLs
+        # Try multiple selector patterns DDG uses
+        for div in soup.select(".result, .web-result")[:max_results + 5]:
+            title_tag = div.select_one(".result__title a, .result__a, h2 a")
+            if not title_tag:
+                continue
+            href = title_tag.get("href", "")
+            # DDG wraps real URL in uddg= param
             m = re.search(r"uddg=([^&]+)", href)
             link = urllib.parse.unquote(m.group(1)) if m else href
-            results.append({"title": a.get_text(strip=True), "link": link})
+            if not link.startswith("http"):
+                continue
+            snippet_tag = div.select_one(".result__snippet, .result__body")
+            snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
+            results.append({
+                "title": title_tag.get_text(strip=True),
+                "link": link,
+                "snippet": snippet,
+            })
+            if len(results) >= max_results:
+                break
         return results
     except Exception as e:
         log.error("web_search error: %s", e)
         return []
 
 
-def search_to_html(query: str) -> bytes:
-    results = web_search(query, 10)
+def search_to_html(query: str, page: int = 0) -> bytes:
+    results = web_search(query, 10, page)
     rows = ""
-    for i, r in enumerate(results, 1):
-        rows += f'<tr><td>{i}</td><td><a href="{r["link"]}" target="_blank">{r["title"]}</a></td></tr>\n'
+    if not results:
+        rows = '<tr><td colspan="3" style="text-align:center;color:#999">نتیجه‌ای یافت نشد</td></tr>'
+    for i, r in enumerate(results, page * 10 + 1):
+        snippet = r.get("snippet", "")
+        rows += (
+            f'<tr><td style="width:30px;text-align:center">{i}</td>'
+            f'<td><a href="{r["link"]}" target="_blank">{r["title"]}</a>'
+            f'{"<br><small style=color:#666>" + snippet + "</small>" if snippet else ""}</td></tr>\n'
+        )
+    page_info = f"صفحه {page + 1}" if page > 0 else "صفحه ۱"
     html = f"""<!DOCTYPE html>
 <html dir="rtl" lang="fa">
 <head><meta charset="utf-8"><title>نتایج: {query}</title>
 <style>
-  body{{font-family:Tahoma,sans-serif;padding:20px;background:#f9f9f9}}
-  h2{{color:#333}}
-  table{{width:100%;border-collapse:collapse}}
-  th{{background:#4a90d9;color:#fff;padding:8px}}
-  td{{padding:8px;border-bottom:1px solid #ddd}}
-  a{{color:#1a0dab;text-decoration:none}}
+  body{{font-family:Tahoma,Arial,sans-serif;padding:20px;background:#f9f9f9;direction:rtl}}
+  h2{{color:#333;font-size:18px}}
+  table{{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.1)}}
+  th{{background:#4a90d9;color:#fff;padding:10px 14px;text-align:right}}
+  td{{padding:10px 14px;border-bottom:1px solid #eee;vertical-align:top}}
+  tr:last-child td{{border-bottom:none}}
+  tr:hover td{{background:#f0f7ff}}
+  a{{color:#1a0dab;text-decoration:none;font-weight:bold}}
   a:hover{{text-decoration:underline}}
+  small{{font-size:12px;line-height:1.5;display:block;margin-top:4px}}
+  .meta{{color:#888;font-size:12px;margin-top:2px}}
 </style>
 </head>
 <body>
-<h2>🔎 نتایج جستجو برای: {query}</h2>
-<p>تاریخ: {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
+<h2>🔎 نتایج جستجو برای: <em>{query}</em> — {page_info}</h2>
+<p style="color:#888;font-size:13px">تاریخ: {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
 <table><tr><th>#</th><th>عنوان و لینک</th></tr>
 {rows}
 </table>
@@ -261,12 +319,30 @@ def search_to_html(query: str) -> bytes:
 
 
 def fetch_page(url: str) -> Optional[bytes]:
-    """Fetch raw HTML of a page."""
+    """Fetch raw HTML of a page with proper browser headers."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "fa,en-US;q=0.7,en;q=0.3",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; BaleBot/1.0)"}
-        r = requests.get(url, headers=headers, timeout=20)
+        r = requests.get(url, headers=headers, timeout=25,
+                         allow_redirects=True, verify=True)
         r.raise_for_status()
         return r.content
+    except requests.exceptions.SSLError:
+        try:
+            r = requests.get(url, headers=headers, timeout=25,
+                             allow_redirects=True, verify=False)
+            return r.content
+        except Exception as e:
+            log.error("fetch_page SSL fallback error: %s", e)
+            return None
     except Exception as e:
         log.error("fetch_page error: %s", e)
         return None
@@ -318,20 +394,55 @@ def github_zip(repo_url: str) -> Optional[bytes]:
 
 
 def translate_text(text: str, target: str, source: str = "auto") -> str:
-    """Translate using MyMemory API (free, no key needed)."""
-    pair = f"{source}|{target}" if source != "auto" else f"en|{target}"
-    # Detect if Persian to translate to English
+    """Translate using MyMemory API, handling long texts and HTML entities."""
+    import html as html_mod
     has_persian = bool(re.search(r'[\u0600-\u06FF]', text))
     if source == "auto":
-        pair = f"{'fa' if has_persian else 'en'}|{target}"
-    try:
-        url = "https://api.mymemory.translated.net/get"
-        r = requests.get(url, params={"q": text[:500], "langpair": pair}, timeout=15)
-        data = r.json()
-        return data["responseData"]["translatedText"]
-    except Exception as e:
-        log.error("translate error: %s", e)
-        return "❌ خطا در ترجمه."
+        source = "fa" if has_persian else "en"
+    if source == target:
+        return text  # nothing to do
+
+    # MyMemory max 500 chars per request — split on sentences
+    def _translate_chunk(chunk: str) -> str:
+        pair = f"{source}|{target}"
+        try:
+            r = requests.get(
+                "https://api.mymemory.translated.net/get",
+                params={"q": chunk, "langpair": pair},
+                timeout=20,
+            )
+            data = r.json()
+            translated = data["responseData"]["translatedText"]
+            # Unescape HTML entities (&#10; → \n, &amp; → & etc.)
+            return html_mod.unescape(translated)
+        except Exception as e:
+            log.error("translate chunk error: %s", e)
+            return chunk  # return original on failure
+
+    # Split into ≤500-char chunks on newlines/sentences
+    MAX_CHUNK = 490
+    chunks = []
+    current = ""
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 <= MAX_CHUNK:
+            current = (current + "\n" + line).lstrip("\n")
+        else:
+            if current:
+                chunks.append(current)
+            # If a single line is too long, split on ". "
+            while len(line) > MAX_CHUNK:
+                chunks.append(line[:MAX_CHUNK])
+                line = line[MAX_CHUNK:]
+            current = line
+    if current:
+        chunks.append(current)
+
+    translated_parts = []
+    for chunk in chunks:
+        translated_parts.append(_translate_chunk(chunk))
+        time.sleep(0.3)  # be polite to free API
+
+    return "\n".join(translated_parts)
 
 
 def ocr_image(img_bytes: bytes) -> str:
@@ -346,37 +457,54 @@ def ocr_image(img_bytes: bytes) -> str:
         return "❌ خطا در پردازش تصویر."
 
 
-def ocr_to_pdf(text: str, original_filename: str = "ocr") -> bytes:
-    """Wrap OCR text in a simple PDF."""
+def ocr_to_pdf(text: str) -> bytes:
+    """Wrap OCR text in a PDF using updated fpdf2 API."""
     from fpdf import FPDF
+    from fpdf.enums import XPos, YPos
     pdf = FPDF()
+    pdf.set_margins(15, 15, 15)
     pdf.add_page()
-    # Use built-in font (no Persian support without custom font, but keeps it simple)
-    pdf.set_font("Helvetica", size=12)
-    pdf.set_right_margin(10)
-    pdf.set_left_margin(10)
+    pdf.set_font("Helvetica", size=11)
     for line in text.split("\n"):
-        try:
-            pdf.cell(0, 8, txt=line, ln=True)
-        except Exception:
-            pdf.cell(0, 8, txt=line.encode("latin-1", "replace").decode("latin-1"), ln=True)
-    return pdf.output(dest="S").encode("latin-1")
+        # Sanitize to latin-1 for built-in font (OCR text may have odd chars)
+        safe_line = line.encode("latin-1", errors="replace").decode("latin-1")
+        pdf.cell(
+            0, 8,
+            text=safe_line,
+            new_x=XPos.LMARGIN,
+            new_y=YPos.NEXT,
+        )
+    # fpdf2 output() returns bytearray
+    result = pdf.output()
+    return bytes(result)
 
 
-def scholar_search(query: str) -> list[dict]:
-    """Search Google Scholar via scraping."""
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; BaleBot/1.0)"}
-    url = f"https://scholar.google.com/scholar?q={urllib.parse.quote(query)}&hl=fa&num=10"
+def scholar_search(query: str, page: int = 0) -> list[dict]:
+    """Search Google Scholar via scraping with page support."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    start = page * 10
+    url = (
+        f"https://scholar.google.com/scholar"
+        f"?q={urllib.parse.quote(query)}&hl=en&num=10&start={start}"
+    )
     try:
-        r = requests.get(url, headers=headers, timeout=15)
+        r = requests.get(url, headers=headers, timeout=20)
         soup = BeautifulSoup(r.text, "html.parser")
         results = []
-        for div in soup.select(".gs_ri")[:8]:
+        for div in soup.select(".gs_ri"):
             title_tag = div.select_one(".gs_rt a")
-            snippet_tag = div.select_one(".gs_rs")
-            meta_tag = div.select_one(".gs_a")
+            if not title_tag:
+                # Try h3 > a
+                title_tag = div.select_one("h3 a")
             if not title_tag:
                 continue
+            snippet_tag = div.select_one(".gs_rs")
+            meta_tag = div.select_one(".gs_a")
             results.append({
                 "title": title_tag.get_text(strip=True),
                 "link": title_tag.get("href", ""),
@@ -416,52 +544,163 @@ def youtube_search(query: str, max_results: int = 8) -> list[dict]:
         return []
 
 
-def youtube_download(url: str, audio_only: bool = False,
-                     quality: str = "best[filesize<50M]") -> Optional[tuple[bytes, str]]:
-    """Download YouTube video/audio. Returns (bytes, filename)."""
+def youtube_download(url: str, audio_only: bool = False) -> Optional[tuple[bytes, str]]:
+    """Download YouTube video/audio, trimming video to fit 50 MB limit."""
     with tempfile.TemporaryDirectory() as tmp:
-        out_tpl = os.path.join(tmp, "%(title)s.%(ext)s")
-        cmd = ["yt-dlp", "--no-playlist", "-o", out_tpl, "--no-warnings"]
+        out_tpl = os.path.join(tmp, "%(title).60s.%(ext)s")
+        cmd = ["yt-dlp", "--no-playlist", "-o", out_tpl,
+               "--no-warnings", "--no-check-certificate"]
         if audio_only:
-            cmd += ["-x", "--audio-format", "mp3",
-                    "--audio-quality", "192K",
-                    "-f", "bestaudio"]
+            cmd += [
+                "-x", "--audio-format", "mp3", "--audio-quality", "5",
+                "-f", "bestaudio/best",
+            ]
         else:
-            cmd += ["-f", "bestvideo[ext=mp4][filesize<45M]+bestaudio[ext=m4a]/best[ext=mp4][filesize<45M]/best"]
+            # Download best mp4 ≤ 720p; fallback to any mp4
+            cmd += [
+                "-f",
+                "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]"
+                "/bestvideo[ext=mp4]+bestaudio"
+                "/best[ext=mp4]/best",
+                "--merge-output-format", "mp4",
+            ]
         cmd.append(url)
         try:
-            subprocess.run(cmd, capture_output=True, timeout=120, check=True)
+            proc = subprocess.run(cmd, capture_output=True, timeout=180)
+            if proc.returncode != 0:
+                log.error("yt-dlp stderr: %s", proc.stderr.decode(errors="replace")[:500])
+                return None
             files = list(Path(tmp).glob("*"))
             if not files:
                 return None
             f = files[0]
             data = f.read_bytes()
+
+            # If video is too large, trim it to fit 49 MB using ffmpeg
+            if not audio_only and len(data) > MAX_FILE_SIZE - 1024 * 1024:
+                log.info("Video too large (%d MB), trimming…", len(data) // 1024 // 1024)
+                trimmed = _trim_video_ffmpeg(f, tmp)
+                if trimmed:
+                    data, f = trimmed
+
             return data, f.name
+        except subprocess.TimeoutExpired:
+            log.error("yt-dlp timeout")
+            return None
         except Exception as e:
             log.error("yt-dlp error: %s", e)
             return None
 
 
-def pinterest_search(query: str) -> list[dict]:
-    """Search Pinterest images."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; BaleBot/1.0)",
-        "Accept": "application/json",
-    }
-    url = f"https://www.pinterest.com/search/pins/?q={urllib.parse.quote(query)}&rs=typed"
+def _trim_video_ffmpeg(src: Path, tmp: str) -> Optional[tuple[bytes, Path]]:
+    """Trim video to ~48 MB using ffmpeg by re-encoding at lower bitrate."""
+    out_path = Path(tmp) / ("trimmed_" + src.name)
+    # Target 48 MB total for ~300s; compute bitrate
+    target_bytes = 48 * 1024 * 1024
     try:
-        r = requests.get(url, headers=headers, timeout=15)
-        # Extract image URLs from JSON blobs in page source
-        matches = re.findall(r'"orig":\{"url":"([^"]+)"', r.text)
+        # Get duration
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(src)],
+            capture_output=True, text=True, timeout=30,
+        )
+        duration = float(probe.stdout.strip() or "300")
+        video_bitrate = max(300, int((target_bytes * 8) / duration / 1000) - 128)
+        ffmpeg_cmd = [
+            "ffmpeg", "-y", "-i", str(src),
+            "-c:v", "libx264", "-b:v", f"{video_bitrate}k",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            str(out_path),
+        ]
+        subprocess.run(ffmpeg_cmd, capture_output=True, timeout=300, check=True)
+        data = out_path.read_bytes()
+        return data, out_path
+    except Exception as e:
+        log.error("ffmpeg trim error: %s", e)
+        return None
+
+
+def pinterest_search(query: str) -> list[dict]:
+    """Search Pinterest images using their visual search API."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*, q=0.01",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.pinterest.com/",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    # Pinterest resource API
+    params = {
+        "source_url": f"/search/pins/?q={urllib.parse.quote(query)}&rs=typed",
+        "data": json.dumps({
+            "options": {
+                "query": query,
+                "scope": "pins",
+                "no_fetch_context_on_resource": False,
+            },
+            "context": {},
+        }),
+    }
+    try:
+        r = requests.get(
+            "https://www.pinterest.com/resource/BaseSearchResource/get/",
+            headers=headers,
+            params=params,
+            timeout=20,
+        )
+        data = r.json()
+        pins = (
+            data.get("resource_response", {})
+                .get("data", {})
+                .get("results", [])
+        )
         results = []
+        for pin in pins:
+            imgs = pin.get("images", {})
+            # Prefer "orig" then "736x"
+            for size in ("orig", "736x", "474x"):
+                img = imgs.get(size, {})
+                url_val = img.get("url", "")
+                if url_val:
+                    results.append({"url": url_val,
+                                    "title": pin.get("title") or pin.get("description") or query})
+                    break
+            if len(results) >= 12:
+                break
+        if results:
+            return results
+    except Exception as e:
+        log.error("pinterest API error: %s", e)
+
+    # Fallback: scrape page HTML for image URLs
+    try:
+        r2 = requests.get(
+            f"https://www.pinterest.com/search/pins/?q={urllib.parse.quote(query)}&rs=typed",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/122.0.0.0 Safari/537.36",
+            },
+            timeout=20,
+        )
+        # Extract CDN image urls from page JSON blobs
+        matches = re.findall(r'"url":"(https://i\.pinimg\.com/[^"]+)"', r2.text)
         seen = set()
-        for img_url in matches[:12]:
-            if img_url not in seen:
-                seen.add(img_url)
-                results.append({"url": img_url})
+        results = []
+        for img_url in matches:
+            # Prefer larger images (736x or originals)
+            if img_url in seen:
+                continue
+            seen.add(img_url)
+            results.append({"url": img_url, "title": query})
+            if len(results) >= 12:
+                break
         return results
     except Exception as e:
-        log.error("pinterest error: %s", e)
+        log.error("pinterest scrape error: %s", e)
         return []
 
 
@@ -737,32 +976,73 @@ def handle_callback(cb: dict):
         send_message(chat_id, "🔍 کلمه جستجو برای یوتیوب:", reply_markup=cancel_keyboard())
         return
 
+    # ── Pagination callbacks ──────────────────────────────────────────────
+    # Format: search_next_2  /  search_prev_2  /  scholar_next_1  etc.
+    pag_match = re.match(r"(search|hsearch|scholar)_(next|prev)_(\d+)$", data)
+    if pag_match:
+        kind, direction, cur_page_str = pag_match.groups()
+        cur_page = int(cur_page_str)
+        new_page = cur_page + 1 if direction == "next" else cur_page - 1
+        new_page = max(0, new_page)
+        query = user_state.get(chat_id, {}).get("last_query", "")
+        if not query:
+            send_message(chat_id, "❌ جستجوی قبلی پیدا نشد. دوباره جستجو کنید.",
+                         reply_markup=main_menu_keyboard())
+            return
+        if kind == "search":
+            do_search(chat_id, query, new_page)
+        elif kind == "hsearch":
+            do_html_search(chat_id, query, new_page)
+        elif kind == "scholar":
+            do_scholar(chat_id, query, new_page)
+        return
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Feature handlers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def do_search(chat_id: int, query: str):
+def do_search(chat_id: int, query: str, page: int = 0):
     bump(chat_id, "searches")
     send_chat_action(chat_id, "typing")
-    results = web_search(query)
+    results = web_search(query, 10, page)
+    # Save state for pagination
+    user_state[chat_id] = {"mode": "search", "last_query": query, "page": page}
     if not results:
-        send_message(chat_id, "❌ نتیجه‌ای یافت نشد.", reply_markup=main_menu_keyboard())
+        send_message(chat_id,
+                     "❌ نتیجه‌ای یافت نشد.\n"
+                     "_ممکن است DuckDuckGo موقتاً پاسخ ندهد. دوباره تلاش کنید._",
+                     parse_mode="Markdown",
+                     reply_markup=main_menu_keyboard())
         return
-    lines = [f"🔎 *نتایج جستجو برای:* {query}\n"]
-    for i, r in enumerate(results, 1):
+    offset = page * 10
+    lines = [f"🔎 *نتایج جستجو:* _{query}_  (صفحه {page + 1})\n"]
+    for i, r in enumerate(results, offset + 1):
+        snippet = r.get("snippet", "")
         lines.append(f"{i}. [{r['title']}]({r['link']})")
-    send_message(chat_id, "\n".join(lines), parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        if snippet:
+            lines.append(f"   _{snippet[:100]}_")
+    kb = pagination_keyboard(
+        f"search_prev_{page}", f"search_next_{page}",
+        page, len(results) == 10,
+    )
+    send_message(chat_id, "\n".join(lines)[:4000],
+                 parse_mode="Markdown", reply_markup=kb)
 
 
-def do_html_search(chat_id: int, query: str):
+def do_html_search(chat_id: int, query: str, page: int = 0):
     bump(chat_id, "searches")
     send_chat_action(chat_id, "upload_document")
-    html_bytes = search_to_html(query)
-    send_document(chat_id, html_bytes, f"search_{query[:20]}.html",
-                  caption=f"📄 نتایج جستجو برای: {query}")
-    user_state[chat_id] = {"mode": None}
-    send_message(chat_id, "✅ فایل HTML ارسال شد.", reply_markup=main_menu_keyboard())
+    html_bytes = search_to_html(query, page)
+    safe_q = re.sub(r"[^\w\u0600-\u06FF]", "_", query)[:20]
+    send_document(chat_id, html_bytes, f"search_{safe_q}_p{page+1}.html",
+                  caption=f"📄 نتایج جستجو: {query} (صفحه {page+1})")
+    user_state[chat_id] = {"mode": "html_search", "last_query": query, "page": page}
+    kb = pagination_keyboard(
+        f"hsearch_prev_{page}", f"hsearch_next_{page}",
+        page, True,
+    )
+    send_message(chat_id, "✅ فایل HTML ارسال شد.", reply_markup=kb)
 
 
 def do_open_url(chat_id: int, url: str):
@@ -872,23 +1152,33 @@ def process_ocr_photo(chat_id: int, photos: list, reply_id: int = None):
     send_message(chat_id, "✅ OCR انجام شد.", reply_markup=main_menu_keyboard())
 
 
-def do_scholar(chat_id: int, query: str):
+def do_scholar(chat_id: int, query: str, page: int = 0):
     bump(chat_id, "searches")
     send_chat_action(chat_id, "typing")
-    results = scholar_search(query)
+    results = scholar_search(query, page)
+    user_state[chat_id] = {"mode": "scholar", "last_query": query, "page": page}
     if not results:
-        send_message(chat_id, "❌ مقاله‌ای یافت نشد.", reply_markup=main_menu_keyboard())
+        send_message(chat_id,
+                     "❌ مقاله‌ای یافت نشد.\n"
+                     "_ممکن است Google Scholar موقتاً دسترسی را محدود کرده باشد._",
+                     parse_mode="Markdown",
+                     reply_markup=main_menu_keyboard())
         return
-    lines = [f"📚 *نتایج Google Scholar:* {query}\n"]
-    for i, r in enumerate(results, 1):
+    offset = page * 10
+    lines = [f"📚 *نتایج Google Scholar:* _{query}_  (صفحه {page + 1})\n"]
+    for i, r in enumerate(results, offset + 1):
         lines.append(f"{i}. [{r['title']}]({r['link']})")
         if r.get("meta"):
-            lines.append(f"   _{r['meta']}_")
+            lines.append(f"   _{r['meta'][:80]}_")
         if r.get("snippet"):
-            lines.append(f"   {r['snippet'][:150]}...")
+            lines.append(f"   {r['snippet'][:120]}…")
         lines.append("")
-    send_message(chat_id, "\n".join(lines)[:4000], parse_mode="Markdown",
-                 reply_markup=main_menu_keyboard())
+    kb = pagination_keyboard(
+        f"scholar_prev_{page}", f"scholar_next_{page}",
+        page, len(results) >= 8,
+    )
+    send_message(chat_id, "\n".join(lines)[:4000],
+                 parse_mode="Markdown", reply_markup=kb)
 
 
 def do_youtube_search(chat_id: int, query: str):
@@ -911,18 +1201,28 @@ def do_youtube_search(chat_id: int, query: str):
 
 def do_youtube_download(chat_id: int, url: str):
     bump(chat_id, "downloads")
-    if "youtu" not in url:
-        send_message(chat_id, "❌ لینک معتبر یوتیوب وارد کنید.", reply_markup=main_menu_keyboard())
+    url = url.strip()
+    if "youtu" not in url and "yt.be" not in url:
+        send_message(chat_id, "❌ لینک معتبر یوتیوب وارد کنید.\nمثال: https://youtu.be/xxxx",
+                     reply_markup=main_menu_keyboard())
         return
-    send_message(chat_id, "⏳ در حال دانلود ویدیو (ممکن است چند دقیقه طول بکشد)...")
+    send_message(chat_id, "⏳ در حال دانلود ویدیو… (ممکن است چند دقیقه طول بکشد)")
     send_chat_action(chat_id, "upload_video")
     result = youtube_download(url, audio_only=False)
     if not result:
-        send_message(chat_id, "❌ خطا در دانلود ویدیو یا حجم آن زیاد است.", reply_markup=main_menu_keyboard())
+        send_message(chat_id,
+                     "❌ خطا در دانلود ویدیو.\n"
+                     "• لینک ممکن است محدود یا خصوصی باشد\n"
+                     "• یا yt-dlp نیاز به آپدیت دارد: `pip install -U yt-dlp`",
+                     parse_mode="Markdown",
+                     reply_markup=main_menu_keyboard())
         return
     data, fname = result
+    fname = Path(fname).name  # strip full path
     if len(data) > MAX_FILE_SIZE:
-        send_message(chat_id, "❌ حجم ویدیو بیشتر از ۵۰ مگابایت است.", reply_markup=main_menu_keyboard())
+        send_message(chat_id,
+                     f"❌ حجم ویدیو ({len(data)//1024//1024} MB) بیشتر از ۵۰ MB است.",
+                     reply_markup=main_menu_keyboard())
         return
     send_document(chat_id, data, fname, caption=f"📺 {fname[:80]}")
     user_state[chat_id] = {"mode": None}
@@ -931,19 +1231,27 @@ def do_youtube_download(chat_id: int, url: str):
 
 def do_music(chat_id: int, query: str):
     bump(chat_id, "downloads")
-    send_message(chat_id, "⏳ در حال جستجو و دانلود MP3...")
+    send_message(chat_id, f"⏳ در حال جستجو و دانلود MP3 برای: _{query}_…",
+                 parse_mode="Markdown")
     send_chat_action(chat_id, "record_voice")
-    result = youtube_download(f"ytsearch1:{query}", audio_only=True)
+    # Use a search URL directly so yt-dlp resolves the best match
+    search_url = f"ytsearch1:{query}"
+    result = youtube_download(search_url, audio_only=True)
     if not result:
-        send_message(chat_id, "❌ خطا در دانلود موسیقی.", reply_markup=main_menu_keyboard())
+        send_message(chat_id,
+                     "❌ خطا در دانلود موسیقی.\n"
+                     "• نام آهنگ را به انگلیسی امتحان کنید\n"
+                     "• یا مستقیم لینک یوتیوب بدهید",
+                     parse_mode="Markdown",
+                     reply_markup=main_menu_keyboard())
         return
     data, fname = result
+    fname = Path(fname).name
     if len(data) > MAX_FILE_SIZE:
         send_message(chat_id, "❌ حجم فایل صوتی زیاد است.", reply_markup=main_menu_keyboard())
         return
-    # Make sure filename is mp3
-    if not fname.endswith(".mp3"):
-        fname = fname.rsplit(".", 1)[0] + ".mp3"
+    if not fname.lower().endswith(".mp3"):
+        fname = re.sub(r"\.[^.]+$", ".mp3", fname)
     send_audio_bytes(chat_id, data, fname, caption=f"🎵 {query}")
     user_state[chat_id] = {"mode": None}
     send_message(chat_id, "✅ موسیقی ارسال شد.", reply_markup=main_menu_keyboard())
