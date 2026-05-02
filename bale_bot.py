@@ -665,6 +665,89 @@ def _trim_video_ffmpeg(src: Path, tmp: str, ffmpeg_dir: str = "/usr/bin") -> Opt
 
 
 def pinterest_search(query: str) -> list[dict]:
+    """Search Pinterest images using their visual search API."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*, q=0.01",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.pinterest.com/",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    # Pinterest resource API
+    params = {
+        "source_url": f"/search/pins/?q={urllib.parse.quote(query)}&rs=typed",
+        "data": json.dumps({
+            "options": {
+                "query": query,
+                "scope": "pins",
+                "no_fetch_context_on_resource": False,
+            },
+            "context": {},
+        }),
+    }
+    try:
+        r = requests.get(
+            "https://www.pinterest.com/resource/BaseSearchResource/get/",
+            headers=headers,
+            params=params,
+            timeout=20,
+        )
+        data = r.json()
+        pins = (
+            data.get("resource_response", {})
+                .get("data", {})
+                .get("results", [])
+        )
+        results = []
+        for pin in pins:
+            imgs = pin.get("images", {})
+            # Prefer "orig" then "736x"
+            for size in ("orig", "736x", "474x"):
+                img = imgs.get(size, {})
+                url_val = img.get("url", "")
+                if url_val:
+                    results.append({"url": url_val,
+                                    "title": pin.get("title") or pin.get("description") or query})
+                    break
+            if len(results) >= 12:
+                break
+        if results:
+            return results
+    except Exception as e:
+        log.error("pinterest API error: %s", e)
+
+    # Fallback: scrape page HTML for image URLs
+    try:
+        r2 = requests.get(
+            f"https://www.pinterest.com/search/pins/?q={urllib.parse.quote(query)}&rs=typed",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/122.0.0.0 Safari/537.36",
+            },
+            timeout=20,
+        )
+        # Extract CDN image urls from page JSON blobs
+        matches = re.findall(r'"url":"(https://i\.pinimg\.com/[^"]+)"', r2.text)
+        seen = set()
+        results = []
+        for img_url in matches:
+            # Prefer larger images (736x or originals)
+            if img_url in seen:
+                continue
+            seen.add(img_url)
+            results.append({"url": img_url, "title": query})
+            if len(results) >= 12:
+                break
+        return results
+    except Exception as e:
+        log.error("old_pinterest_scrape: %s", e)
+        return []
+
+
+def pinterest_search(query: str) -> list[dict]:
     """Search Pinterest — tries API, then HTML scrape, then Google Images fallback."""
     UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
           "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -1191,19 +1274,23 @@ def handle_message(msg: dict):
         do_pinterest(chat_id, text)
 
     elif mode == "gimages":
-        do_gimages(chat_id, text)
+        do_google_images(chat_id, text)
 
     elif mode == "pexels":
         do_pexels(chat_id, text)
 
     elif mode == "wiki":
-        do_wiki(chat_id, text)
+        do_wiki_search(chat_id, text)
+
+    elif mode == "wiki_article":
+        lang = user_state[chat_id].get("wiki_lang", "fa")
+        do_wiki_article(chat_id, text, lang)
 
     elif mode == "currency":
         do_currency(chat_id, text)
 
     elif mode == "iplookup":
-        do_iplookup(chat_id, text)
+        do_ip_lookup(chat_id, text)
 
     elif mode == "shorten":
         do_shorten(chat_id, text)
@@ -1601,7 +1688,7 @@ def do_music(chat_id: int, query: str):
 def do_pinterest(chat_id: int, query: str):
     bump(chat_id, "searches")
     send_chat_action(chat_id, "upload_photo")
-    send_message(chat_id, "⏳ در حال جستجو در پینترست...")
+    send_message(chat_id, f"⏳ در حال جستجو در پینترست: _{query}_…", parse_mode="Markdown")
     results = pinterest_search(query)
     if not results:
         send_message(chat_id, "❌ تصویری یافت نشد.", reply_markup=main_menu_keyboard())
@@ -1610,10 +1697,10 @@ def do_pinterest(chat_id: int, query: str):
     for r in results[:6]:
         try:
             img_bytes = download_file(r["url"], MAX_IMAGE_SIZE)
-            if img_bytes:
-                send_photo_bytes(chat_id, img_bytes, caption=f"📌 {query}")
+            if img_bytes and len(img_bytes) > 1000:
+                send_photo_bytes(chat_id, img_bytes, caption=f"📌 {r.get('title', query)[:80]}")
                 sent += 1
-                time.sleep(0.5)
+                time.sleep(0.4)
         except Exception:
             pass
     msg = f"✅ {sent} تصویر از پینترست ارسال شد." if sent else "❌ تصویری دانلود نشد."
@@ -1621,10 +1708,10 @@ def do_pinterest(chat_id: int, query: str):
     send_message(chat_id, msg, reply_markup=main_menu_keyboard())
 
 
-def do_gimages(chat_id: int, query: str):
+def do_google_images(chat_id: int, query: str):
     bump(chat_id, "searches")
     send_chat_action(chat_id, "upload_photo")
-    send_message(chat_id, "⏳ در حال جستجو در Google Images...")
+    send_message(chat_id, f"⏳ در حال جستجوی تصاویر گوگل: _{query}_…", parse_mode="Markdown")
     results = google_images_search(query, 8)
     if not results:
         send_message(chat_id, "❌ تصویری یافت نشد.", reply_markup=main_menu_keyboard())
@@ -1633,13 +1720,13 @@ def do_gimages(chat_id: int, query: str):
     for r in results[:6]:
         try:
             img_bytes = download_file(r["img"], MAX_IMAGE_SIZE)
-            if img_bytes:
+            if img_bytes and len(img_bytes) > 1000:
                 send_photo_bytes(chat_id, img_bytes, caption=f"🖼 {query}")
                 sent += 1
-                time.sleep(0.5)
+                time.sleep(0.4)
         except Exception:
             pass
-    msg = f"✅ {sent} تصویر از Google Images ارسال شد." if sent else "❌ تصویری دانلود نشد."
+    msg = f"✅ {sent} تصویر از گوگل ارسال شد." if sent else "❌ تصویری دانلود نشد."
     user_state[chat_id] = {"mode": None}
     send_message(chat_id, msg, reply_markup=main_menu_keyboard())
 
@@ -1647,19 +1734,19 @@ def do_gimages(chat_id: int, query: str):
 def do_pexels(chat_id: int, query: str):
     bump(chat_id, "searches")
     send_chat_action(chat_id, "upload_photo")
-    send_message(chat_id, "⏳ در حال جستجو در Pexels...")
+    send_message(chat_id, f"⏳ در حال جستجو در Pexels: _{query}_…", parse_mode="Markdown")
     results = pexels_search(query, 8)
     if not results:
-        send_message(chat_id, "❌ عکسی یافت نشد.", reply_markup=main_menu_keyboard())
+        send_message(chat_id, "❌ تصویری در Pexels یافت نشد.", reply_markup=main_menu_keyboard())
         return
     sent = 0
-    for r in results[:6]:
+    for r in results[:5]:
         try:
             img_bytes = download_file(r["url"], MAX_IMAGE_SIZE)
-            if img_bytes:
-                send_photo_bytes(chat_id, img_bytes, caption=f"📷 {r.get('title', query)}")
+            if img_bytes and len(img_bytes) > 1000:
+                send_photo_bytes(chat_id, img_bytes, caption=f"📷 Pexels — {r.get('title', query)[:60]}")
                 sent += 1
-                time.sleep(0.5)
+                time.sleep(0.4)
         except Exception:
             pass
     msg = f"✅ {sent} عکس از Pexels ارسال شد." if sent else "❌ عکسی دانلود نشد."
@@ -1667,43 +1754,81 @@ def do_pexels(chat_id: int, query: str):
     send_message(chat_id, msg, reply_markup=main_menu_keyboard())
 
 
-def do_wiki(chat_id: int, query: str):
+def do_wiki_search(chat_id: int, query: str):
     bump(chat_id, "searches")
     send_chat_action(chat_id, "typing")
+    # Try Persian first, then English
     results = wikipedia_search(query, "fa")
+    lang_used = "fa"
     if not results:
-        send_message(chat_id, "❌ مقاله‌ای یافت نشد.", reply_markup=main_menu_keyboard())
+        results = wikipedia_search(query, "en")
+        lang_used = "en"
+    if not results:
+        send_message(chat_id, "❌ مقاله‌ای در ویکی‌پدیا یافت نشد.", reply_markup=main_menu_keyboard())
         return
     lines = [f"📖 *نتایج ویکی‌پدیا:* _{query}_\n"]
-    for i, r in enumerate(results[:5], 1):
+    for i, r in enumerate(results, 1):
+        snippet = r.get("snippet", "")[:100]
         lines.append(f"{i}. [{r['title']}]({r['url']})")
-        if r.get("snippet"):
-            lines.append(f"   _{r['snippet'][:150]}_")
+        if snippet:
+            lines.append(f"   _{snippet}…_")
+    lines.append(f"\n💡 برای خواندن کامل مقاله، عنوان آن را بنویسید.")
+    # Save state so next message reads the article
+    user_state[chat_id] = {"mode": "wiki_article", "wiki_lang": lang_used,
+                            "last_query": query}
+    send_message(chat_id, "\n".join(lines)[:4000], parse_mode="Markdown",
+                 reply_markup=cancel_keyboard())
+
+
+def do_wiki_article(chat_id: int, title: str, lang: str = "fa"):
+    bump(chat_id, "searches")
+    send_chat_action(chat_id, "typing")
+    send_message(chat_id, f"⏳ در حال دریافت مقاله: _{title}_…", parse_mode="Markdown")
+    text = wikipedia_article(title, lang)
+    if not lang == "fa" or not text:
+        text2 = wikipedia_article(title, "en")
+        text = text or text2
+    if not text:
+        send_message(chat_id, "❌ مقاله یافت نشد.", reply_markup=main_menu_keyboard())
+        return
+    # Send first 3500 chars as message, rest as text file
+    preview = text[:3500]
+    send_message(chat_id, f"📖 *{title}*\n\n{preview}", parse_mode="Markdown")
+    if len(text) > 3500:
+        send_document(chat_id, text.encode("utf-8"), f"{title[:40]}.txt",
+                      caption="📄 متن کامل مقاله")
     user_state[chat_id] = {"mode": None}
-    send_message(chat_id, "\n".join(lines)[:3500], parse_mode="Markdown", 
-                 reply_markup=main_menu_keyboard())
+    send_message(chat_id, "✅ مقاله دریافت شد.", reply_markup=main_menu_keyboard())
 
 
 def do_currency(chat_id: int, text: str):
     bump(chat_id, "requests")
-    send_chat_action(chat_id, "typing")
-    # Parse "100 USD to IRR" or "100 USD to IRR"
-    m = re.match(r"(\d+\.?\d*)\s+(\w{3})\s+to\s+(\w{3})", text.strip(), re.IGNORECASE)
+    # Parse: "100 USD to IRR"  or  "100 USD IRR"
+    m = re.match(
+        r"([\d,\.]+)\s+([A-Za-z]{3})\s+(?:to\s+)?([A-Za-z]{3})",
+        text.strip(), re.IGNORECASE,
+    )
     if not m:
-        send_message(chat_id, "❌ فرمت نامعتبر.\nمثال: 100 USD to IRR", reply_markup=main_menu_keyboard())
+        send_message(chat_id,
+                     "❌ فرمت اشتباه.\n"
+                     "مثال صحیح: `100 USD to IRR` یا `50 EUR USD`",
+                     parse_mode="Markdown",
+                     reply_markup=main_menu_keyboard())
         return
-    amount, from_cur, to_cur = m.groups()
-    result = currency_convert(float(amount), from_cur, to_cur)
+    amount_str, from_cur, to_cur = m.groups()
+    amount = float(amount_str.replace(",", ""))
+    send_chat_action(chat_id, "typing")
+    result = currency_convert(amount, from_cur, to_cur)
     if result:
-        send_message(chat_id, f"💱 *تبدیل ارز:*\n{result}", parse_mode="Markdown",
+        send_message(chat_id, f"💱 *{result}*", parse_mode="Markdown",
                      reply_markup=main_menu_keyboard())
     else:
-        send_message(chat_id, "❌ خطا در تبدیل ارز. دوباره تلاش کنید.", 
+        send_message(chat_id, "❌ خطا در تبدیل ارز. کدهای ارزی را بررسی کنید.",
                      reply_markup=main_menu_keyboard())
     user_state[chat_id] = {"mode": None}
 
 
-def do_iplookup(chat_id: int, target: str):
+def do_ip_lookup(chat_id: int, target: str):
     bump(chat_id, "requests")
     send_chat_action(chat_id, "typing")
     result = ip_lookup(target.strip())
@@ -1713,29 +1838,33 @@ def do_iplookup(chat_id: int, target: str):
 
 def do_shorten(chat_id: int, url: str):
     bump(chat_id, "requests")
-    send_chat_action(chat_id, "typing")
-    url = url.strip()
     if not url.startswith("http"):
         url = "https://" + url
+    send_chat_action(chat_id, "typing")
     result = shorten_url(url)
-    send_message(chat_id, f"🔗 {result}", reply_markup=main_menu_keyboard())
+    send_message(chat_id, f"🔗 لینک کوتاه شده:\n{result}", reply_markup=main_menu_keyboard())
     user_state[chat_id] = {"mode": None}
 
 
 def do_expand(chat_id: int, url: str):
     bump(chat_id, "requests")
+    if not url.startswith("http"):
+        url = "https://" + url
     send_chat_action(chat_id, "typing")
-    result = expand_url(url.strip())
+    result = expand_url(url)
     send_message(chat_id, result, parse_mode="Markdown", reply_markup=main_menu_keyboard())
     user_state[chat_id] = {"mode": None}
 
 
-def do_paste(chat_id: int, content: str):
+def do_paste(chat_id: int, text: str):
     bump(chat_id, "requests")
     send_chat_action(chat_id, "typing")
-    url = paste_text(content)
+    url = paste_text(text)
     if url:
-        send_message(chat_id, f"✅ متن آپلود شد:\n{url}", reply_markup=main_menu_keyboard())
+        send_message(chat_id,
+                     f"📋 متن آپلود شد:\n{url}\n\n_(لینک عمومی — هر کسی می‌تواند ببیند)_",
+                     parse_mode="Markdown",
+                     reply_markup=main_menu_keyboard())
     else:
         send_message(chat_id, "❌ خطا در آپلود متن.", reply_markup=main_menu_keyboard())
     user_state[chat_id] = {"mode": None}
@@ -1744,13 +1873,13 @@ def do_paste(chat_id: int, content: str):
 def do_qr(chat_id: int, text: str):
     bump(chat_id, "requests")
     send_chat_action(chat_id, "upload_photo")
-    qr_img = generate_qr(text)
-    if qr_img:
-        send_photo_bytes(chat_id, qr_img, caption=f"📱 QR کد برای: {text[:50]}")
+    qr_bytes = generate_qr(text)
+    if qr_bytes:
+        send_photo_bytes(chat_id, qr_bytes, caption=f"📱 QR کد برای:\n{text[:60]}")
     else:
         send_message(chat_id, "❌ خطا در ساخت QR کد.", reply_markup=main_menu_keyboard())
     user_state[chat_id] = {"mode": None}
-    send_message(chat_id, "✅ QR کد ساخته شد.", reply_markup=main_menu_keyboard())
+    send_message(chat_id, "✅", reply_markup=main_menu_keyboard())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
