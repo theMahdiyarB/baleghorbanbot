@@ -20,7 +20,7 @@ import pytesseract
 # ═══════════════════════════════════════════════════════════════════════════════
 TOKEN          = os.getenv("BALE_TOKEN", "YOUR_BOT_TOKEN_HERE")
 BASE_URL       = f"https://tapi.bale.ai/bot{TOKEN}"
-MAX_FILE_SIZE  = 50 * 1024 * 1024
+MAX_FILE_SIZE  = 20 * 1024 * 1024
 MAX_IMAGE_SIZE = 10 * 1024 * 1024
 MAX_OCR_SIZE   =  5 * 1024 * 1024
 GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN", "")   # optional, raises rate limits
@@ -65,10 +65,59 @@ result_cache: dict[str, list] = {}   # key → list[dict]
 # ═══════════════════════════════════════════════════════════════════════════════
 # BALE API HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# Chunk size matches index.js: 19 MB per part
+CHUNK_SIZE = 19 * 1024 * 1024
+
+# Extensions Bale accepts natively — no ZIP wrapping needed (mirrors index.js)
+EXEMPT_EXT = {
+    "jpg","jpeg","png","gif","webp","bmp","tiff","tif","svg","ico","heic","heif","avif",
+    "mp4","mkv","avi","mov","wmv","flv","webm","m4v","3gp","ts","mts",
+    "mp3","ogg","wav","flac","m4a","aac","wma","opus","aiff",
+    "zip","rar","7z","tar","gz","bz2","xz","zst","lz4",
+    "pdf","doc","docx","xls","xlsx","ppt","pptx","odt","ods","odp","epub",
+}
+
+MIME_MAP = {
+    "jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png","gif":"image/gif",
+    "webp":"image/webp","mp4":"video/mp4","mkv":"video/x-matroska",
+    "mov":"video/quicktime","avi":"video/x-msvideo","webm":"video/webm",
+    "mp3":"audio/mpeg","ogg":"audio/ogg","wav":"audio/wav","flac":"audio/flac",
+    "m4a":"audio/mp4","aac":"audio/aac","opus":"audio/opus",
+    "pdf":"application/pdf","zip":"application/zip","7z":"application/x-7z-compressed",
+    "txt":"text/plain","html":"text/html","json":"application/json",
+}
+
+def _mime(filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return MIME_MAP.get(ext, "application/octet-stream")
+
+def _should_wrap(filename: str) -> bool:
+    """Non-exempt extensions should be ZIP-wrapped so Bale accepts them."""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return ext not in EXEMPT_EXT
+
+def _wrap_zip(data: bytes, filename: str) -> tuple[bytes, str]:
+    """Wrap data in a ZIP and return (zip_bytes, new_filename)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(filename, data)
+    buf.seek(0)
+    base = filename.rsplit(".", 1)[0] if "." in filename else filename
+    return buf.read(), f"{base}.zip"
+
+def _safe_json(r: requests.Response) -> dict:
+    """Parse JSON safely — log raw body on failure."""
+    try:
+        return r.json()
+    except Exception:
+        log.error("Non-JSON response (status=%d): %r", r.status_code, r.text[:200])
+        return {"ok": False, "_raw": r.text[:200]}
+
 def api(method: str, **kwargs) -> dict:
     try:
         r = requests.post(f"{BASE_URL}/{method}", json=kwargs, timeout=30)
-        return r.json()
+        return _safe_json(r)
     except Exception as e:
         log.error("api %s: %s", method, e)
         return {"ok": False}
@@ -86,67 +135,130 @@ def send_message(chat_id, text, reply_markup=None,
         kw["parse_mode"] = parse_mode
     return api("sendMessage", **kw)
 
+def _post_file(endpoint: str, field: str, filename: str,
+               data_bytes: bytes, extra_data: dict) -> bool:
+    """Low-level multipart file POST to Bale API."""
+    files = {field: (filename, io.BytesIO(data_bytes), _mime(filename))}
+    try:
+        r = requests.post(f"{BASE_URL}/{endpoint}", data=extra_data,
+                          files=files, timeout=180)
+        resp = _safe_json(r)
+        ok = resp.get("ok", False)
+        if not ok:
+            log.error("%s failed: %s  file=%s  size=%dKB",
+                      endpoint, resp, filename, len(data_bytes)//1024)
+        return ok
+    except Exception as e:
+        log.error("%s exception: %s  file=%s", endpoint, e, filename)
+        return False
+
+def _send_one_chunk(chat_id, data_bytes: bytes, filename: str,
+                    caption="", media_type="document") -> bool:
+    """Send a single chunk using the correct Bale endpoint."""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    extra = {"chat_id": str(chat_id), "caption": caption[:1024]}
+
+    if media_type == "video" or ext in {"mp4","mkv","avi","mov","webm","m4v"}:
+        extra["supports_streaming"] = "true"
+        return _post_file("sendVideo", "video", filename, data_bytes, extra)
+    elif media_type == "audio" or ext in {"mp3","ogg","wav","flac","m4a","aac","opus"}:
+        return _post_file("sendAudio", "audio", filename, data_bytes, extra)
+    elif media_type == "photo" or ext in {"jpg","jpeg","png","gif","webp"}:
+        return _post_file("sendPhoto", "photo", filename, data_bytes, extra)
+    else:
+        return _post_file("sendDocument", "document", filename, data_bytes, extra)
+
+def smart_send(chat_id, data: bytes, filename: str,
+               caption="", media_type="auto") -> bool:
+    """
+    Smart file sender that mirrors index.js logic:
+    1. Wrap unsupported extensions in ZIP
+    2. If > CHUNK_SIZE, split into .part1ofN chunks
+    3. Send each chunk with correct endpoint
+    Returns True if all chunks sent successfully.
+    """
+    if not data:
+        log.error("smart_send: empty data for %s", filename)
+        return False
+
+    total_mb = len(data) / 1024 / 1024
+    log.info("smart_send: %s  %.1fMB  type=%s", filename, total_mb, media_type)
+
+    # Step 1: ZIP wrap if needed (skip for chunks and exempt types)
+    import re as _re
+    is_chunk = bool(_re.search(r'\.part\d+of\d+\.', filename))
+    if not is_chunk and _should_wrap(filename):
+        log.info("smart_send: wrapping %s in ZIP", filename)
+        send_message(chat_id, f"📦 در حال زیپ کردن `{filename}`…", parse_mode="Markdown")
+        data, filename = _wrap_zip(data, filename)
+        log.info("smart_send: zipped → %s  %.1fMB", filename, len(data)/1024/1024)
+
+    total_size = len(data)
+
+    # Step 2: Send in one shot if small enough
+    if total_size <= CHUNK_SIZE:
+        return _send_one_chunk(chat_id, data, filename, caption, media_type)
+
+    # Step 3: Chunk it
+    total_chunks = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+    base = filename.rsplit(".", 1)[0] if "." in filename else filename
+    ext  = ("." + filename.rsplit(".", 1)[1]) if "." in filename else ""
+    log.info("smart_send: splitting into %d chunks", total_chunks)
+    send_message(chat_id,
+                 f"📤 فایل بزرگ است — ارسال در *{total_chunks} بخش*…",
+                 parse_mode="Markdown")
+    all_ok = True
+    for i in range(total_chunks):
+        start = i * CHUNK_SIZE
+        end   = min(start + CHUNK_SIZE, total_size)
+        chunk = data[start:end]
+        chunk_name = f"{base}.part{i+1}of{total_chunks}{ext}"
+        chunk_mb = len(chunk) / 1024 / 1024
+        send_message(chat_id,
+                     f"📤 ارسال بخش {i+1} از {total_chunks} ({chunk_mb:.1f}MB)…")
+        ok = _send_one_chunk(chat_id, chunk, chunk_name, caption="", media_type="document")
+        if not ok:
+            send_message(chat_id, f"❌ ارسال بخش {i+1} ناموفق بود.")
+            all_ok = False
+            break
+    if all_ok:
+        send_message(chat_id,
+                     f"✅ همه {total_chunks} بخش ارسال شدند!\n\n"
+                     f"برای ترکیب:\n"
+                     f"`cat {base}.part*of{total_chunks}{ext} > {filename}`",
+                     parse_mode="Markdown")
+    return all_ok
+
+# Convenience wrappers (keep old call sites working)
 def send_document(chat_id, file_bytes: bytes, filename: str,
                   caption="", reply_to=None) -> bool:
-    if not file_bytes:
-        log.error("send_document: empty bytes  file=%s", filename)
-        return False
-    files = {"document": (filename, io.BytesIO(file_bytes), "application/octet-stream")}
-    data  = {"chat_id": chat_id, "caption": caption[:1024]}
-    if reply_to:
-        data["reply_to_message_id"] = reply_to
-    try:
-        r = requests.post(f"{BASE_URL}/sendDocument", data=data, files=files, timeout=180)
-        ok = r.json().get("ok", False)
-        if not ok:
-            log.error("sendDocument failed: %s  file=%s  size=%dB",
-                      r.json(), filename, len(file_bytes))
-        return ok
-    except Exception as e:
-        log.error("sendDocument exception: %s", e)
-        return False
+    return smart_send(chat_id, file_bytes, filename, caption, media_type="document")
 
 def send_video(chat_id, video_bytes: bytes, filename: str, caption="") -> bool:
-    files = {"video": (filename, io.BytesIO(video_bytes), "video/mp4")}
-    data  = {"chat_id": chat_id, "caption": caption[:1024],
-             "supports_streaming": "true"}
-    try:
-        r = requests.post(f"{BASE_URL}/sendVideo", data=data, files=files, timeout=180)
-        ok = r.json().get("ok", False)
-        if not ok:
-            log.error("sendVideo failed: %s  size=%dMB", r.json(), len(video_bytes)//1024//1024)
-        return ok
-    except Exception as e:
-        log.error("sendVideo exception: %s", e)
-        return False
+    return smart_send(chat_id, video_bytes, filename, caption, media_type="video")
 
 def send_photo(chat_id, img_bytes: bytes, caption="", reply_markup=None) -> bool:
-    files = {"photo": ("image.jpg", io.BytesIO(img_bytes), "image/jpeg")}
-    data  = {"chat_id": chat_id, "caption": caption[:1024]}
+    """Photos don't chunk — just post directly."""
+    if not img_bytes:
+        return False
+    ext = "jpg"
+    files = {"photo": (f"image.{ext}", io.BytesIO(img_bytes), "image/jpeg")}
+    data  = {"chat_id": str(chat_id), "caption": caption[:1024]}
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup)
     try:
         r = requests.post(f"{BASE_URL}/sendPhoto", data=data, files=files, timeout=60)
-        ok = r.json().get("ok", False)
+        resp = _safe_json(r)
+        ok = resp.get("ok", False)
         if not ok:
-            log.error("sendPhoto failed: %s", r.json())
+            log.error("sendPhoto failed: %s", resp)
         return ok
     except Exception as e:
         log.error("sendPhoto exception: %s", e)
         return False
 
 def send_audio(chat_id, audio_bytes: bytes, filename: str, caption="") -> bool:
-    files = {"audio": (filename, io.BytesIO(audio_bytes), "audio/mpeg")}
-    data  = {"chat_id": chat_id, "caption": caption[:1024]}
-    try:
-        r = requests.post(f"{BASE_URL}/sendAudio", data=data, files=files, timeout=120)
-        ok = r.json().get("ok", False)
-        if not ok:
-            log.error("sendAudio failed: %s", r.json())
-        return ok
-    except Exception as e:
-        log.error("sendAudio exception: %s", e)
-        return False
+    return smart_send(chat_id, audio_bytes, filename, caption, media_type="audio")
 
 def chat_action(chat_id, action="typing"):
     api("sendChatAction", chat_id=chat_id, action=action)
@@ -156,6 +268,7 @@ def get_file_url(file_id: str) -> Optional[str]:
     if resp.get("ok"):
         return f"https://tapi.bale.ai/file/bot{TOKEN}/{resp['result']['file_path']}"
     return None
+
 
 def download_bytes(url: str, max_bytes=MAX_FILE_SIZE) -> Optional[bytes]:
     log.debug("download_bytes: %s", url)
@@ -430,20 +543,65 @@ def fetch_page(url: str) -> Optional[bytes]:
         log.error("fetch_page: %s", e, exc_info=True); return None
 
 def screenshot_page(url: str) -> Optional[bytes]:
-    """Take a JPEG screenshot of a URL using Playwright (headless Chromium)."""
+    """
+    Full-page scrolling screenshot using Playwright.
+    Takes viewport-height screenshots while scrolling, stitches them vertically.
+    Returns JPEG bytes.
+    """
     log.info("screenshot_page: %s", url)
     try:
         from playwright.sync_api import sync_playwright
+        VW, VH = 1280, 900
         with sync_playwright() as p:
-            browser = p.chromium.launch(args=["--no-sandbox","--disable-setuid-sandbox",
-                                               "--disable-dev-shm-usage"])
-            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            browser = p.chromium.launch(args=[
+                "--no-sandbox", "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage", "--disable-gpu",
+            ])
+            page = browser.new_page(viewport={"width": VW, "height": VH})
             page.goto(url, timeout=25000, wait_until="domcontentloaded")
-            time.sleep(1.5)   # let JS render
-            img = page.screenshot(type="jpeg", quality=80, full_page=False)
+            time.sleep(2)  # wait for JS
+
+            # Get full page height
+            full_h = page.evaluate("document.body.scrollHeight")
+            full_h = min(full_h, 12000)  # cap at ~12000px
+            log.debug("screenshot: page height=%dpx", full_h)
+
+            # Scroll and capture strips
+            strips: list[bytes] = []
+            y = 0
+            while y < full_h:
+                page.evaluate(f"window.scrollTo(0, {y})")
+                time.sleep(0.3)
+                strip = page.screenshot(type="jpeg", quality=75, clip={
+                    "x": 0, "y": 0, "width": VW, "height": VH,
+                })
+                strips.append(strip)
+                y += VH
+                if len(strips) >= 15:  # max 15 strips = ~13500px
+                    break
+
             browser.close()
-            log.info("screenshot_page: %d bytes", len(img))
-            return img
+
+        if not strips:
+            return None
+
+        # Stitch strips vertically using Pillow
+        images = [Image.open(io.BytesIO(s)) for s in strips]
+        total_h = sum(im.height for im in images)
+        stitched = Image.new("RGB", (VW, total_h))
+        offset = 0
+        for im in images:
+            stitched.paste(im, (0, offset))
+            offset += im.height
+
+        # Encode final image
+        out = io.BytesIO()
+        stitched.save(out, format="JPEG", quality=75, optimize=True)
+        out.seek(0)
+        result = out.read()
+        log.info("screenshot_page: stitched %d strips → %dKB", len(strips), len(result)//1024)
+        return result
+
     except Exception as e:
         log.error("screenshot_page error: %s", e, exc_info=True)
         return None
@@ -484,22 +642,30 @@ def page_to_pdf(url: str) -> Optional[bytes]:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
             out = tf.name
         result = subprocess.run(
-            ["wkhtmltopdf", "--quiet", "--load-error-handling", "ignore",
-             "--javascript-delay", "1000", url, out],
-            capture_output=True, timeout=30,
+            ["wkhtmltopdf",
+             "--quiet",
+             "--load-error-handling", "ignore",
+             "--load-media-error-handling", "ignore",
+             "--no-stop-slow-scripts",
+             "--javascript-delay", "2000",
+             "--page-size", "A4",
+             "--encoding", "utf-8",
+             url, out],
+            capture_output=True, timeout=60,
         )
-        if result.returncode == 0 and Path(out).stat().st_size > 1000:
+        if Path(out).exists() and Path(out).stat().st_size > 500:
             data = Path(out).read_bytes()
             Path(out).unlink(missing_ok=True)
-            log.info("page_to_pdf: %d bytes", len(data))
+            log.info("page_to_pdf: %dKB", len(data)//1024)
             return data
         log.warning("wkhtmltopdf rc=%d stderr=%s", result.returncode,
-                    result.stderr.decode()[:200])
+                    result.stderr.decode()[:300])
         Path(out).unlink(missing_ok=True)
+    except subprocess.TimeoutExpired:
+        log.warning("page_to_pdf: wkhtmltopdf timed out — falling back to HTML")
     except Exception as e:
         log.error("page_to_pdf: %s", e)
-    # Fallback: return raw HTML
-    return fetch_page(url)
+    return fetch_page(url)  # fallback: raw HTML
 
 # ─── Scholar ──────────────────────────────────────────────────────────────────
 def scholar_search(query: str, page=0) -> list[dict]:
@@ -627,54 +793,71 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
     import shutil
     ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
 
-    # Build yt-dlp command
     base_cmd = [
-        "yt-dlp", "--no-playlist", "-o", "%(title).60s.%(ext)s",
-        "--no-warnings", "--no-check-certificate",
+        "yt-dlp",
+        "--no-playlist",
+        "--no-warnings",
+        "--no-check-certificate",
         "--ffmpeg-location", ffmpeg_dir,
         "--geo-bypass",
-        "--geo-bypass-country", "DE",
-        "--socket-timeout", "30", "--retries", "5",
-        "--extractor-args", "youtube:player_client=ios,web",
+        "--socket-timeout", "30",
+        "--retries", "5",
+        "--extractor-args", "youtube:player_client=ios,tv_embedded,web",
     ]
 
-    def _run(extra_args, search_url) -> Optional[tuple[bytes,str]]:
+    def _run(extra_args, target_url) -> Optional[tuple[bytes,str]]:
         with tempfile.TemporaryDirectory() as tmp:
-            cmd = base_cmd + ["-o", os.path.join(tmp, "%(title).60s.%(ext)s")] + extra_args + [search_url]
+            out_tpl = os.path.join(tmp, "%(title).60s.%(ext)s")
+            cmd = base_cmd + ["-o", out_tpl] + extra_args + [target_url]
             log.debug("yt-dlp cmd: %s", " ".join(cmd))
             proc = subprocess.run(cmd, capture_output=True, timeout=300)
             stderr = proc.stderr.decode(errors="replace")
+            stdout = proc.stdout.decode(errors="replace")
             if proc.returncode != 0:
-                log.error("yt-dlp failed rc=%d: %s", proc.returncode, stderr[:600])
+                log.error("yt-dlp rc=%d stderr=%s", proc.returncode, stderr[:800])
                 return None
+            log.debug("yt-dlp stdout: %s", stdout[:300])
             files = list(Path(tmp).glob("*"))
             if not files:
                 log.error("yt-dlp: no output files in %s", tmp)
                 return None
             f = files[0]
             data = f.read_bytes()
-            log.info("yt-dlp: downloaded %s  %dMB", f.name, len(data)//1024//1024)
+            log.info("yt-dlp: %s  %.1fMB", f.name, len(data)/1024/1024)
             return data, f.name
 
     if audio_only:
-        result = _run(["-x","--audio-format","mp3","--audio-quality","5",
-                       "-f","bestaudio/best"], url)
+        # Try mp3 first, fallback to best audio then convert
+        for args in [
+            ["-x", "--audio-format", "mp3", "--audio-quality", "5", "-f", "bestaudio/best"],
+            ["-x", "--audio-format", "mp3", "--audio-quality", "5"],
+            ["-f", "bestaudio", "--audio-format", "mp3", "-x"],
+        ]:
+            result = _run(args, url)
+            if result:
+                return result
+        return None
     else:
-        result = _run(["-f",
-                       "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]"
-                       "/bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
-                       "--merge-output-format","mp4"], url)
-        # Trim if too large
-        if result and len(result[0]) > MAX_FILE_SIZE - 1*1024*1024:
-            log.info("Video too large (%dMB), trimming…", len(result[0])//1024//1024)
-            with tempfile.TemporaryDirectory() as tmp:
-                src = Path(tmp) / result[1]
-                src.write_bytes(result[0])
-                trimmed = _trim_video(src, tmp, ffmpeg_dir)
-                if trimmed:
-                    result = trimmed
-
-    return result
+        # Try progressive quality steps — no strict codec filter
+        for fmt in [
+            "bestvideo[height<=720]+bestaudio/best[height<=720]",
+            "bestvideo+bestaudio/best",
+            "best[height<=720]",
+            "best",
+        ]:
+            result = _run(["-f", fmt, "--merge-output-format", "mp4"], url)
+            if result:
+                # Trim if too large
+                if len(result[0]) > MAX_FILE_SIZE - 1*1024*1024:
+                    log.info("Video %.1fMB too large, trimming…", len(result[0])/1024/1024)
+                    with tempfile.TemporaryDirectory() as tmp2:
+                        src = Path(tmp2) / result[1]
+                        src.write_bytes(result[0])
+                        trimmed = _trim_video(src, tmp2, ffmpeg_dir)
+                        if trimmed:
+                            result = trimmed
+                return result
+        return None
 
 def _trim_video(src: Path, tmp: str, ffmpeg_dir="/usr/bin") -> Optional[tuple[bytes,Path]]:
     out = Path(tmp) / ("trimmed_" + src.name)
@@ -1251,23 +1434,19 @@ def do_youtube_dl(cid: int, url: str):
 
 def _finish_video(cid: int, result):
     if not result:
-        send_message(cid, "❌ دانلود ناموفق بود.\nاجرا کنید: `yt-dlp -U` برای آپدیت",
+        send_message(cid,
+                     "❌ دانلود ناموفق بود.\n"
+                     "• اجرا کنید: `yt-dlp -U`\n"
+                     "• یا یک ویدیو دیگر امتحان کنید.",
                      parse_mode="Markdown", reply_markup=home_kb())
         return
     data, fname = result
     fname = Path(fname).name
-    size_mb = len(data)//1024//1024
-    if len(data) > MAX_FILE_SIZE:
-        send_message(cid, f"❌ حجم ویدیو ({size_mb}MB) بیشتر از ۵۰MB است.",
-                     reply_markup=home_kb())
-        return
-    sent = False
-    if fname.lower().endswith(".mp4"):
-        sent = send_video(cid, data, fname, caption=f"📺 {fname[:60]}")
-    if not sent:
-        sent = send_document(cid, data, fname, caption=f"📺 {fname[:60]}")
-    if sent:
-        send_message(cid, f"✅ ارسال شد ({size_mb}MB).", reply_markup=home_kb())
+    size_mb = len(data)/1024/1024
+    log.info("_finish_video: %s  %.1fMB", fname, size_mb)
+    # smart_send handles chunking automatically — no size limit needed here
+    if smart_send(cid, data, fname, caption=f"📺 {fname[:60]}", media_type="video"):
+        send_message(cid, f"✅ ارسال شد ({size_mb:.1f}MB).", reply_markup=home_kb())
     else:
         send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
     clear_state(cid)
@@ -1719,14 +1898,12 @@ def handle_callback(cb: dict):
             send_message(cid, "❌ نتیجه منقضی."); return
         asset = assets[idx]
         url = asset.get("browser_download_url","")
-        size_mb = asset.get("size",0)//1024//1024
-        if size_mb > 50:
-            send_message(cid, f"❌ حجم فایل ({size_mb}MB) بیش از ۵۰MB است.",
-                         reply_markup=home_kb()); return
-        send_message(cid, f"⏳ دانلود: {asset['name']} ({size_mb}MB)…")
+        size_mb = asset.get("size",0)/1024/1024
+        send_message(cid, f"⏳ دانلود: {asset['name']} ({size_mb:.1f}MB)…")
         chat_action(cid, "upload_document")
-        d = download_bytes(url, MAX_FILE_SIZE)
-        if d and send_document(cid, d, asset["name"], caption=f"📦 {repo}"):
+        d = download_bytes(url, 500 * 1024 * 1024)  # allow up to 500MB download
+        if d:
+            smart_send(cid, d, asset["name"], caption=f"📦 {repo}")
             send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
         else:
             send_message(cid, "❌ دانلود ناموفق.", reply_markup=home_kb())
