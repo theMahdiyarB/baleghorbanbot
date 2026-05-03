@@ -1908,5 +1908,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-ENDOFFILE
-echo "Written $(wc -l < /home/claude/bale_bot.py) lines"
