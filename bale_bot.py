@@ -28,7 +28,7 @@ GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN", "")   # optional, raises rate limits
 # YouTube cookies file — export from browser for best download success rate.
 # How to get: install yt-dlp, run:
 #   yt-dlp --cookies-from-browser chrome --cookies /home/user/yt_cookies.txt  https://youtube.com
-YOUTUBE_COOKIES_FILE = os.getenv("yt_cookies.txt", "")
+YOUTUBE_COOKIES_FILE = os.getenv("/yt_cookies.txt", "")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
