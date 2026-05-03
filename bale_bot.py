@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-دستیار وب — Bale Bot  (v4)
+دستیار وب — Bale Bot  (v5)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -270,17 +270,23 @@ def get_file_url(file_id: str) -> Optional[str]:
     return None
 
 
-def download_bytes(url: str, max_bytes=MAX_FILE_SIZE) -> Optional[bytes]:
-    log.debug("download_bytes: %s", url)
+def download_bytes(url: str, max_bytes: int = 500 * 1024 * 1024) -> Optional[bytes]:
+    log.debug("download_bytes: %s  max=%.0fMB", url, max_bytes/1024/1024)
     try:
-        r = WEB.get(url, timeout=30, stream=True)
+        r = WEB.get(url, timeout=120, stream=True,
+                    headers={"User-Agent": UA_DESK})
+        log.debug("download_bytes: status=%d content-length=%s",
+                  r.status_code, r.headers.get("content-length", "?"))
         chunks, total = [], 0
-        for chunk in r.iter_content(8192):
-            chunks.append(chunk); total += len(chunk)
+        for chunk in r.iter_content(65536):
+            chunks.append(chunk)
+            total += len(chunk)
             if total > max_bytes:
-                log.warning("download_bytes: exceeded %d bytes", max_bytes)
+                log.warning("download_bytes: exceeded %.0fMB cap", max_bytes/1024/1024)
                 return None
-        return b"".join(chunks)
+        result = b"".join(chunks)
+        log.info("download_bytes: got %.1fMB", len(result)/1024/1024)
+        return result
     except Exception as e:
         log.error("download_bytes: %s — %s", url, e)
         return None
@@ -544,14 +550,13 @@ def fetch_page(url: str) -> Optional[bytes]:
 
 def screenshot_page(url: str) -> Optional[bytes]:
     """
-    Full-page scrolling screenshot using Playwright.
-    Takes viewport-height screenshots while scrolling, stitches them vertically.
-    Returns JPEG bytes.
+    1920×1080 viewport screenshot using Playwright.
+    Single shot — not scrolled. Returns JPEG bytes.
     """
     log.info("screenshot_page: %s", url)
     try:
         from playwright.sync_api import sync_playwright
-        VW, VH = 1280, 900
+        VW, VH = 1920, 1080
         with sync_playwright() as p:
             browser = p.chromium.launch(args=[
                 "--no-sandbox", "--disable-setuid-sandbox",
@@ -559,49 +564,13 @@ def screenshot_page(url: str) -> Optional[bytes]:
             ])
             page = browser.new_page(viewport={"width": VW, "height": VH})
             page.goto(url, timeout=25000, wait_until="domcontentloaded")
-            time.sleep(2)  # wait for JS
-
-            # Get full page height
-            full_h = page.evaluate("document.body.scrollHeight")
-            full_h = min(full_h, 12000)  # cap at ~12000px
-            log.debug("screenshot: page height=%dpx", full_h)
-
-            # Scroll and capture strips
-            strips: list[bytes] = []
-            y = 0
-            while y < full_h:
-                page.evaluate(f"window.scrollTo(0, {y})")
-                time.sleep(0.3)
-                strip = page.screenshot(type="jpeg", quality=75, clip={
-                    "x": 0, "y": 0, "width": VW, "height": VH,
-                })
-                strips.append(strip)
-                y += VH
-                if len(strips) >= 15:  # max 15 strips = ~13500px
-                    break
-
+            time.sleep(2)
+            img = page.screenshot(type="jpeg", quality=82, clip={
+                "x": 0, "y": 0, "width": VW, "height": VH,
+            })
             browser.close()
-
-        if not strips:
-            return None
-
-        # Stitch strips vertically using Pillow
-        images = [Image.open(io.BytesIO(s)) for s in strips]
-        total_h = sum(im.height for im in images)
-        stitched = Image.new("RGB", (VW, total_h))
-        offset = 0
-        for im in images:
-            stitched.paste(im, (0, offset))
-            offset += im.height
-
-        # Encode final image
-        out = io.BytesIO()
-        stitched.save(out, format="JPEG", quality=75, optimize=True)
-        out.seek(0)
-        result = out.read()
-        log.info("screenshot_page: stitched %d strips → %dKB", len(strips), len(result)//1024)
-        return result
-
+        log.info("screenshot_page: %dKB", len(img)//1024)
+        return img
     except Exception as e:
         log.error("screenshot_page error: %s", e, exc_info=True)
         return None
@@ -636,8 +605,38 @@ def page_to_text(url: str) -> str:
     return "\n".join(lines[:100])
 
 def page_to_pdf(url: str) -> Optional[bytes]:
-    """Generate PDF using wkhtmltopdf if available, else return HTML."""
+    """
+    Generate a full-page PDF using Playwright's built-in PDF print.
+    This captures the entire page (scrollable content) as a proper PDF,
+    not a screenshot. Falls back to wkhtmltopdf, then raw HTML.
+    """
     log.info("page_to_pdf: %s", url)
+
+    # Strategy 1: Playwright PDF (best quality, full page)
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(args=[
+                "--no-sandbox", "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage", "--disable-gpu",
+            ])
+            page = browser.new_page(viewport={"width": 1920, "height": 1080})
+            page.goto(url, timeout=30000, wait_until="networkidle")
+            time.sleep(2)
+            pdf_bytes = page.pdf(
+                format="A4",
+                print_background=True,
+                margin={"top": "10mm", "bottom": "10mm",
+                        "left": "10mm", "right": "10mm"},
+            )
+            browser.close()
+        if pdf_bytes and len(pdf_bytes) > 500:
+            log.info("page_to_pdf (playwright): %dKB", len(pdf_bytes)//1024)
+            return pdf_bytes
+    except Exception as e:
+        log.warning("page_to_pdf playwright failed: %s", e)
+
+    # Strategy 2: wkhtmltopdf
     try:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
             out = tf.name
@@ -656,16 +655,19 @@ def page_to_pdf(url: str) -> Optional[bytes]:
         if Path(out).exists() and Path(out).stat().st_size > 500:
             data = Path(out).read_bytes()
             Path(out).unlink(missing_ok=True)
-            log.info("page_to_pdf: %dKB", len(data)//1024)
+            log.info("page_to_pdf (wkhtmltopdf): %dKB", len(data)//1024)
             return data
-        log.warning("wkhtmltopdf rc=%d stderr=%s", result.returncode,
-                    result.stderr.decode()[:300])
+        log.warning("wkhtmltopdf rc=%d stderr=%s",
+                    result.returncode, result.stderr.decode()[:200])
         Path(out).unlink(missing_ok=True)
     except subprocess.TimeoutExpired:
-        log.warning("page_to_pdf: wkhtmltopdf timed out — falling back to HTML")
+        log.warning("page_to_pdf: wkhtmltopdf timed out")
     except Exception as e:
-        log.error("page_to_pdf: %s", e)
-    return fetch_page(url)  # fallback: raw HTML
+        log.error("page_to_pdf wkhtmltopdf: %s", e)
+
+    # Strategy 3: raw HTML fallback (better than nothing)
+    log.warning("page_to_pdf: falling back to raw HTML")
+    return fetch_page(url)
 
 # ─── Scholar ──────────────────────────────────────────────────────────────────
 def scholar_search(query: str, page=0) -> list[dict]:
@@ -802,7 +804,8 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
         "--geo-bypass",
         "--socket-timeout", "30",
         "--retries", "5",
-        "--extractor-args", "youtube:player_client=ios,tv_embedded,web",
+        # Try multiple clients in order — tv_embedded avoids most geo/format blocks
+        "--extractor-args", "youtube:player_client=tv_embedded,ios,web",
     ]
 
     def _run(extra_args, target_url) -> Optional[tuple[bytes,str]]:
@@ -814,49 +817,60 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
             stderr = proc.stderr.decode(errors="replace")
             stdout = proc.stdout.decode(errors="replace")
             if proc.returncode != 0:
-                log.error("yt-dlp rc=%d stderr=%s", proc.returncode, stderr[:800])
+                log.error("yt-dlp rc=%d\nSTDERR: %s\nSTDOUT: %s",
+                          proc.returncode, stderr[:1000], stdout[:300])
                 return None
-            log.debug("yt-dlp stdout: %s", stdout[:300])
             files = list(Path(tmp).glob("*"))
             if not files:
-                log.error("yt-dlp: no output files in %s", tmp)
+                log.error("yt-dlp: no output files in %s  stdout=%s", tmp, stdout[:200])
                 return None
-            f = files[0]
+            # Pick largest file (avoid .part files)
+            f = sorted(files, key=lambda x: x.stat().st_size, reverse=True)[0]
             data = f.read_bytes()
-            log.info("yt-dlp: %s  %.1fMB", f.name, len(data)/1024/1024)
+            log.info("yt-dlp OK: %s  %.1fMB", f.name, len(data)/1024/1024)
             return data, f.name
 
     if audio_only:
-        # Try mp3 first, fallback to best audio then convert
+        # Strategy 1: Let yt-dlp pick best audio, convert to mp3 — NO -f flag
         for args in [
-            ["-x", "--audio-format", "mp3", "--audio-quality", "5", "-f", "bestaudio/best"],
+            # No format filter at all — yt-dlp picks whatever is available
             ["-x", "--audio-format", "mp3", "--audio-quality", "5"],
-            ["-f", "bestaudio", "--audio-format", "mp3", "-x"],
+            # Explicit bestaudio with no codec constraint
+            ["-x", "--audio-format", "mp3", "--audio-quality", "5",
+             "-f", "bestaudio"],
+            # Absolute fallback: download anything and convert
+            ["-x", "--audio-format", "mp3"],
         ]:
             result = _run(args, url)
             if result:
                 return result
+        log.error("youtube_download: all audio strategies failed for %s", url)
         return None
     else:
-        # Try progressive quality steps — no strict codec filter
-        for fmt in [
-            "bestvideo[height<=720]+bestaudio/best[height<=720]",
-            "bestvideo+bestaudio/best",
-            "best[height<=720]",
-            "best",
+        # Strategy: try from best quality down, no codec constraints
+        for fmt_args in [
+            # Best video+audio, merged to mp4
+            ["-f", "bestvideo+bestaudio", "--merge-output-format", "mp4"],
+            # Best single-file
+            ["-f", "best", "--merge-output-format", "mp4"],
+            # Absolute fallback — no format spec
+            ["--merge-output-format", "mp4"],
         ]:
-            result = _run(["-f", fmt, "--merge-output-format", "mp4"], url)
+            result = _run(fmt_args, url)
             if result:
-                # Trim if too large
-                if len(result[0]) > MAX_FILE_SIZE - 1*1024*1024:
-                    log.info("Video %.1fMB too large, trimming…", len(result[0])/1024/1024)
+                data, fname = result
+                # Trim if too large for a single chunk
+                if len(data) > 200 * 1024 * 1024:
+                    log.info("Video %.1fMB very large, trimming…", len(data)/1024/1024)
                     with tempfile.TemporaryDirectory() as tmp2:
-                        src = Path(tmp2) / result[1]
-                        src.write_bytes(result[0])
+                        src = Path(tmp2) / fname
+                        src.write_bytes(data)
                         trimmed = _trim_video(src, tmp2, ffmpeg_dir)
                         if trimmed:
-                            result = trimmed
-                return result
+                            data, fname_path = trimmed
+                            fname = Path(fname_path).name
+                return data, fname
+        log.error("youtube_download: all video strategies failed for %s", url)
         return None
 
 def _trim_video(src: Path, tmp: str, ffmpeg_dir="/usr/bin") -> Optional[tuple[bytes,Path]]:
