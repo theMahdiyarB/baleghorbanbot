@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-دستیار وب — Bale Bot  (v5)
+دستیار وب — Bale Bot  (v6)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -24,6 +24,12 @@ MAX_FILE_SIZE  = 20 * 1024 * 1024
 MAX_IMAGE_SIZE = 10 * 1024 * 1024
 MAX_OCR_SIZE   =  5 * 1024 * 1024
 GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN", "")   # optional, raises rate limits
+
+# YouTube cookies file — export from browser for best download success rate.
+# How to get: install yt-dlp, run:
+#   yt-dlp --cookies-from-browser chrome --cookies /home/user/yt_cookies.txt  https://youtube.com
+# Then: export YOUTUBE_COOKIES_FILE=/home/user/yt_cookies.txt
+YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -791,87 +797,232 @@ def youtube_search(query: str, max_results=8) -> list[dict]:
         return []
 
 def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
+    """
+    Multi-strategy YouTube downloader.
+    Tries in order:
+      1. yt-dlp with cookies file (if YOUTUBE_COOKIES_FILE is set)
+      2. yt-dlp via Invidious public instance URL (bypasses IP blocks)
+      3. pytubefix (different client fingerprint)
+      4. cobalt.tools API (free public service)
+    """
     log.info("youtube_download: url=%r audio=%s", url, audio_only)
+
+    # Normalize URL (handle search queries)
+    is_search = url.startswith("ytsearch")
+    video_id = None
+    if not is_search:
+        m = re.search(r"(?:v=|youtu\.be/|/v/|/embed/)([A-Za-z0-9_-]{11})", url)
+        if m:
+            video_id = m.group(1)
+
     import shutil
     ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
+    cookies_file = os.getenv("YOUTUBE_COOKIES_FILE", "")   # e.g. /home/user/cookies.txt
 
-    base_cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--no-warnings",
-        "--no-check-certificate",
-        "--ffmpeg-location", ffmpeg_dir,
-        "--geo-bypass",
-        "--socket-timeout", "30",
-        "--retries", "5",
-        # Try multiple clients in order — tv_embedded avoids most geo/format blocks
-        "--extractor-args", "youtube:player_client=tv_embedded,ios,web",
-    ]
-
-    def _run(extra_args, target_url) -> Optional[tuple[bytes,str]]:
+    # ── Helper: run yt-dlp with given args ────────────────────────────────────
+    def _ytdlp(extra_args: list, target_url: str,
+               extra_base: list = None) -> Optional[tuple[bytes,str]]:
         with tempfile.TemporaryDirectory() as tmp:
-            out_tpl = os.path.join(tmp, "%(title).60s.%(ext)s")
-            cmd = base_cmd + ["-o", out_tpl] + extra_args + [target_url]
-            log.debug("yt-dlp cmd: %s", " ".join(cmd))
+            base = [
+                "yt-dlp", "--no-playlist",
+                "--no-warnings", "--no-check-certificate",
+                "--ffmpeg-location", ffmpeg_dir,
+                "--geo-bypass", "--socket-timeout", "30", "--retries", "3",
+                "-o", os.path.join(tmp, "%(title).60s.%(ext)s"),
+            ]
+            if extra_base:
+                base += extra_base
+            cmd = base + extra_args + [target_url]
+            log.debug("yt-dlp: %s", " ".join(cmd))
             proc = subprocess.run(cmd, capture_output=True, timeout=300)
             stderr = proc.stderr.decode(errors="replace")
             stdout = proc.stdout.decode(errors="replace")
             if proc.returncode != 0:
-                log.error("yt-dlp rc=%d\nSTDERR: %s\nSTDOUT: %s",
-                          proc.returncode, stderr[:1000], stdout[:300])
+                log.warning("yt-dlp rc=%d | %s | %s",
+                            proc.returncode, stderr[:400], stdout[:200])
                 return None
-            files = list(Path(tmp).glob("*"))
+            files = [f for f in Path(tmp).glob("*") if f.stat().st_size > 1000]
             if not files:
-                log.error("yt-dlp: no output files in %s  stdout=%s", tmp, stdout[:200])
+                log.warning("yt-dlp: no output files")
                 return None
-            # Pick largest file (avoid .part files)
             f = sorted(files, key=lambda x: x.stat().st_size, reverse=True)[0]
             data = f.read_bytes()
             log.info("yt-dlp OK: %s  %.1fMB", f.name, len(data)/1024/1024)
             return data, f.name
 
-    if audio_only:
-        # Strategy 1: Let yt-dlp pick best audio, convert to mp3 — NO -f flag
-        for args in [
-            # No format filter at all — yt-dlp picks whatever is available
-            ["-x", "--audio-format", "mp3", "--audio-quality", "5"],
-            # Explicit bestaudio with no codec constraint
-            ["-x", "--audio-format", "mp3", "--audio-quality", "5",
-             "-f", "bestaudio"],
-            # Absolute fallback: download anything and convert
-            ["-x", "--audio-format", "mp3"],
-        ]:
-            result = _run(args, url)
-            if result:
-                return result
-        log.error("youtube_download: all audio strategies failed for %s", url)
-        return None
-    else:
-        # Strategy: try from best quality down, no codec constraints
-        for fmt_args in [
-            # Best video+audio, merged to mp4
-            ["-f", "bestvideo+bestaudio", "--merge-output-format", "mp4"],
-            # Best single-file
-            ["-f", "best", "--merge-output-format", "mp4"],
-            # Absolute fallback — no format spec
-            ["--merge-output-format", "mp4"],
-        ]:
-            result = _run(fmt_args, url)
-            if result:
-                data, fname = result
-                # Trim if too large for a single chunk
-                if len(data) > 200 * 1024 * 1024:
-                    log.info("Video %.1fMB very large, trimming…", len(data)/1024/1024)
-                    with tempfile.TemporaryDirectory() as tmp2:
-                        src = Path(tmp2) / fname
-                        src.write_bytes(data)
-                        trimmed = _trim_video(src, tmp2, ffmpeg_dir)
-                        if trimmed:
-                            data, fname_path = trimmed
-                            fname = Path(fname_path).name
-                return data, fname
-        log.error("youtube_download: all video strategies failed for %s", url)
-        return None
+    # ── Strategy 1: yt-dlp with browser cookies (most reliable) ─────────────
+    if cookies_file and Path(cookies_file).exists():
+        log.info("Strategy 1: yt-dlp + cookies file")
+        base_extra = ["--cookies", cookies_file]
+        if audio_only:
+            r = _ytdlp(["-x", "--audio-format", "mp3", "--audio-quality", "5"],
+                       url, base_extra)
+        else:
+            r = _ytdlp(["-f", "bestvideo+bestaudio/best",
+                        "--merge-output-format", "mp4"], url, base_extra)
+        if r: return _maybe_trim(r, ffmpeg_dir)
+
+    # ── Strategy 2: yt-dlp via Invidious (bypasses YouTube IP blocks) ────────
+    if not is_search and video_id:
+        log.info("Strategy 2: yt-dlp via Invidious for video_id=%s", video_id)
+        # Public Invidious instances — yt-dlp handles them natively
+        invidious_instances = [
+            "https://yewtu.be",
+            "https://inv.nadeko.net",
+            "https://invidious.nerdvpn.de",
+            "https://iv.melmac.space",
+            "https://invidious.privacydev.net",
+        ]
+        for instance in invidious_instances:
+            inv_url = f"{instance}/watch?v={video_id}"
+            log.debug("Trying Invidious: %s", inv_url)
+            if audio_only:
+                r = _ytdlp(["-x", "--audio-format", "mp3", "--audio-quality", "5"],
+                           inv_url)
+            else:
+                r = _ytdlp(["-f", "bestvideo+bestaudio/best",
+                            "--merge-output-format", "mp4"], inv_url)
+            if r:
+                log.info("Invidious download succeeded via %s", instance)
+                return _maybe_trim(r, ffmpeg_dir)
+        log.warning("All Invidious instances failed")
+
+    # ── Strategy 3: pytubefix (different client, bypasses many blocks) ────────
+    if not is_search and video_id:
+        log.info("Strategy 3: pytubefix video_id=%s", video_id)
+        try:
+            from pytubefix import YouTube
+            from pytubefix.cli import on_progress
+            yt = YouTube(
+                f"https://www.youtube.com/watch?v={video_id}",
+                use_oauth=False,
+                allow_oauth_cache=True,
+                on_progress_callback=on_progress,
+            )
+            with tempfile.TemporaryDirectory() as tmp:
+                if audio_only:
+                    stream = (yt.streams
+                                .filter(only_audio=True)
+                                .order_by("abr").last())
+                    if not stream:
+                        raise ValueError("No audio stream found")
+                    safe_title = re.sub(r'[^\w\s-]', '', yt.title)[:50]
+                    fpath = stream.download(output_path=tmp,
+                                           filename=f"{safe_title}.mp4")
+                    # Convert to mp3 with ffmpeg
+                    mp3_path = Path(fpath).with_suffix(".mp3")
+                    subprocess.run(
+                        [str(Path(ffmpeg_dir)/"ffmpeg"), "-y", "-i", fpath,
+                         "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k",
+                         str(mp3_path)],
+                        capture_output=True, timeout=120, check=True,
+                    )
+                    data = mp3_path.read_bytes()
+                    fname = mp3_path.name
+                else:
+                    stream = (yt.streams
+                                .filter(progressive=True, file_extension="mp4")
+                                .order_by("resolution").last())
+                    if not stream:
+                        stream = yt.streams.filter(file_extension="mp4").first()
+                    if not stream:
+                        raise ValueError("No video stream found")
+                    safe_title = re.sub(r'[^\w\s-]', '', yt.title)[:50]
+                    fpath = stream.download(output_path=tmp,
+                                           filename=f"{safe_title}.mp4")
+                    data = Path(fpath).read_bytes()
+                    fname = Path(fpath).name
+            log.info("pytubefix OK: %s  %.1fMB", fname, len(data)/1024/1024)
+            return _maybe_trim((data, fname), ffmpeg_dir)
+        except Exception as e:
+            log.warning("pytubefix failed: %s", e)
+
+    # ── Strategy 4: cobalt.tools public API ──────────────────────────────────
+    if not is_search and video_id:
+        log.info("Strategy 4: cobalt.tools API")
+        try:
+            cobalt_url = f"https://www.youtube.com/watch?v={video_id}"
+            payload = {
+                "url": cobalt_url,
+                "videoQuality": "720",
+                "youtubeVideoCodec": "h264",
+                "filenameStyle": "basic",
+                "downloadMode": "audio" if audio_only else "auto",
+            }
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": UA_DESK,
+            }
+            # Try multiple cobalt instances
+            for cobalt_api in [
+                "https://api.cobalt.tools/",
+                "https://cobalt.api.timelessnesses.me/",
+            ]:
+                resp = WEB.post(cobalt_api, json=payload,
+                                headers=headers, timeout=20)
+                log.debug("cobalt %s: status=%d", cobalt_api, resp.status_code)
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+                status = data.get("status", "")
+                dl_url = data.get("url") or data.get("stream")
+                log.info("cobalt status=%s url=%s", status, str(dl_url)[:80])
+                if status in ("redirect", "stream", "tunnel") and dl_url:
+                    content = download_bytes(dl_url)
+                    if content and len(content) > 10000:
+                        ext = "mp3" if audio_only else "mp4"
+                        fname = f"{video_id}.{ext}"
+                        log.info("cobalt OK: %.1fMB", len(content)/1024/1024)
+                        return _maybe_trim((content, fname), ffmpeg_dir)
+                elif status == "picker":
+                    # cobalt returns multiple streams — grab first
+                    picks = data.get("picker", [])
+                    if picks:
+                        dl_url = picks[0].get("url")
+                        if dl_url:
+                            content = download_bytes(dl_url)
+                            if content and len(content) > 10000:
+                                ext = "mp3" if audio_only else "mp4"
+                                fname = f"{video_id}.{ext}"
+                                return _maybe_trim((content, fname), ffmpeg_dir)
+        except Exception as e:
+            log.warning("cobalt.tools failed: %s", e)
+
+    # ── Strategy 5: yt-dlp with mweb client (last resort) ────────────────────
+    log.info("Strategy 5: yt-dlp mweb/android client")
+    for client in ["mweb", "android", "android_vr"]:
+        log.debug("Trying client: %s", client)
+        args_base = [
+            "--extractor-args", f"youtube:player_client={client}",
+        ]
+        if audio_only:
+            r = _ytdlp(["-x", "--audio-format", "mp3", "--audio-quality", "5"],
+                       url, args_base)
+        else:
+            r = _ytdlp(["--merge-output-format", "mp4"], url, args_base)
+        if r:
+            return _maybe_trim(r, ffmpeg_dir)
+
+    log.error("youtube_download: ALL strategies failed for %r", url)
+    return None
+
+
+def _maybe_trim(result: tuple[bytes,str], ffmpeg_dir: str) -> tuple[bytes,str]:
+    """Trim video if it's extremely large (>500MB), otherwise pass through."""
+    data, fname = result
+    if len(data) > 500 * 1024 * 1024:
+        log.info("_maybe_trim: %.1fMB — trimming", len(data)/1024/1024)
+        with tempfile.TemporaryDirectory() as tmp2:
+            src = Path(tmp2) / fname
+            src.write_bytes(data)
+            trimmed = _trim_video(src, tmp2, ffmpeg_dir)
+            if trimmed:
+                tdata, tpath = trimmed
+                return tdata, Path(tpath).name
+    return data, fname
+
+
 
 def _trim_video(src: Path, tmp: str, ffmpeg_dir="/usr/bin") -> Optional[tuple[bytes,Path]]:
     out = Path(tmp) / ("trimmed_" + src.name)
@@ -1449,9 +1600,10 @@ def do_youtube_dl(cid: int, url: str):
 def _finish_video(cid: int, result):
     if not result:
         send_message(cid,
-                     "❌ دانلود ناموفق بود.\n"
-                     "• اجرا کنید: `yt-dlp -U`\n"
-                     "• یا یک ویدیو دیگر امتحان کنید.",
+                     "❌ دانلود ناموفق بود.\n\n"
+                     "💡 *راه‌حل:* کوکی‌های مرورگر Chrome خود را export کنید:\n"
+                     "`yt-dlp --cookies-from-browser chrome --cookies /path/yt_cookies.txt https://youtube.com`\n"
+                     "سپس: `export YOUTUBE_COOKIES_FILE=/path/yt_cookies.txt`",
                      parse_mode="Markdown", reply_markup=home_kb())
         return
     data, fname = result
@@ -1471,7 +1623,12 @@ def do_music(cid: int, query: str):
     chat_action(cid, "record_voice")
     result = youtube_download(f"ytsearch1:{query}", audio_only=True)
     if not result:
-        send_message(cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb())
+        send_message(cid,
+                     "❌ دانلود ناموفق بود.\n\n"
+                     "💡 *راه‌حل:* کوکی‌های مرورگر Chrome خود را export کنید:\n"
+                     "`yt-dlp --cookies-from-browser chrome --cookies /path/yt_cookies.txt https://youtube.com`\n"
+                     "سپس: `export YOUTUBE_COOKIES_FILE=/path/yt_cookies.txt`",
+                     parse_mode="Markdown", reply_markup=home_kb())
         return
     data, fname = result
     fname = Path(fname).name
@@ -2078,6 +2235,14 @@ def run():
     if TOKEN == "YOUR_BOT_TOKEN_HERE":
         log.critical("BALE_TOKEN not set! Run: export BALE_TOKEN=your_token")
         return
+    if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).exists():
+        log.info("YouTube cookies: %s ✅", YOUTUBE_COOKIES_FILE)
+    else:
+        log.warning(
+            "YouTube cookies NOT configured — downloads may fail on datacenter IPs.\n"
+            "  Fix: yt-dlp --cookies-from-browser chrome --cookies /path/yt_cookies.txt https://youtube.com\n"
+            "  Then: export YOUTUBE_COOKIES_FILE=/path/yt_cookies.txt"
+        )
     offset = 0
     while True:
         try:
