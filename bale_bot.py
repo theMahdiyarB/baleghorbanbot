@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 دستیار وب — Bale Bot  (v4)
 Full-featured web assistant for Bale messenger.
