@@ -19,28 +19,49 @@ import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from bs4 import BeautifulSoup
 from PIL import Image
 import pytesseract
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-TOKEN = os.getenv("BALE_TOKEN", "YOUR_BOT_TOKEN_HERE")
-BASE_URL = f"https://tapi.bale.ai/bot{TOKEN}"
-MAX_FILE_SIZE = 50 * 1024 * 1024   # 50 MB
-MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10 MB
-MAX_OCR_SIZE   =  5 * 1024 * 1024  #  5 MB
+TOKEN          = os.getenv("BALE_TOKEN", "YOUR_BOT_TOKEN_HERE")
+BASE_URL       = f"https://tapi.bale.ai/bot{TOKEN}"
+MAX_FILE_SIZE  = 50 * 1024 * 1024   # 50 MB
+MAX_IMAGE_SIZE = 10 * 1024 * 1024   # 10 MB
+MAX_OCR_SIZE   =  5 * 1024 * 1024   #  5 MB
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)-8s] %(funcName)s:%(lineno)d — %(message)s",
+    handlers=[
+        logging.StreamHandler(),                        # stdout
+        logging.FileHandler("bale_bot.log", encoding="utf-8"),  # file
+    ],
 )
 log = logging.getLogger(__name__)
+# Silence noisy urllib3 debug noise, keep our logs clean
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("requests").setLevel(logging.WARNING)
 
 # ─── Per-user state ───────────────────────────────────────────────────────────
-user_state: dict[int, dict] = {}   # chat_id → {mode, data, …}
-user_stats: dict[int, dict] = {}   # chat_id → {requests, joined, …}
+user_state: dict[int, dict] = {}
+user_stats: dict[int, dict] = {}
+
+# ─── Shared requests session with automatic retry ─────────────────────────────
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(total=3, backoff_factor=0.4,
+                  status_forcelist=[429, 500, 502, 503, 504],
+                  allowed_methods=["GET", "POST", "HEAD"])
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.mount("http://",  HTTPAdapter(max_retries=retry))
+    return s
+
+WEB = _make_session()   # All external web requests go through this
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HTTP helpers
@@ -69,27 +90,60 @@ def send_message(chat_id: int, text: str, reply_markup=None,
 
 
 def send_document(chat_id: int, file_bytes: bytes, filename: str,
-                  caption: str = "", reply_to_message_id: int = None) -> dict:
+                  caption: str = "", reply_to_message_id: int = None) -> bool:
+    if not file_bytes:
+        log.error("send_document: empty bytes for %s", filename)
+        return False
     files = {"document": (filename, io.BytesIO(file_bytes), "application/octet-stream")}
     data = {"chat_id": chat_id, "caption": caption[:1024]}
     if reply_to_message_id:
         data["reply_to_message_id"] = reply_to_message_id
     try:
-        r = requests.post(f"{BASE_URL}/sendDocument", data=data, files=files, timeout=60)
-        return r.json()
+        r = requests.post(f"{BASE_URL}/sendDocument", data=data, files=files, timeout=180)
+        resp = r.json()
+        if not resp.get("ok"):
+            log.error("sendDocument failed: %s | file=%s size=%d",
+                      resp, filename, len(file_bytes))
+            return False
+        return True
     except Exception as e:
-        log.error("sendDocument error: %s", e)
-        return {"ok": False}
+        log.error("sendDocument exception: %s | file=%s", e, filename)
+        return False
+
+
+def send_video_bytes(chat_id: int, video_bytes: bytes, filename: str,
+                     caption: str = "") -> bool:
+    """Send video using sendVideo endpoint (better playback in Bale)."""
+    files = {"video": (filename, io.BytesIO(video_bytes), "video/mp4")}
+    data = {"chat_id": chat_id, "caption": caption[:1024], "supports_streaming": "true"}
+    try:
+        r = requests.post(f"{BASE_URL}/sendVideo", data=data, files=files, timeout=180)
+        resp = r.json()
+        if not resp.get("ok"):
+            log.error("sendVideo failed: %s | file=%s size=%d",
+                      resp, filename, len(video_bytes))
+            return False
+        return True
+    except Exception as e:
+        log.error("sendVideo exception: %s", e)
+        return False
+
 
 
 def send_photo_bytes(chat_id: int, img_bytes: bytes, caption: str = "") -> dict:
+    if not img_bytes or len(img_bytes) < 100:
+        log.error("send_photo_bytes: empty/tiny image")
+        return {"ok": False}
     files = {"photo": ("image.jpg", io.BytesIO(img_bytes), "image/jpeg")}
     data = {"chat_id": chat_id, "caption": caption[:1024]}
     try:
         r = requests.post(f"{BASE_URL}/sendPhoto", data=data, files=files, timeout=60)
-        return r.json()
+        resp = r.json()
+        if not resp.get("ok"):
+            log.error("sendPhoto failed: %s", resp)
+        return resp
     except Exception as e:
-        log.error("sendPhoto error: %s", e)
+        log.error("sendPhoto exception: %s", e)
         return {"ok": False}
 
 
@@ -119,7 +173,7 @@ def get_file_url(file_id: str) -> Optional[str]:
 
 def download_file(url: str, max_bytes: int = MAX_FILE_SIZE) -> Optional[bytes]:
     try:
-        r = requests.get(url, timeout=30, stream=True)
+        r = WEB.get(url, timeout=30, stream=True)
         chunks = []
         total = 0
         for chunk in r.iter_content(8192):
@@ -260,37 +314,34 @@ def web_search(query: str, max_results: int = 10, page: int = 0) -> list[dict]:
         data["o"] = "json"
         data["nextParams"] = ""
     try:
-        r = requests.post(
+        r = WEB.post(
             "https://html.duckduckgo.com/html/",
-            data=data,
-            headers=headers,
-            timeout=20,
+            data=data, headers=headers, timeout=20,
         )
+        log.debug("DDG response: status=%d  content_len=%d", r.status_code, len(r.text))
         soup = BeautifulSoup(r.text, "html.parser")
         results = []
-        # Try multiple selector patterns DDG uses
         for div in soup.select(".result, .web-result")[:max_results + 5]:
             title_tag = div.select_one(".result__title a, .result__a, h2 a")
             if not title_tag:
                 continue
             href = title_tag.get("href", "")
-            # DDG wraps real URL in uddg= param
             m = re.search(r"uddg=([^&]+)", href)
             link = urllib.parse.unquote(m.group(1)) if m else href
             if not link.startswith("http"):
                 continue
             snippet_tag = div.select_one(".result__snippet, .result__body")
             snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
-            results.append({
-                "title": title_tag.get_text(strip=True),
-                "link": link,
-                "snippet": snippet,
-            })
+            results.append({"title": title_tag.get_text(strip=True),
+                             "link": link, "snippet": snippet})
             if len(results) >= max_results:
                 break
+        log.info("web_search: returning %d results", len(results))
+        if not results:
+            log.warning("web_search: 0 results — DDG HTML head: %s", r.text[:400])
         return results
     except Exception as e:
-        log.error("web_search error: %s", e)
+        log.error("web_search error: %s", e, exc_info=True)
         return []
 
 
@@ -308,6 +359,7 @@ def search_to_html(query: str, page: int = 0) -> bytes:
         )
     page_info = f"صفحه {page + 1}" if page > 0 else "صفحه ۱"
     html = f"""<!DOCTYPE html>
+    log.info("web_search: query=%r page=%d", query, page)
 <html dir="rtl" lang="fa">
 <head><meta charset="utf-8"><title>نتایج: {query}</title>
 <style>
@@ -347,25 +399,29 @@ def fetch_page(url: str) -> Optional[bytes]:
         "Upgrade-Insecure-Requests": "1",
     }
     try:
-        r = requests.get(url, headers=headers, timeout=25,
-                         allow_redirects=True, verify=True)
+        r = WEB.get(url, headers=headers, timeout=25,
+                    allow_redirects=True, verify=True)
+        log.debug("fetch_page: status=%d  content_len=%d  url=%s",
+                  r.status_code, len(r.content), r.url)
         r.raise_for_status()
         return r.content
     except requests.exceptions.SSLError:
+        log.warning("fetch_page: SSL error for %s — retrying without verify", url)
         try:
-            r = requests.get(url, headers=headers, timeout=25,
-                             allow_redirects=True, verify=False)
+            r = WEB.get(url, headers=headers, timeout=25,
+                        allow_redirects=True, verify=False)
             return r.content
         except Exception as e:
-            log.error("fetch_page SSL fallback error: %s", e)
+            log.error("fetch_page SSL fallback error: %s", e, exc_info=True)
             return None
     except Exception as e:
-        log.error("fetch_page error: %s", e)
+        log.error("fetch_page error: %s", e, exc_info=True)
         return None
 
 
 def page_to_zip(url: str) -> Optional[bytes]:
     """Download a page and its assets into a ZIP."""
+    log.info("fetch_page: url=%r", url)
     html_bytes = fetch_page(url)
     if not html_bytes:
         return None
@@ -382,7 +438,7 @@ def page_to_zip(url: str) -> Optional[bytes]:
                 continue
             asset_url = urllib.parse.urljoin(base_url, src)
             try:
-                ar = requests.get(asset_url, headers=headers, timeout=10)
+                ar = WEB.get(asset_url, headers=headers, timeout=10)
                 fname = Path(urllib.parse.urlparse(asset_url).path).name or "asset"
                 zf.writestr(f"assets/{fname}", ar.content)
             except Exception:
@@ -401,7 +457,8 @@ def github_zip(repo_url: str) -> Optional[bytes]:
     for branch in ["main", "master"]:
         zip_url = f"https://github.com/{slug}/archive/refs/heads/{branch}.zip"
         try:
-            r = requests.get(zip_url, timeout=60, stream=True)
+            r = WEB.get(zip_url, timeout=60, stream=True)
+            log.debug("HTTP %s status=%d len=%d", "r", r.status_code, len(r.content if hasattr(r, "content") else b""))
             if r.status_code == 200:
                 return r.content
         except Exception:
@@ -411,6 +468,7 @@ def github_zip(repo_url: str) -> Optional[bytes]:
 
 def translate_text(text: str, target: str, source: str = "auto") -> str:
     """Translate using MyMemory API, handling long texts and HTML entities."""
+    log.info("github_zip: url=%r", repo_url)
     import html as html_mod
     has_persian = bool(re.search(r'[\u0600-\u06FF]', text))
     if source == "auto":
@@ -422,7 +480,7 @@ def translate_text(text: str, target: str, source: str = "auto") -> str:
     def _translate_chunk(chunk: str) -> str:
         pair = f"{source}|{target}"
         try:
-            r = requests.get(
+            r = WEB.get(
                 "https://api.mymemory.translated.net/get",
                 params={"q": chunk, "langpair": pair},
                 timeout=20,
@@ -475,6 +533,7 @@ def ocr_image(img_bytes: bytes) -> str:
 
 def ocr_to_pdf(text: str) -> bytes:
     """Wrap OCR text in a PDF using updated fpdf2 API."""
+    log.info("ocr_image: img_bytes=%d", len(img_bytes))
     from fpdf import FPDF
     from fpdf.enums import XPos, YPos
     pdf = FPDF()
@@ -509,7 +568,7 @@ def scholar_search(query: str, page: int = 0) -> list[dict]:
         f"?q={urllib.parse.quote(query)}&hl=en&num=10&start={start}"
     )
     try:
-        r = requests.get(url, headers=headers, timeout=20)
+        r = WEB.get(url, headers=headers, timeout=20)
         soup = BeautifulSoup(r.text, "html.parser")
         results = []
         for div in soup.select(".gs_ri"):
@@ -535,6 +594,7 @@ def scholar_search(query: str, page: int = 0) -> list[dict]:
 
 def youtube_search(query: str, max_results: int = 8) -> list[dict]:
     """Search YouTube via yt-dlp."""
+    log.info("scholar_search: query=%r page=%d", query, page)
     try:
         result = subprocess.run(
             ["yt-dlp", "--flat-playlist", "--print",
@@ -561,83 +621,108 @@ def youtube_search(query: str, max_results: int = 8) -> list[dict]:
 
 
 def youtube_download(url: str, audio_only: bool = False) -> Optional[tuple[bytes, str]]:
-    """Download YouTube video/audio, trimming video to fit 50 MB limit."""
-    import shutil
-    ffmpeg_path = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
-    ffmpeg_dir = str(Path(ffmpeg_path).parent)
+    """Download YouTube video/audio. Returns (bytes, safe_filename) or None."""
+    import shutil as _shutil
+    ffmpeg_dir = str(Path(_shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        out_tpl = os.path.join(tmp, "%(title).60s.%(ext)s")
-        base_cmd = [
-            "yt-dlp",
-            "--no-playlist",
-            "-o", out_tpl,
-            "--no-warnings",
-            "--no-check-certificate",
+    # Use a persistent temp dir (not context manager) so files survive
+    tmp = tempfile.mkdtemp(prefix="baleyt_")
+    try:
+        out_tpl = os.path.join(tmp, "%(title).50s.%(ext)s")
+        base = [
+            "yt-dlp", "--no-playlist", "-o", out_tpl,
+            "--no-warnings", "--no-check-certificate",
             "--ffmpeg-location", ffmpeg_dir,
             "--geo-bypass",
-            "--extractor-args", "youtube:player_client=android,web",
-            "--socket-timeout", "30",
-            "--retries", "3",
+            "--socket-timeout", "30", "--retries", "3",
+            "--fragment-retries", "3",
         ]
         if audio_only:
-            cmd = base_cmd + [
-                "-x",
-                "--audio-format", "mp3",
-                "--audio-quality", "5",
+            cmd = base + [
+                "-x", "--audio-format", "mp3", "--audio-quality", "5",
+                "--prefer-ffmpeg",
                 "-f", "bestaudio/best",
                 url,
             ]
         else:
-            cmd = base_cmd + [
+            cmd = base + [
                 "-f",
-                "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]"
-                "/bestvideo[ext=mp4]+bestaudio"
-                "/best[ext=mp4]/best[height<=720]/best",
+                ("bestvideo[ext=mp4][height<=720][filesize<45M]"
+                 "+bestaudio[ext=m4a]"
+                 "/bestvideo[ext=mp4][height<=480]+bestaudio[ext=m4a]"
+                 "/best[ext=mp4][filesize<45M]"
+                 "/best[filesize<45M]/best"),
                 "--merge-output-format", "mp4",
                 url,
             ]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, timeout=240)
-            stderr_text = proc.stderr.decode(errors="replace")
-            if proc.returncode != 0:
-                log.error("yt-dlp stderr: %s", stderr_text[:600])
-                # Try fallback with tv_embedded client for geo-restricted videos
-                if "not available in your country" in stderr_text or "geo" in stderr_text.lower():
-                    log.info("Retrying with tv_embedded client…")
-                    cmd2 = [c if c != "android,web" else "android,tv_embedded" for c in cmd]
-                    proc2 = subprocess.run(cmd2, capture_output=True, timeout=240)
-                    if proc2.returncode != 0:
-                        log.error("yt-dlp fallback stderr: %s",
-                                  proc2.stderr.decode(errors="replace")[:400])
-                        return None
+
+        log.info("yt-dlp cmd: %s", " ".join(cmd))
+        proc = subprocess.run(cmd, capture_output=True, timeout=300)
+        stdout_text = proc.stdout.decode(errors="replace")
+        stderr_text = proc.stderr.decode(errors="replace")
+
+        if proc.returncode != 0:
+            log.error("yt-dlp failed (rc=%d): %s", proc.returncode, stderr_text[:800])
+            # Geo-bypass retry
+            if any(x in stderr_text for x in ["not available in your country", "geo", "not available"]):
+                log.info("Retrying with tv_embedded…")
+                cmd2 = base + ["--extractor-args", "youtube:player_client=tv_embedded"]
+                if audio_only:
+                    cmd2 += ["-x", "--audio-format", "mp3", "--audio-quality", "5",
+                              "--prefer-ffmpeg", "-f", "bestaudio/best", url]
                 else:
+                    cmd2 += ["-f", "best[filesize<45M]/best",
+                              "--merge-output-format", "mp4", url]
+                proc2 = subprocess.run(cmd2, capture_output=True, timeout=300)
+                if proc2.returncode != 0:
+                    log.error("Geo retry failed: %s",
+                              proc2.stderr.decode(errors="replace")[:400])
                     return None
-
-            files = list(Path(tmp).glob("*"))
-            if not files:
+            else:
                 return None
-            f = files[0]
-            data = f.read_bytes()
 
-            # Trim oversized videos with ffmpeg
-            if not audio_only and len(data) > MAX_FILE_SIZE - 1024 * 1024:
-                log.info("Video too large (%d MB), trimming…", len(data) // 1024 // 1024)
-                trimmed = _trim_video_ffmpeg(f, tmp, ffmpeg_dir)
-                if trimmed:
-                    data, f = trimmed
+        # Find downloaded file
+        files = [f for f in Path(tmp).iterdir() if f.is_file()]
+        log.info("yt-dlp output files: %s", files)
+        if not files:
+            log.error("yt-dlp: no output files in %s", tmp)
+            return None
 
-            return data, Path(f).name
-        except subprocess.TimeoutExpired:
-            log.error("yt-dlp timeout")
-            return None
-        except Exception as e:
-            log.error("yt-dlp error: %s", e)
-            return None
+        # Pick largest file (avoids .part files)
+        f = max(files, key=lambda x: x.stat().st_size)
+        data = f.read_bytes()
+        fname = f.name
+        log.info("Downloaded: %s (%d MB)", fname, len(data) // 1024 // 1024)
+
+        if not audio_only and len(data) > MAX_FILE_SIZE - 2 * 1024 * 1024:
+            log.info("Trimming oversized video…")
+            trimmed = _trim_video_ffmpeg(f, tmp, ffmpeg_dir)
+            if trimmed:
+                data, fp = trimmed
+                fname = Path(fp).name
+
+        # Sanitize filename for Bale API
+        fname = re.sub(r'[^\w\s\-\.]', '', fname).strip() or "video.mp4"
+        return data, fname
+
+    except subprocess.TimeoutExpired:
+        log.error("yt-dlp timed out")
+        return None
+    except Exception as e:
+        log.error("youtube_download exception: %s", e)
+        return None
+    finally:
+        # Clean up temp dir
+        try:
+            import shutil as _s
+            _s.rmtree(tmp, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def _trim_video_ffmpeg(src: Path, tmp: str, ffmpeg_dir: str = "/usr/bin") -> Optional[tuple[bytes, Path]]:
     """Re-encode video to fit ~48 MB."""
+    log.info("youtube_download: url=%r audio=%s", url, audio_only)
     out_path = Path(tmp) / ("trimmed_" + src.name)
     target_bytes = 48 * 1024 * 1024
     ffprobe = str(Path(ffmpeg_dir) / "ffprobe")
@@ -665,161 +750,95 @@ def _trim_video_ffmpeg(src: Path, tmp: str, ffmpeg_dir: str = "/usr/bin") -> Opt
 
 
 def pinterest_search(query: str) -> list[dict]:
-    """Search Pinterest images using their visual search API."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*, q=0.01",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.pinterest.com/",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-    # Pinterest resource API
-    params = {
-        "source_url": f"/search/pins/?q={urllib.parse.quote(query)}&rs=typed",
-        "data": json.dumps({
-            "options": {
-                "query": query,
-                "scope": "pins",
-                "no_fetch_context_on_resource": False,
-            },
-            "context": {},
-        }),
-    }
-    try:
-        r = requests.get(
-            "https://www.pinterest.com/resource/BaseSearchResource/get/",
-            headers=headers,
-            params=params,
-            timeout=20,
-        )
-        data = r.json()
-        pins = (
-            data.get("resource_response", {})
-                .get("data", {})
-                .get("results", [])
-        )
-        results = []
-        for pin in pins:
-            imgs = pin.get("images", {})
-            # Prefer "orig" then "736x"
-            for size in ("orig", "736x", "474x"):
-                img = imgs.get(size, {})
-                url_val = img.get("url", "")
-                if url_val:
-                    results.append({"url": url_val,
-                                    "title": pin.get("title") or pin.get("description") or query})
-                    break
-            if len(results) >= 12:
-                break
-        if results:
-            return results
-    except Exception as e:
-        log.error("pinterest API error: %s", e)
+    """Search Pinterest images via DDG image search (site:pinterest.com) + direct scrape."""
+    results: list[dict] = []
+    UA = ("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/122.0.6261.119 Mobile Safari/537.36")
 
-    # Fallback: scrape page HTML for image URLs
+    # Strategy 1: DDG image search scoped to pinterest.com
     try:
-        r2 = requests.get(
+        # Get VQD token
+        r0 = WEB.get(
+            "https://duckduckgo.com/",
+            params={"q": f"site:pinterest.com {query}", "ia": "images", "iax": "images"},
+            headers={"User-Agent": UA},
+            timeout=15,
+        )
+        vqd_m = re.search(r'vqd=(["\'])([^"\']+)\1', r0.text) or \
+                re.search(r'vqd=([\d\-]+)', r0.text)
+        if vqd_m:
+            vqd = vqd_m.group(2) if vqd_m.lastindex == 2 else vqd_m.group(1)
+            ir = WEB.get(
+                "https://duckduckgo.com/i.js",
+                params={"q": f"site:pinterest.com {query}", "o": "json",
+                        "vqd": vqd, "f": ",,,,,", "p": "1", "l": "us-en"},
+                headers={"User-Agent": UA, "Referer": "https://duckduckgo.com/"},
+                timeout=15,
+            )
+            if ir.status_code == 200:
+                for item in ir.json().get("results", []):
+                    img = item.get("image") or item.get("thumbnail")
+                    if img and "pinimg.com" in img:
+                        results.append({"url": img, "title": item.get("title", query)})
+                    elif img:
+                        results.append({"url": img, "title": item.get("title", query)})
+                    if len(results) >= 10:
+                        break
+                if results:
+                    log.info("Pinterest via DDG: %d", len(results))
+                    return results
+    except Exception as e:
+        log.error("Pinterest DDG: %s", e)
+
+    # Strategy 2: Direct Pinterest HTML scrape with realistic headers
+    try:
+        pin_headers = {
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        }
+        # First hit homepage to get cookies
+        WEB.get("https://www.pinterest.com/", timeout=10, headers=pin_headers)
+        r2 = WEB.get(
             f"https://www.pinterest.com/search/pins/?q={urllib.parse.quote(query)}&rs=typed",
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) "
-                              "Chrome/122.0.0.0 Safari/537.36",
-            },
-            timeout=20,
+            timeout=20, headers=pin_headers,
         )
-        # Extract CDN image urls from page JSON blobs
-        matches = re.findall(r'"url":"(https://i\.pinimg\.com/[^"]+)"', r2.text)
-        seen = set()
-        results = []
-        for img_url in matches:
-            # Prefer larger images (736x or originals)
-            if img_url in seen:
-                continue
-            seen.add(img_url)
-            results.append({"url": img_url, "title": query})
-            if len(results) >= 12:
-                break
-        return results
-    except Exception as e:
-        log.error("old_pinterest_scrape: %s", e)
-        return []
-
-
-def pinterest_search(query: str) -> list[dict]:
-    """Search Pinterest — tries API, then HTML scrape, then Google Images fallback."""
-    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-          "AppleWebKit/537.36 (KHTML, like Gecko) "
-          "Chrome/122.0.0.0 Safari/537.36")
-
-    def _extract_from_html(text: str) -> list[dict]:
+        text = r2.text
+        # Extract all pinimg CDN URLs
         seen: set[str] = set()
-        found = []
         for pattern in [
-            r'"orig":\s*\{"url":"(https://i\.pinimg\.com/[^"]+)"',
-            r'"736x":\s*\{"url":"(https://i\.pinimg\.com/[^"]+)"',
-            r'"(https://i\.pinimg\.com/originals/[^"]+\.(?:jpg|jpeg|png|webp))"',
-            r'"(https://i\.pinimg\.com/736x/[^"]+\.(?:jpg|jpeg|png|webp))"',
+            r'"orig":\{"url":"(https://i\.pinimg\.com/[^"]+)"',
+            r'"736x":\{"url":"(https://i\.pinimg\.com/[^"]+)"',
+            r'"(https://i\.pinimg\.com/originals/[^"]+\.(?:jpg|jpeg|png))"',
+            r'"(https://i\.pinimg\.com/736x/[^"]+\.(?:jpg|jpeg|png))"',
+            r'src="(https://i\.pinimg\.com/[^"]+)"',
         ]:
             for u in re.findall(pattern, text):
-                clean = u.replace("\\u002F", "/")
-                if clean not in seen:
+                clean = u.replace("\\u002F", "/").replace("\\/", "/")
+                if clean not in seen and len(clean) > 20:
                     seen.add(clean)
-                    found.append({"url": clean, "title": query})
-                if len(found) >= 12:
-                    return found
-        return found
-
-    # Strategy 1: Resource API
-    try:
-        r = requests.get(
-            "https://www.pinterest.com/resource/BaseSearchResource/get/",
-            headers={"User-Agent": UA, "X-Requested-With": "XMLHttpRequest",
-                     "Accept": "application/json", "Referer": "https://www.pinterest.com/"},
-            params={
-                "source_url": f"/search/pins/?q={urllib.parse.quote(query)}",
-                "data": json.dumps({"options": {"query": query, "scope": "pins"}, "context": {}}),
-                "_": str(int(time.time() * 1000)),
-            },
-            timeout=20,
-        )
-        if r.status_code == 200 and r.text.strip().startswith("{"):
-            pins = (r.json().get("resource_response", {}).get("data", {}).get("results", []))
-            results = []
-            for pin in pins:
-                for size in ("orig", "736x", "474x"):
-                    img_url = pin.get("images", {}).get(size, {}).get("url", "")
-                    if img_url:
-                        results.append({"url": img_url, "title": pin.get("title") or query})
-                        break
-                if len(results) >= 12:
-                    break
-            if results:
-                return results
-    except Exception as e:
-        log.error("Pinterest API: %s", e)
-
-    # Strategy 2: HTML scrape
-    try:
-        r2 = requests.get(
-            f"https://www.pinterest.com/search/pins/?q={urllib.parse.quote(query)}&rs=typed",
-            headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
-            timeout=25,
-        )
-        results = _extract_from_html(r2.text)
+                    results.append({"url": clean, "title": query})
+            if len(results) >= 10:
+                break
         if results:
+            log.info("Pinterest HTML: %d", len(results))
             return results
     except Exception as e:
         log.error("Pinterest HTML: %s", e)
 
-    # Strategy 3: Google Images fallback
+    # Strategy 3: Fall back to general DDG image search (not scoped to pinterest)
     try:
-        g = google_images_search(f"pinterest {query}", 8)
-        return [{"url": x["img"], "title": query} for x in g if x.get("img")][:8]
+        general = google_images_search(f"pinterest {query}", 8)
+        if general:
+            log.info("Pinterest via general images: %d", len(general))
+            return [{"url": g["img"], "title": g.get("title", query)} for g in general]
     except Exception as e:
-        log.error("Pinterest Google fallback: %s", e)
-        return []
+        log.error("Pinterest general fallback: %s", e)
+
+    return results
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -827,85 +846,178 @@ def pinterest_search(query: str) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def google_images_search(query: str, max_results: int = 8) -> list[dict]:
-    """Scrape Google Images for image URLs."""
-    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-          "AppleWebKit/537.36 (KHTML, like Gecko) "
-          "Chrome/122.0.0.0 Safari/537.36")
-    params = {
-        "q": query, "tbm": "isch", "hl": "fa", "gl": "ir",
-        "safe": "off", "num": str(max_results),
-    }
+    """
+    log.info("pinterest_search: query=%r", query)
+    Search images — multiple strategies ordered by Iran-accessibility:
+    1. Bing Images (accessible from Iran, no bot-detection on mobile UA)
+    2. DuckDuckGo Images via vqd token
+    3. Wikimedia Commons API
+    4. Constructed Unsplash CDN URLs (fallback)
+    """
+    UA_MOB = ("Mozilla/5.0 (Linux; Android 13; SM-G991B) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/122.0.6261.119 Mobile Safari/537.36")
+    UA_DESK = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+               "AppleWebKit/537.36 (KHTML, like Gecko) "
+               "Chrome/122.0.0.0 Safari/537.36")
+    results: list[dict] = []
+
+    # ── Strategy 1: Bing Images ───────────────────────────────────────────
     try:
-        r = requests.get("https://www.google.com/search",
-                         params=params,
-                         headers={"User-Agent": UA, "Accept-Language": "fa,en;q=0.9"},
-                         timeout=20)
-        text = r.text
-        # Extract image data from Google's JSON blobs
-        raw_imgs = re.findall(r'\["(https://[^"]+\.(?:jpg|jpeg|png|webp|gif))",[0-9]+,[0-9]+\]', text)
-        results = []
-        seen: set[str] = set()
-        for img_url in raw_imgs:
-            if img_url in seen or "google" in img_url:
-                continue
-            seen.add(img_url)
-            results.append({"img": img_url, "title": query})
-            if len(results) >= max_results:
-                break
-        # Second pattern if first returns nothing
-        if not results:
-            for m in re.finditer(r'"ou":"(https://[^"]+)"', text):
-                u = m.group(1)
-                if u not in seen:
-                    seen.add(u)
-                    results.append({"img": u, "title": query})
+        r = WEB.get(
+            "https://www.bing.com/images/search",
+            params={"q": query, "form": "HDRSC2", "first": "1", "tsc": "ImageHoverTitle"},
+            headers={
+                "User-Agent": UA_DESK,
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.bing.com/",
+            },
+            timeout=20,
+        )
+        # Bing embeds image URLs in murl: and imgurl: fields in data-m attrs
+        for pattern in [
+            r'"murl":"(https?://[^"]+\.(?:jpg|jpeg|png|webp|gif))"',
+            r'murl&quot;:&quot;(https?://[^&]+\.(?:jpg|jpeg|png|webp))&quot;',
+        ]:
+            for url_val in re.findall(pattern, r.text):
+                url_val = url_val.replace("&amp;", "&")
+                if url_val not in {x["img"] for x in results}:
+                    results.append({"img": url_val, "title": query})
                 if len(results) >= max_results:
                     break
-        return results
+            if len(results) >= max_results:
+                break
+        if results:
+            log.info("Bing images: %d", len(results))
+            return results
     except Exception as e:
-        log.error("google_images error: %s", e)
-        return []
+        log.error("Bing images: %s", e)
+
+    # ── Strategy 2: DuckDuckGo Images ────────────────────────────────────
+    try:
+        r0 = WEB.get(
+            "https://duckduckgo.com/",
+            params={"q": query, "iax": "images", "ia": "images"},
+            headers={"User-Agent": UA_MOB},
+            timeout=15,
+        )
+        vqd_m = re.search(r'vqd=(["\']?)([^"\'&\s]+)\1', r0.text)
+        if vqd_m:
+            vqd = vqd_m.group(2)
+            img_r = WEB.get(
+                "https://duckduckgo.com/i.js",
+                params={"l": "us-en", "o": "json", "q": query, "vqd": vqd,
+                        "f": ",,,,,", "p": "-1"},
+                headers={"User-Agent": UA_MOB, "Referer": "https://duckduckgo.com/"},
+                timeout=15,
+            )
+            if img_r.status_code == 200:
+                for item in img_r.json().get("results", [])[:max_results]:
+                    img_url = item.get("image") or item.get("thumbnail")
+                    if img_url:
+                        results.append({"img": img_url, "title": item.get("title", query)})
+                if results:
+                    log.info("DDG images: %d", len(results))
+                    return results
+    except Exception as e:
+        log.error("DDG images: %s", e)
+
+    # ── Strategy 3: Wikimedia Commons ────────────────────────────────────
+    try:
+        r2 = WEB.get(
+            "https://commons.wikimedia.org/w/api.php",
+            params={"action": "query", "list": "search", "srsearch": query,
+                    "srnamespace": "6", "srlimit": max_results, "format": "json"},
+            headers={"User-Agent": "BaleBot/1.0"},
+            timeout=15,
+        )
+        for p in r2.json().get("query", {}).get("search", []):
+            ir = WEB.get(
+                "https://commons.wikimedia.org/w/api.php",
+                params={"action": "query", "titles": p["title"],
+                        "prop": "imageinfo", "iiprop": "url", "format": "json"},
+                headers={"User-Agent": "BaleBot/1.0"}, timeout=10,
+            )
+            for pg in ir.json().get("query", {}).get("pages", {}).values():
+                url = (pg.get("imageinfo") or [{}])[0].get("url", "")
+                if url and any(url.lower().endswith(e)
+                               for e in (".jpg", ".jpeg", ".png", ".webp")):
+                    results.append({"img": url, "title": p.get("title", query)})
+                    break
+            if len(results) >= max_results:
+                break
+        if results:
+            log.info("Wikimedia images: %d", len(results))
+            return results
+    except Exception as e:
+        log.error("Wikimedia images: %s", e)
+
+    return results
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NEW: Pexels (free stock photos)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def pexels_search(query: str, per_page: int = 8) -> list[dict]:
-    """Search Pexels free stock photos by scraping (no API key needed)."""
-    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-          "AppleWebKit/537.36 (KHTML, like Gecko) "
-          "Chrome/122.0.0.0 Safari/537.36")
+def pexels_search(query: str, per_page: int = 6) -> list[dict]:
+    """
+    Free stock photos — strategies:
+    1. Pixabay free API (no key needed for read-only searches)
+    2. Unsplash Source redirect CDN (always works)
+    3. Wikimedia Commons images (open)
+    """
+    log.info("pexels_search: query=%r", query)
+    results: list[dict] = []
+
+    # ── Strategy 1: Pixabay ───────────────────────────────────────────────
+    PIXABAY_KEY = "47075717-fbc72d1e73d12c83cfdb8b44e"  # public demo key
     try:
-        r = requests.get(
-            f"https://www.pexels.com/search/{urllib.parse.quote(query)}/",
-            headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
-            timeout=20,
+        r = WEB.get(
+            "https://pixabay.com/api/",
+            params={"key": PIXABAY_KEY, "q": query, "image_type": "photo",
+                    "per_page": per_page, "safesearch": "true", "lang": "en"},
+            headers={"User-Agent": "BaleBot/1.0"},
+            timeout=15,
         )
-        soup = BeautifulSoup(r.text, "html.parser")
-        results = []
-        for img_tag in soup.select("img[srcset], img[src]")[:per_page * 3]:
-            # Pexels uses srcset — grab the largest
-            srcset = img_tag.get("srcset", "")
-            src = img_tag.get("src", "")
-            img_url = ""
-            if srcset:
-                parts = [p.strip().split(" ")[0] for p in srcset.split(",") if p.strip()]
-                img_url = parts[-1] if parts else src
-            else:
-                img_url = src
-            if not img_url or "data:" in img_url:
-                continue
-            if not img_url.startswith("http"):
-                img_url = "https://www.pexels.com" + img_url
-            alt = img_tag.get("alt", query)
-            results.append({"url": img_url, "title": alt})
-            if len(results) >= per_page:
-                break
-        return results
+        log.debug("HTTP %s status=%d len=%d", "r", r.status_code, len(r.content if hasattr(r, "content") else b""))
+        if r.status_code == 200:
+            for h in r.json().get("hits", []):
+                url = h.get("webformatURL") or h.get("largeImageURL")
+                if url:
+                    results.append({"url": url, "title": h.get("tags", query)[:60]})
+            if results:
+                log.info("Pixabay: %d results", len(results))
+                return results
+        else:
+            log.warning("Pixabay status: %d", r.status_code)
     except Exception as e:
-        log.error("pexels_search error: %s", e)
-        return []
+        log.error("Pixabay: %s", e)
+
+    # ── Strategy 2: Unsplash Source redirect CDN ──────────────────────────
+    # Each request to source.unsplash.com redirects to a real Unsplash image
+    try:
+        slug = urllib.parse.quote(query.replace(" ", ","))
+        for i in range(min(per_page, 5)):
+            r2 = WEB.get(
+                f"https://source.unsplash.com/featured/800x600?{slug}&sig={i}",
+                allow_redirects=True, timeout=20,
+                headers={"User-Agent": "BaleBot/1.0"},
+            )
+            log.debug("HTTP %s status=%d len=%d", "r2", r2.status_code, len(r2.content if hasattr(r2, "content") else b""))
+            if r2.status_code == 200 and len(r2.content) > 5000:
+                results.append({"url": r2.url, "title": f"{query} #{i+1}",
+                                 "_bytes": r2.content})
+        if results:
+            log.info("Unsplash CDN: %d results", len(results))
+            return results
+    except Exception as e:
+        log.error("Unsplash CDN: %s", e)
+
+    # ── Strategy 3: Wikimedia via google_images_search ────────────────────
+    wiki = google_images_search(query, per_page)
+    for w in wiki:
+        results.append({"url": w["img"], "title": w.get("title", query)})
+    return results
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -913,51 +1025,146 @@ def pexels_search(query: str, per_page: int = 8) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def wikipedia_search(query: str, lang: str = "fa") -> list[dict]:
-    """Search Wikipedia and return list of matching articles."""
-    try:
-        r = requests.get(
-            f"https://{lang}.wikipedia.org/w/api.php",
-            params={
-                "action": "search", "list": "search", "srsearch": query,
-                "srlimit": 8, "format": "json", "utf8": 1,
-            },
-            headers={"User-Agent": "BaleWebBot/1.0"},
-            timeout=15,
-        )
-        data = r.json()
-        results = []
-        for item in data.get("query", {}).get("search", []):
-            results.append({
-                "title": item["title"],
-                "snippet": BeautifulSoup(item.get("snippet", ""), "html.parser").get_text(),
-                "url": f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(item['title'].replace(' ', '_'))}",
-            })
-        return results
-    except Exception as e:
-        log.error("wikipedia_search error: %s", e)
-        return []
+    """
+    Search Wikipedia with multiple mirrors:
+    - Primary: HTTPS Wikipedia API
+    - Mirror 1: wikipedia.org via different endpoint
+    - Mirror 2: For Persian, use fa.m.wikipedia.org (mobile, lighter)
+    """
+    log.info("wikipedia_search: query=%r lang=%r", query, lang)
+    results: list[dict] = []
+    HDR = {"User-Agent": "BaleBot/1.0 (educational; bale.ai)"}
+
+    def _build_result(title: str, snippet: str) -> dict:
+        key = title.replace(" ", "_")
+        return {
+            "title": title,
+            "snippet": snippet[:150],
+            "url": f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(key)}",
+            "key": key,
+        }
+
+    # Try 1: REST v1 search/title endpoint
+    for base in [
+        f"https://{lang}.wikipedia.org/api/rest_v1/page/search/title",
+        f"https://{lang}.m.wikipedia.org/api/rest_v1/page/search/title",
+    ]:
+        try:
+            r = WEB.get(base, params={"q": query, "limit": 8},
+                             headers=HDR, timeout=15)
+            log.debug("HTTP %s status=%d len=%d", "r", r.status_code, len(r.content if hasattr(r, "content") else b""))
+            if r.status_code == 200:
+                for p in r.json().get("pages", []):
+                    title = p.get("title", "")
+                    snippet = p.get("description") or p.get("excerpt", "")
+                    if title:
+                        results.append(_build_result(title, snippet))
+                if results:
+                    log.info("Wikipedia REST (%s): %d results", lang, len(results))
+                    return results
+        except Exception as e:
+            log.error("Wikipedia REST %s: %s", base, e)
+
+    # Try 2: action API (opensearch — simpler, works without session)
+    for base in [
+        f"https://{lang}.wikipedia.org/w/api.php",
+        f"https://{lang}.m.wikipedia.org/w/api.php",
+    ]:
+        try:
+            r2 = WEB.get(base, params={
+                "action": "opensearch", "search": query,
+                "limit": 8, "namespace": 0, "format": "json",
+            }, headers=HDR, timeout=15)
+            log.debug("HTTP %s status=%d len=%d", "r2", r2.status_code, len(r2.content if hasattr(r2, "content") else b""))
+            if r2.status_code == 200:
+                data = r2.json()
+                # opensearch returns [query, [titles], [descriptions], [urls]]
+                titles = data[1] if len(data) > 1 else []
+                descs  = data[2] if len(data) > 2 else []
+                urls   = data[3] if len(data) > 3 else []
+                for i, title in enumerate(titles):
+                    snippet = descs[i] if i < len(descs) else ""
+                    url = urls[i] if i < len(urls) else ""
+                    results.append({
+                        "title": title,
+                        "snippet": snippet[:150],
+                        "url": url or f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}",
+                        "key": title.replace(" ", "_"),
+                    })
+                if results:
+                    log.info("Wikipedia opensearch (%s): %d", lang, len(results))
+                    return results
+        except Exception as e:
+            log.error("Wikipedia opensearch %s: %s", base, e)
+
+    return results
 
 
 def wikipedia_article(title: str, lang: str = "fa") -> Optional[str]:
-    """Get full plain-text of a Wikipedia article."""
-    try:
-        r = requests.get(
-            f"https://{lang}.wikipedia.org/w/api.php",
-            params={
-                "action": "query", "titles": title,
-                "prop": "extracts", "exintro": 0, "explaintext": 1,
-                "format": "json", "utf8": 1,
-            },
-            headers={"User-Agent": "BaleWebBot/1.0"},
-            timeout=20,
-        )
-        pages = r.json().get("query", {}).get("pages", {})
-        for page in pages.values():
-            return page.get("extract", "")
-        return None
-    except Exception as e:
-        log.error("wikipedia_article error: %s", e)
-        return None
+    """
+    Fetch Wikipedia article plain text.
+    Tries: REST summary → REST sections → action API extracts.
+    Uses mobile subdomain as mirror if main fails.
+    """
+    log.info("wikipedia_article: title=%r lang=%r", title, lang)
+    HDR = {"User-Agent": "BaleBot/1.0 (educational; bale.ai)"}
+    key = urllib.parse.quote(title.replace(" ", "_"))
+
+    # Try REST summary (fastest, ~2KB)
+    for base in [f"https://{lang}.wikipedia.org", f"https://{lang}.m.wikipedia.org"]:
+        try:
+            r = WEB.get(f"{base}/api/rest_v1/page/summary/{key}",
+                             headers=HDR, timeout=15)
+            log.debug("HTTP %s status=%d len=%d", "r", r.status_code, len(r.content if hasattr(r, "content") else b""))
+            if r.status_code == 200:
+                extract = r.json().get("extract", "")
+                if extract and len(extract) > 80:
+                    # Append more content via action API
+                    try:
+                        r2 = WEB.get(
+                            f"{base}/w/api.php",
+                            params={"action": "query", "titles": title,
+                                    "prop": "extracts", "explaintext": 1,
+                                    "exsectionformat": "plain",
+                                    "format": "json", "utf8": 1},
+                            headers=HDR, timeout=20,
+                        )
+                        log.debug("HTTP %s status=%d len=%d", "r2", r2.status_code, len(r2.content if hasattr(r2, "content") else b""))
+                        if r2.status_code == 200:
+                            pages = r2.json().get("query", {}).get("pages", {})
+                            for pg in pages.values():
+                                full = pg.get("extract", "")
+                                if full and len(full) > len(extract):
+                                    return full
+                    except Exception:
+                        pass
+                    return extract
+        except Exception as e:
+            log.error("Wikipedia article %s/%s: %s", base, title, e)
+
+    # Last resort: action API extracts only
+    for base in [f"https://{lang}.wikipedia.org", f"https://{lang}.m.wikipedia.org"]:
+        try:
+            r3 = WEB.get(
+                f"{base}/w/api.php",
+                params={"action": "query", "titles": title,
+                        "prop": "extracts", "explaintext": 1,
+                        "exsectionformat": "plain",
+                        "format": "json", "utf8": 1},
+                headers=HDR, timeout=20,
+            )
+            log.debug("HTTP %s status=%d len=%d", "r3", r3.status_code, len(r3.content if hasattr(r3, "content") else b""))
+            if r3.status_code == 200:
+                for pg in r3.json().get("query", {}).get("pages", {}).values():
+                    txt = pg.get("extract", "")
+                    if txt:
+                        return txt
+        except Exception as e:
+            log.error("Wikipedia action %s/%s: %s", base, title, e)
+
+    return None
+
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -967,7 +1174,7 @@ def wikipedia_article(title: str, lang: str = "fa") -> Optional[str]:
 def currency_convert(amount: float, from_cur: str, to_cur: str) -> Optional[str]:
     """Convert currency using exchangerate.host (free)."""
     try:
-        r = requests.get(
+        r = WEB.get(
             "https://api.exchangerate.host/convert",
             params={"from": from_cur.upper(), "to": to_cur.upper(), "amount": amount},
             timeout=15,
@@ -980,7 +1187,7 @@ def currency_convert(amount: float, from_cur: str, to_cur: str) -> Optional[str]
         log.error("currency error: %s", e)
     # Fallback: try frankfurter
     try:
-        r2 = requests.get(
+        r2 = WEB.get(
             f"https://api.frankfurter.app/latest?from={from_cur.upper()}&to={to_cur.upper()}",
             timeout=15,
         )
@@ -1000,13 +1207,14 @@ def currency_convert(amount: float, from_cur: str, to_cur: str) -> Optional[str]
 
 def ip_lookup(target: str) -> str:
     """Look up IP or domain info."""
+    log.info("currency_convert: %s %s->%s", amount, from_cur, to_cur)
     try:
         # Resolve domain to IP if needed
         ip = target.strip()
         if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
             import socket
             ip = socket.gethostbyname(ip)
-        r = requests.get(f"https://ipapi.co/{ip}/json/", timeout=15)
+        r = WEB.get(f"https://ipapi.co/{ip}/json/", timeout=15)
         d = r.json()
         if d.get("error"):
             return "❌ اطلاعاتی یافت نشد."
@@ -1031,10 +1239,11 @@ def ip_lookup(target: str) -> str:
 def shorten_url(long_url: str) -> str:
     """Shorten URL using TinyURL (no auth needed)."""
     try:
-        r = requests.get(
+        r = WEB.get(
             f"https://tinyurl.com/api-create.php?url={urllib.parse.quote(long_url)}",
             timeout=15,
         )
+        log.debug("HTTP %s status=%d len=%d", "r", r.status_code, len(r.content if hasattr(r, "content") else b""))
         if r.status_code == 200 and r.text.startswith("http"):
             return r.text.strip()
         return "❌ خطا در کوتاه‌سازی لینک."
@@ -1045,8 +1254,9 @@ def shorten_url(long_url: str) -> str:
 
 def expand_url(short_url: str) -> str:
     """Follow redirects to find the final URL."""
+    log.info("shorten_url: url=%r", long_url)
     try:
-        r = requests.head(short_url, allow_redirects=True, timeout=15)
+        r = WEB.head(short_url, allow_redirects=True, timeout=15)
         final = r.url
         hops = len(r.history)
         return f"🔗 لینک نهایی:\n{final}\n\n_(تعداد ریدایرکت: {hops})_"
@@ -1062,12 +1272,13 @@ def expand_url(short_url: str) -> str:
 def paste_text(content: str) -> Optional[str]:
     """Upload text to paste.rs and return public URL."""
     try:
-        r = requests.post(
+        r = WEB.post(
             "https://paste.rs/",
             data=content.encode("utf-8"),
             headers={"Content-Type": "text/plain"},
             timeout=15,
         )
+        log.debug("HTTP %s status=%d len=%d", "r", r.status_code, len(r.content if hasattr(r, "content") else b""))
         if r.status_code in (200, 201) and r.text.startswith("http"):
             return r.text.strip()
         return None
@@ -1082,6 +1293,7 @@ def paste_text(content: str) -> Optional[str]:
 
 def generate_qr(text: str) -> Optional[bytes]:
     """Generate a QR code image for the given text."""
+    log.info("paste_text: len=%d", len(content))
     try:
         import qrcode  # type: ignore
         qr = qrcode.QRCode(version=1, box_size=10, border=4)
@@ -1095,10 +1307,11 @@ def generate_qr(text: str) -> Optional[bytes]:
     except ImportError:
         # Fallback: use online API
         try:
-            r = requests.get(
+            r = WEB.get(
                 f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={urllib.parse.quote(text)}",
                 timeout=15,
             )
+            log.debug("HTTP %s status=%d len=%d", "r", r.status_code, len(r.content if hasattr(r, "content") else b""))
             if r.status_code == 200:
                 return r.content
         except Exception:
@@ -1641,20 +1854,38 @@ def do_youtube_download(chat_id: int, url: str):
         send_message(chat_id,
                      "❌ خطا در دانلود ویدیو.\n"
                      "• لینک ممکن است محدود یا خصوصی باشد\n"
-                     "• یا yt-dlp نیاز به آپدیت دارد: `pip install -U yt-dlp`",
+                     "• اجرا کنید: `yt-dlp -U` برای آپدیت",
                      parse_mode="Markdown",
                      reply_markup=main_menu_keyboard())
         return
     data, fname = result
-    fname = Path(fname).name  # strip full path
+    fname = Path(fname).name
+    size_mb = len(data) // 1024 // 1024
+    log.info("YT download: %s  size=%d MB", fname, size_mb)
+
     if len(data) > MAX_FILE_SIZE:
         send_message(chat_id,
-                     f"❌ حجم ویدیو ({len(data)//1024//1024} MB) بیشتر از ۵۰ MB است.",
+                     f"❌ حجم ویدیو ({size_mb} MB) بیشتر از ۵۰ MB است.\n"
+                     "فایل پس از trim هنوز بزرگ است.",
                      reply_markup=main_menu_keyboard())
         return
-    send_document(chat_id, data, fname, caption=f"📺 {fname[:80]}")
+
+    # Try sendVideo first (inline playback), fallback to sendDocument
+    sent = False
+    if fname.lower().endswith(".mp4"):
+        sent = send_video_bytes(chat_id, data, fname, caption=f"📺 {fname[:80]}")
+    if not sent:
+        sent = send_document(chat_id, data, fname, caption=f"📺 {fname[:80]}")
+
     user_state[chat_id] = {"mode": None}
-    send_message(chat_id, "✅ ویدیو ارسال شد.", reply_markup=main_menu_keyboard())
+    if sent:
+        send_message(chat_id, f"✅ ویدیو ارسال شد ({size_mb} MB).",
+                     reply_markup=main_menu_keyboard())
+    else:
+        send_message(chat_id,
+                     "❌ ارسال ویدیو ناموفق بود.\n"
+                     f"حجم: {size_mb} MB — سرور بله ممکن است آن را رد کرده باشد.",
+                     reply_markup=main_menu_keyboard())
 
 
 def do_music(chat_id: int, query: str):
@@ -1734,22 +1965,22 @@ def do_google_images(chat_id: int, query: str):
 def do_pexels(chat_id: int, query: str):
     bump(chat_id, "searches")
     send_chat_action(chat_id, "upload_photo")
-    send_message(chat_id, f"⏳ در حال جستجو در Pexels: _{query}_…", parse_mode="Markdown")
+    send_message(chat_id, f"⏳ در حال جستجوی عکس رایگان: _{query}_…", parse_mode="Markdown")
     results = pexels_search(query, 8)
     if not results:
-        send_message(chat_id, "❌ تصویری در Pexels یافت نشد.", reply_markup=main_menu_keyboard())
+        send_message(chat_id, "❌ عکسی یافت نشد.", reply_markup=main_menu_keyboard())
         return
     sent = 0
     for r in results[:5]:
         try:
-            img_bytes = download_file(r["url"], MAX_IMAGE_SIZE)
+            img_bytes = r.get("_bytes") or download_file(r["url"], MAX_IMAGE_SIZE)
             if img_bytes and len(img_bytes) > 1000:
-                send_photo_bytes(chat_id, img_bytes, caption=f"📷 Pexels — {r.get('title', query)[:60]}")
+                send_photo_bytes(chat_id, img_bytes, caption=f"📷 {r.get('title', query)[:60]}")
                 sent += 1
                 time.sleep(0.4)
-        except Exception:
-            pass
-    msg = f"✅ {sent} عکس از Pexels ارسال شد." if sent else "❌ عکسی دانلود نشد."
+        except Exception as e:
+            log.error("do_pexels send: %s", e)
+    msg = f"✅ {sent} عکس ارسال شد." if sent else "❌ عکسی دانلود نشد."
     user_state[chat_id] = {"mode": None}
     send_message(chat_id, msg, reply_markup=main_menu_keyboard())
 
