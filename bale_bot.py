@@ -20,7 +20,7 @@ import pytesseract
 # ═══════════════════════════════════════════════════════════════════════════════
 TOKEN          = os.getenv("BALE_TOKEN", "YOUR_BOT_TOKEN_HERE")
 BASE_URL       = f"https://tapi.bale.ai/bot{TOKEN}"
-MAX_FILE_SIZE  = 20 * 1024 * 1024
+MAX_FILE_SIZE  = 50 * 1024 * 1024
 MAX_IMAGE_SIZE = 10 * 1024 * 1024
 MAX_OCR_SIZE   =  5 * 1024 * 1024
 GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN", "")   # optional, raises rate limits
@@ -556,13 +556,13 @@ def fetch_page(url: str) -> Optional[bytes]:
 
 def screenshot_page(url: str) -> Optional[bytes]:
     """
-    1920×1080 viewport screenshot using Playwright.
+    1080×1920 viewport screenshot using Playwright.
     Single shot — not scrolled. Returns JPEG bytes.
     """
     log.info("screenshot_page: %s", url)
     try:
         from playwright.sync_api import sync_playwright
-        VW, VH = 1920, 1080
+        VW, VH = 1080, 1920
         with sync_playwright() as p:
             browser = p.chromium.launch(args=[
                 "--no-sandbox", "--disable-setuid-sandbox",
@@ -626,7 +626,7 @@ def page_to_pdf(url: str) -> Optional[bytes]:
                 "--no-sandbox", "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage", "--disable-gpu",
             ])
-            page = browser.new_page(viewport={"width": 1920, "height": 1080})
+            page = browser.new_page(viewport={"width": 1080, "height": 1920})
             page.goto(url, timeout=30000, wait_until="networkidle")
             time.sleep(2)
             pdf_bytes = page.pdf(
