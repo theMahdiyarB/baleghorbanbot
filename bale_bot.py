@@ -28,8 +28,7 @@ GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN", "")   # optional, raises rate limits
 # YouTube cookies file — export from browser for best download success rate.
 # How to get: install yt-dlp, run:
 #   yt-dlp --cookies-from-browser chrome --cookies /home/user/yt_cookies.txt  https://youtube.com
-# Then: export YOUTUBE_COOKIES_FILE=/home/user/yt_cookies.txt
-YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "")
+YOUTUBE_COOKIES_FILE = os.getenv("yt_cookies.txt", "")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -944,7 +943,7 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
             cobalt_url = f"https://www.youtube.com/watch?v={video_id}"
             payload = {
                 "url": cobalt_url,
-                "videoQuality": "720",
+                "videoQuality": "480",
                 "youtubeVideoCodec": "h264",
                 "filenameStyle": "basic",
                 "downloadMode": "audio" if audio_only else "auto",
