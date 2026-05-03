@@ -1,2149 +1,1911 @@
-#!/usr/bin/env python3
 """
-دستیار وب - Bale Bot
-A comprehensive web assistant bot for Bale messenger.
+دستیار وب — Bale Bot  (v4)
+Full-featured web assistant for Bale messenger.
 """
 
-import os
-import re
-import io
-import json
-import time
-import zipfile
-import logging
-import tempfile
-import requests
-import threading
-import subprocess
-import urllib.parse
+import os, re, io, json, time, zipfile, logging, tempfile
+import requests, subprocess, urllib.parse, threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
 from bs4 import BeautifulSoup
 from PIL import Image
 import pytesseract
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════════════════════
 TOKEN          = os.getenv("BALE_TOKEN", "YOUR_BOT_TOKEN_HERE")
 BASE_URL       = f"https://tapi.bale.ai/bot{TOKEN}"
-MAX_FILE_SIZE  = 50 * 1024 * 1024   # 50 MB
-MAX_IMAGE_SIZE = 10 * 1024 * 1024   # 10 MB
-MAX_OCR_SIZE   =  5 * 1024 * 1024   #  5 MB
+MAX_FILE_SIZE  = 50 * 1024 * 1024
+MAX_IMAGE_SIZE = 10 * 1024 * 1024
+MAX_OCR_SIZE   =  5 * 1024 * 1024
+GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN", "")   # optional, raises rate limits
 
-# ─── Logging ──────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════════════════════════════════════════════
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s [%(levelname)-8s] %(funcName)s:%(lineno)d — %(message)s",
     handlers=[
-        logging.StreamHandler(),                        # stdout
-        logging.FileHandler("bale_bot.log", encoding="utf-8"),  # file
+        logging.StreamHandler(),
+        logging.FileHandler("bale_bot.log", encoding="utf-8"),
     ],
 )
 log = logging.getLogger(__name__)
-# Silence noisy urllib3 debug noise, keep our logs clean
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
 
-# ─── Per-user state ───────────────────────────────────────────────────────────
-user_state: dict[int, dict] = {}
-user_stats: dict[int, dict] = {}
-
-# ─── Shared requests session with automatic retry ─────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# SHARED HTTP SESSION
+# ═══════════════════════════════════════════════════════════════════════════════
 def _make_session() -> requests.Session:
     s = requests.Session()
-    retry = Retry(total=3, backoff_factor=0.4,
-                  status_forcelist=[429, 500, 502, 503, 504],
-                  allowed_methods=["GET", "POST", "HEAD"])
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.mount("http://",  HTTPAdapter(max_retries=retry))
+    r = Retry(total=3, backoff_factor=0.4,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=["GET", "POST", "HEAD"])
+    s.mount("https://", HTTPAdapter(max_retries=r))
+    s.mount("http://",  HTTPAdapter(max_retries=r))
     return s
 
-WEB = _make_session()   # All external web requests go through this
+WEB = _make_session()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# HTTP helpers
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# STATE
+# ═══════════════════════════════════════════════════════════════════════════════
+user_state: dict[int, dict] = {}
+user_stats: dict[int, dict] = {}
+# Cache pending search results so callback buttons can refer to them
+result_cache: dict[str, list] = {}   # key → list[dict]
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# BALE API HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
 def api(method: str, **kwargs) -> dict:
-    """Call a Bale Bot API method."""
     try:
         r = requests.post(f"{BASE_URL}/{method}", json=kwargs, timeout=30)
         return r.json()
     except Exception as e:
-        log.error("API error %s: %s", method, e)
+        log.error("api %s: %s", method, e)
         return {"ok": False}
 
-
-def send_message(chat_id: int, text: str, reply_markup=None,
-                 reply_to_message_id: int = None, parse_mode: str = None) -> dict:
-    kw = dict(chat_id=chat_id, text=text[:4096])
+def send_message(chat_id, text, reply_markup=None,
+                 reply_to_message_id=None, parse_mode=None) -> dict:
+    kw = dict(chat_id=chat_id, text=str(text)[:4096])
     if reply_markup:
-        kw["reply_markup"] = json.dumps(reply_markup)
+        kw["reply_markup"] = (json.dumps(reply_markup)
+                               if not isinstance(reply_markup, str)
+                               else reply_markup)
     if reply_to_message_id:
         kw["reply_to_message_id"] = reply_to_message_id
     if parse_mode:
         kw["parse_mode"] = parse_mode
     return api("sendMessage", **kw)
 
-
-def send_document(chat_id: int, file_bytes: bytes, filename: str,
-                  caption: str = "", reply_to_message_id: int = None) -> bool:
+def send_document(chat_id, file_bytes: bytes, filename: str,
+                  caption="", reply_to=None) -> bool:
     if not file_bytes:
-        log.error("send_document: empty bytes for %s", filename)
+        log.error("send_document: empty bytes  file=%s", filename)
         return False
     files = {"document": (filename, io.BytesIO(file_bytes), "application/octet-stream")}
-    data = {"chat_id": chat_id, "caption": caption[:1024]}
-    if reply_to_message_id:
-        data["reply_to_message_id"] = reply_to_message_id
+    data  = {"chat_id": chat_id, "caption": caption[:1024]}
+    if reply_to:
+        data["reply_to_message_id"] = reply_to
     try:
         r = requests.post(f"{BASE_URL}/sendDocument", data=data, files=files, timeout=180)
-        resp = r.json()
-        if not resp.get("ok"):
-            log.error("sendDocument failed: %s | file=%s size=%d",
-                      resp, filename, len(file_bytes))
-            return False
-        return True
+        ok = r.json().get("ok", False)
+        if not ok:
+            log.error("sendDocument failed: %s  file=%s  size=%dB",
+                      r.json(), filename, len(file_bytes))
+        return ok
     except Exception as e:
-        log.error("sendDocument exception: %s | file=%s", e, filename)
+        log.error("sendDocument exception: %s", e)
         return False
 
-
-def send_video_bytes(chat_id: int, video_bytes: bytes, filename: str,
-                     caption: str = "") -> bool:
-    """Send video using sendVideo endpoint (better playback in Bale)."""
+def send_video(chat_id, video_bytes: bytes, filename: str, caption="") -> bool:
     files = {"video": (filename, io.BytesIO(video_bytes), "video/mp4")}
-    data = {"chat_id": chat_id, "caption": caption[:1024], "supports_streaming": "true"}
+    data  = {"chat_id": chat_id, "caption": caption[:1024],
+             "supports_streaming": "true"}
     try:
         r = requests.post(f"{BASE_URL}/sendVideo", data=data, files=files, timeout=180)
-        resp = r.json()
-        if not resp.get("ok"):
-            log.error("sendVideo failed: %s | file=%s size=%d",
-                      resp, filename, len(video_bytes))
-            return False
-        return True
+        ok = r.json().get("ok", False)
+        if not ok:
+            log.error("sendVideo failed: %s  size=%dMB", r.json(), len(video_bytes)//1024//1024)
+        return ok
     except Exception as e:
         log.error("sendVideo exception: %s", e)
         return False
 
-
-
-def send_photo_bytes(chat_id: int, img_bytes: bytes, caption: str = "") -> dict:
-    if not img_bytes or len(img_bytes) < 100:
-        log.error("send_photo_bytes: empty/tiny image")
-        return {"ok": False}
+def send_photo(chat_id, img_bytes: bytes, caption="", reply_markup=None) -> bool:
     files = {"photo": ("image.jpg", io.BytesIO(img_bytes), "image/jpeg")}
-    data = {"chat_id": chat_id, "caption": caption[:1024]}
+    data  = {"chat_id": chat_id, "caption": caption[:1024]}
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
     try:
         r = requests.post(f"{BASE_URL}/sendPhoto", data=data, files=files, timeout=60)
-        resp = r.json()
-        if not resp.get("ok"):
-            log.error("sendPhoto failed: %s", resp)
-        return resp
+        ok = r.json().get("ok", False)
+        if not ok:
+            log.error("sendPhoto failed: %s", r.json())
+        return ok
     except Exception as e:
         log.error("sendPhoto exception: %s", e)
-        return {"ok": False}
+        return False
 
-
-def send_audio_bytes(chat_id: int, audio_bytes: bytes, filename: str,
-                     caption: str = "") -> dict:
+def send_audio(chat_id, audio_bytes: bytes, filename: str, caption="") -> bool:
     files = {"audio": (filename, io.BytesIO(audio_bytes), "audio/mpeg")}
-    data = {"chat_id": chat_id, "caption": caption[:1024]}
+    data  = {"chat_id": chat_id, "caption": caption[:1024]}
     try:
         r = requests.post(f"{BASE_URL}/sendAudio", data=data, files=files, timeout=120)
-        return r.json()
+        ok = r.json().get("ok", False)
+        if not ok:
+            log.error("sendAudio failed: %s", r.json())
+        return ok
     except Exception as e:
-        log.error("sendAudio error: %s", e)
-        return {"ok": False}
+        log.error("sendAudio exception: %s", e)
+        return False
 
-
-def send_chat_action(chat_id: int, action: str = "typing") -> None:
+def chat_action(chat_id, action="typing"):
     api("sendChatAction", chat_id=chat_id, action=action)
-
 
 def get_file_url(file_id: str) -> Optional[str]:
     resp = api("getFile", file_id=file_id)
     if resp.get("ok"):
-        path = resp["result"]["file_path"]
-        return f"https://tapi.bale.ai/file/bot{TOKEN}/{path}"
+        return f"https://tapi.bale.ai/file/bot{TOKEN}/{resp['result']['file_path']}"
     return None
 
-
-def download_file(url: str, max_bytes: int = MAX_FILE_SIZE) -> Optional[bytes]:
+def download_bytes(url: str, max_bytes=MAX_FILE_SIZE) -> Optional[bytes]:
+    log.debug("download_bytes: %s", url)
     try:
         r = WEB.get(url, timeout=30, stream=True)
-        chunks = []
-        total = 0
+        chunks, total = [], 0
         for chunk in r.iter_content(8192):
-            chunks.append(chunk)
-            total += len(chunk)
+            chunks.append(chunk); total += len(chunk)
             if total > max_bytes:
+                log.warning("download_bytes: exceeded %d bytes", max_bytes)
                 return None
         return b"".join(chunks)
     except Exception as e:
-        log.error("download_file error: %s", e)
+        log.error("download_bytes: %s — %s", url, e)
         return None
 
+def answer_cb(cb_id: str, text=""):
+    try: api("answerCallbackQuery", callback_query_id=cb_id, text=text)
+    except Exception: pass
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Keyboards
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# RESULT CACHE  (stores search results so buttons can reference them)
+# ═══════════════════════════════════════════════════════════════════════════════
+import hashlib
 
-def main_menu_keyboard():
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "🔎 جستجو در وب", "callback_data": "mode_search"},
-                {"text": "🌐 باز کردن سایت", "callback_data": "mode_open"},
-            ],
-            [
-                {"text": "📄 نتایج HTML", "callback_data": "mode_html_search"},
-                {"text": "🗜 ZIP آفلاین", "callback_data": "mode_zip"},
-            ],
-            [
-                {"text": "📥 GitHub دانلود", "callback_data": "mode_github"},
-                {"text": "🌐 ترجمه متن", "callback_data": "mode_translate"},
-            ],
-            [
-                {"text": "🖼 OCR متن از عکس", "callback_data": "mode_ocr"},
-                {"text": "📚 مقاله علمی", "callback_data": "mode_scholar"},
-            ],
-            [
-                {"text": "📖 ویکی‌پدیا", "callback_data": "mode_wiki"},
-                {"text": "📺 یوتیوب", "callback_data": "mode_youtube"},
-            ],
-            [
-                {"text": "🎵 دانلود موسیقی MP3", "callback_data": "mode_music"},
-                {"text": "📌 پینترست", "callback_data": "mode_pinterest"},
-            ],
-            [
-                {"text": "🖼 تصاویر گوگل", "callback_data": "mode_gimages"},
-                {"text": "📷 Pexels عکس رایگان", "callback_data": "mode_pexels"},
-            ],
-            [
-                {"text": "💱 تبدیل ارز", "callback_data": "mode_currency"},
-                {"text": "🌐 اطلاعات IP/دامنه", "callback_data": "mode_iplookup"},
-            ],
-            [
-                {"text": "🔗 کوتاه‌سازی لینک", "callback_data": "mode_shorten"},
-                {"text": "🔍 باز کردن لینک کوتاه", "callback_data": "mode_expand"},
-            ],
-            [
-                {"text": "📋 اشتراک‌گذاری متن", "callback_data": "mode_paste"},
-                {"text": "📱 ساخت QR کد", "callback_data": "mode_qr"},
-            ],
-            [
-                {"text": "📊 اطلاعات کاربری", "callback_data": "stats"},
-                {"text": "❓ راهنما", "callback_data": "help"},
-            ],
-        ]
-    }
+def cache_set(key: str, data: list):
+    result_cache[key] = data
+    # Prune if too large
+    if len(result_cache) > 500:
+        oldest = list(result_cache.keys())[:100]
+        for k in oldest:
+            result_cache.pop(k, None)
 
+def cache_get(key: str) -> list:
+    return result_cache.get(key, [])
 
-def cancel_keyboard():
-    return {
-        "inline_keyboard": [[{"text": "❌ انصراف", "callback_data": "cancel"}]]
-    }
+def make_cache_key(prefix: str, query: str, page: int) -> str:
+    h = hashlib.md5(f"{prefix}:{query}:{page}".encode()).hexdigest()[:8]
+    return f"{prefix}_{h}"
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# KEYBOARDS
+# ═══════════════════════════════════════════════════════════════════════════════
+def main_menu_kb():
+    return {"inline_keyboard": [
+        [{"text": "🔎 جستجو در وب",      "callback_data": "mode_search"},
+         {"text": "🌐 مشاهده سایت",      "callback_data": "mode_open"}],
+        [{"text": "📚 مقاله علمی",        "callback_data": "mode_scholar"},
+         {"text": "📖 ویکی‌پدیا",         "callback_data": "mode_wiki"}],
+        [{"text": "📺 یوتیوب",            "callback_data": "mode_youtube"},
+         {"text": "🎵 دانلود موسیقی MP3", "callback_data": "mode_music"}],
+        [{"text": "🖼 دانلود عکس",        "callback_data": "mode_images"},
+         {"text": "🐙 GitHub",            "callback_data": "mode_github"}],
+        [{"text": "🌐 ترجمه",             "callback_data": "mode_translate"},
+         {"text": "🖼 OCR متن از عکس",   "callback_data": "mode_ocr"}],
+        [{"text": "💱 تبدیل ارز",         "callback_data": "mode_currency"},
+         {"text": "🌐 IP / دامنه",        "callback_data": "mode_iplookup"}],
+        [{"text": "🔗 کوتاه‌سازی لینک",  "callback_data": "mode_shorten"},
+         {"text": "📱 ساخت QR کد",        "callback_data": "mode_qr"}],
+        [{"text": "📋 اشتراک‌گذاری متن", "callback_data": "mode_paste"},
+         {"text": "🔍 باز کردن لینک",    "callback_data": "mode_expand"}],
+        [{"text": "📊 آمار کاربری",       "callback_data": "stats"},
+         {"text": "🔒 حریم خصوصی",       "callback_data": "privacy"}],
+        [{"text": "❓ راهنما",             "callback_data": "help"}],
+    ]}
 
-def pagination_keyboard(prev_cb: str, next_cb: str, page: int, has_next: bool) -> dict:
-    """Generic prev/next keyboard."""
+def cancel_kb():
+    return {"inline_keyboard": [[{"text": "❌ انصراف", "callback_data": "cancel"}]]}
+
+def home_kb():
+    return {"inline_keyboard": [[{"text": "🏠 منوی اصلی", "callback_data": "home"}]]}
+
+def paged_kb(prev_cb, next_cb, page, has_next):
     row = []
     if page > 0:
-        row.append({"text": "◀️ صفحه قبل", "callback_data": prev_cb})
+        row.append({"text": "◀️ قبلی", "callback_data": prev_cb})
     if has_next:
-        row.append({"text": "صفحه بعد ▶️", "callback_data": next_cb})
+        row.append({"text": "بعدی ▶️", "callback_data": next_cb})
     buttons = []
     if row:
         buttons.append(row)
-    buttons.append([{"text": "🏠 منوی اصلی", "callback_data": "cancel"}])
+    buttons.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
     return {"inline_keyboard": buttons}
 
+def image_source_kb():
+    return {"inline_keyboard": [
+        [{"text": "🖼 تصاویر Bing",     "callback_data": "img_src_bing"},
+         {"text": "📌 پینترست",          "callback_data": "img_src_pinterest"}],
+        [{"text": "📷 Pixabay/Pexels",   "callback_data": "img_src_pexels"},
+         {"text": "🎨 Wikimedia",        "callback_data": "img_src_wiki"}],
+        [{"text": "❌ انصراف",            "callback_data": "cancel"}],
+    ]}
 
-def translate_keyboard():
-    langs = [
-        ("🇮🇷 فارسی", "fa"), ("🇬🇧 انگلیسی", "en"),
-        ("🇸🇦 عربی", "ar"),   ("🇩🇪 آلمانی", "de"),
-        ("🇫🇷 فرانسوی", "fr"),("🇷🇺 روسی", "ru"),
-    ]
-    rows = []
-    row = []
+def youtube_action_kb():
+    return {"inline_keyboard": [
+        [{"text": "📥 دانلود ویدیو",    "callback_data": "yt_video"},
+         {"text": "🔍 جستجوی یوتیوب",  "callback_data": "yt_search"}],
+        [{"text": "❌ انصراف",           "callback_data": "cancel"}],
+    ]}
+
+def github_action_kb():
+    return {"inline_keyboard": [
+        [{"text": "🔍 جستجوی مخازن",   "callback_data": "gh_search"},
+         {"text": "📥 دانلود ZIP",      "callback_data": "gh_zip"}],
+        [{"text": "📦 دانلود Release",  "callback_data": "gh_release"}],
+        [{"text": "❌ انصراف",           "callback_data": "cancel"}],
+    ]}
+
+def translate_kb():
+    langs = [("🇮🇷 فارسی","fa"),("🇬🇧 انگلیسی","en"),
+             ("🇸🇦 عربی","ar"),("🇩🇪 آلمانی","de"),
+             ("🇫🇷 فرانسوی","fr"),("🇷🇺 روسی","ru")]
+    rows, row = [], []
     for label, code in langs:
         row.append({"text": label, "callback_data": f"trlang_{code}"})
         if len(row) == 2:
             rows.append(row); row = []
-    if row:
-        rows.append(row)
+    if row: rows.append(row)
     rows.append([{"text": "❌ انصراف", "callback_data": "cancel"}])
     return {"inline_keyboard": rows}
 
+def site_view_kb(url_key: str):
+    """Buttons shown after screenshot of a website."""
+    return {"inline_keyboard": [
+        [{"text": "📝 متن صفحه",  "callback_data": f"site_text_{url_key}"},
+         {"text": "🌐 فایل HTML", "callback_data": f"site_html_{url_key}"}],
+        [{"text": "🗜 ZIP آفلاین", "callback_data": f"site_zip_{url_key}"},
+         {"text": "📑 PDF صفحه",  "callback_data": f"site_pdf_{url_key}"}],
+        [{"text": "🏠 منوی اصلی", "callback_data": "home"}],
+    ]}
 
-def youtube_keyboard():
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "📥 دانلود ویدیو", "callback_data": "yt_video"},
-                {"text": "🔍 جستجوی یوتیوب", "callback_data": "yt_search"},
-            ],
-            [{"text": "❌ انصراف", "callback_data": "cancel"}],
-        ]
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Feature implementations
-# ══════════════════════════════════════════════════════════════════════════════
-
-def web_search(query: str, max_results: int = 10, page: int = 0) -> list[dict]:
-    """DuckDuckGo HTML scrape with page support."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/122.0.0.0 Safari/537.36",
-        "Accept-Language": "fa,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-    # DDG paginates with &s= offset (multiples of 30) via POST
-    data = {"q": query, "b": "", "kl": "ir-fa"}
+def search_results_kb(results: list, cache_key: str, page: int,
+                      has_next: bool, mode: str) -> dict:
+    """Each search result becomes an inline button."""
+    rows = []
+    offset = page * 10
+    for i, r in enumerate(results):
+        num = offset + i + 1
+        title = r.get("title", r.get("name", f"نتیجه {num}"))[:45]
+        cb = f"res_{cache_key}_{i}"
+        rows.append([{"text": f"{num}. {title}", "callback_data": cb}])
+    # Pagination row
+    pag = []
     if page > 0:
-        data["s"] = str(page * 30)
-        data["dc"] = str(page * 30 + 1)
-        data["v"] = "l"
-        data["o"] = "json"
-        data["nextParams"] = ""
+        pag.append({"text": "◀️ قبلی", "callback_data": f"page_{mode}_{page-1}"})
+    if has_next:
+        pag.append({"text": "بعدی ▶️", "callback_data": f"page_{mode}_{page+1}"})
+    if pag:
+        rows.append(pag)
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+    return {"inline_keyboard": rows}
+
+def yt_results_kb(results: list, cache_key: str, page: int, has_next: bool) -> dict:
+    rows = []
+    offset = page * 8
+    for i, r in enumerate(results):
+        num = offset + i + 1
+        title = r.get("title", f"ویدیو {num}")[:40]
+        dur = f" [{r.get('duration','')}]" if r.get("duration") else ""
+        rows.append([{"text": f"{num}. {title}{dur}", "callback_data": f"yt_res_{cache_key}_{i}"}])
+    pag = []
+    if page > 0:
+        pag.append({"text": "◀️ قبلی", "callback_data": f"yt_page_{page-1}"})
+    if has_next:
+        pag.append({"text": "بعدی ▶️", "callback_data": f"yt_page_{page+1}"})
+    if pag: rows.append(pag)
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+    return {"inline_keyboard": rows}
+
+def gh_repo_kb(results: list, cache_key: str, page: int, has_next: bool) -> dict:
+    rows = []
+    offset = page * 8
+    for i, r in enumerate(results):
+        num = offset + i + 1
+        name = r.get("full_name", f"repo {num}")[:40]
+        stars = r.get("stargazers_count", 0)
+        rows.append([{"text": f"{num}. {name} ⭐{stars}",
+                       "callback_data": f"gh_res_{cache_key}_{i}"}])
+    pag = []
+    if page > 0:
+        pag.append({"text": "◀️ قبلی", "callback_data": f"gh_page_{page-1}"})
+    if has_next:
+        pag.append({"text": "بعدی ▶️", "callback_data": f"gh_page_{page+1}"})
+    if pag: rows.append(pag)
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+    return {"inline_keyboard": rows}
+
+def gh_repo_action_kb(repo_full: str) -> dict:
+    safe = repo_full.replace("/", "__")
+    return {"inline_keyboard": [
+        [{"text": "📥 دانلود ZIP کل مخزن",     "callback_data": f"ghact_zip_{safe}"},
+         {"text": "📦 آخرین Release",           "callback_data": f"ghact_rel_{safe}"}],
+        [{"text": "📋 اطلاعات بیشتر",           "callback_data": f"ghact_info_{safe}"}],
+        [{"text": "🔙 برگشت به نتایج",          "callback_data": "gh_back"}],
+    ]}
+
+def images_more_kb(cache_key: str, page: int, source: str) -> dict:
+    return {"inline_keyboard": [
+        [{"text": "📥 دانلود بیشتر", "callback_data": f"img_more_{source}_{cache_key}_{page+1}"}],
+        [{"text": "🔄 منبع دیگر",    "callback_data": "mode_images"},
+         {"text": "🏠 منوی اصلی",    "callback_data": "home"}],
+    ]}
+
+def wiki_result_kb(results: list, cache_key: str, lang: str) -> dict:
+    rows = []
+    for i, r in enumerate(results):
+        title = r.get("title", f"مقاله {i+1}")[:50]
+        rows.append([{"text": f"📖 {title}", "callback_data": f"wiki_art_{cache_key}_{i}_{lang}"}])
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+    return {"inline_keyboard": rows}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WEB SCRAPING FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+UA_DESK = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+           "AppleWebKit/537.36 (KHTML, like Gecko) "
+           "Chrome/122.0.0.0 Safari/537.36")
+UA_MOB  = ("Mozilla/5.0 (Linux; Android 13; SM-G991B) "
+           "AppleWebKit/537.36 (KHTML, like Gecko) "
+           "Chrome/122.0.6261.119 Mobile Safari/537.36")
+
+def web_search(query: str, max_results=10, page=0) -> list[dict]:
+    log.info("web_search: %r  page=%d", query, page)
+    data = {"q": query, "b": "", "kl": "wt-wt"}
+    if page > 0:
+        data.update({"s": str(page*30), "dc": str(page*30+1), "v": "l", "o": "json"})
     try:
-        r = WEB.post(
-            "https://html.duckduckgo.com/html/",
-            data=data, headers=headers, timeout=20,
-        )
-        log.debug("DDG response: status=%d  content_len=%d", r.status_code, len(r.text))
+        r = WEB.post("https://html.duckduckgo.com/html/", data=data,
+                     headers={"User-Agent": UA_DESK, "Accept-Language": "en-US,en;q=0.9"},
+                     timeout=20)
+        log.debug("DDG: status=%d len=%d", r.status_code, len(r.text))
         soup = BeautifulSoup(r.text, "html.parser")
         results = []
-        for div in soup.select(".result, .web-result")[:max_results + 5]:
-            title_tag = div.select_one(".result__title a, .result__a, h2 a")
-            if not title_tag:
-                continue
-            href = title_tag.get("href", "")
+        for div in soup.select(".result, .web-result"):
+            ta = div.select_one(".result__title a, .result__a, h2 a")
+            if not ta: continue
+            href = ta.get("href","")
             m = re.search(r"uddg=([^&]+)", href)
             link = urllib.parse.unquote(m.group(1)) if m else href
-            if not link.startswith("http"):
-                continue
-            snippet_tag = div.select_one(".result__snippet, .result__body")
-            snippet = snippet_tag.get_text(strip=True) if snippet_tag else ""
-            results.append({"title": title_tag.get_text(strip=True),
-                             "link": link, "snippet": snippet})
-            if len(results) >= max_results:
-                break
-        log.info("web_search: returning %d results", len(results))
+            if not link.startswith("http"): continue
+            sn = div.select_one(".result__snippet, .result__body")
+            results.append({"title": ta.get_text(strip=True),
+                             "link": link,
+                             "snippet": sn.get_text(strip=True) if sn else ""})
+            if len(results) >= max_results: break
+        log.info("web_search: %d results", len(results))
         if not results:
-            log.warning("web_search: 0 results — DDG HTML head: %s", r.text[:400])
+            log.warning("DDG returned 0 results. HTML head: %s", r.text[:300])
         return results
     except Exception as e:
         log.error("web_search error: %s", e, exc_info=True)
         return []
 
-
-def search_to_html(query: str, page: int = 0) -> bytes:
-    results = web_search(query, 10, page)
-    rows = ""
-    if not results:
-        rows = '<tr><td colspan="3" style="text-align:center;color:#999">نتیجه‌ای یافت نشد</td></tr>'
-    for i, r in enumerate(results, page * 10 + 1):
-        snippet = r.get("snippet", "")
-        rows += (
-            f'<tr><td style="width:30px;text-align:center">{i}</td>'
-            f'<td><a href="{r["link"]}" target="_blank">{r["title"]}</a>'
-            f'{"<br><small style=color:#666>" + snippet + "</small>" if snippet else ""}</td></tr>\n'
-        )
-    page_info = f"صفحه {page + 1}" if page > 0 else "صفحه ۱"
-    html = f"""<!DOCTYPE html>
-    log.info("web_search: query=%r page=%d", query, page)
-<html dir="rtl" lang="fa">
-<head><meta charset="utf-8"><title>نتایج: {query}</title>
-<style>
-  body{{font-family:Tahoma,Arial,sans-serif;padding:20px;background:#f9f9f9;direction:rtl}}
-  h2{{color:#333;font-size:18px}}
-  table{{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.1)}}
-  th{{background:#4a90d9;color:#fff;padding:10px 14px;text-align:right}}
-  td{{padding:10px 14px;border-bottom:1px solid #eee;vertical-align:top}}
-  tr:last-child td{{border-bottom:none}}
-  tr:hover td{{background:#f0f7ff}}
-  a{{color:#1a0dab;text-decoration:none;font-weight:bold}}
-  a:hover{{text-decoration:underline}}
-  small{{font-size:12px;line-height:1.5;display:block;margin-top:4px}}
-  .meta{{color:#888;font-size:12px;margin-top:2px}}
-</style>
-</head>
-<body>
-<h2>🔎 نتایج جستجو برای: <em>{query}</em> — {page_info}</h2>
-<p style="color:#888;font-size:13px">تاریخ: {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
-<table><tr><th>#</th><th>عنوان و لینک</th></tr>
-{rows}
-</table>
-</body></html>"""
-    return html.encode("utf-8")
-
-
 def fetch_page(url: str) -> Optional[bytes]:
-    """Fetch raw HTML of a page with proper browser headers."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "fa,en-US;q=0.7,en;q=0.3",
-        "Accept-Encoding": "gzip, deflate",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-    }
+    log.info("fetch_page: %s", url)
+    headers = {"User-Agent": UA_DESK,
+               "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+               "Accept-Language": "en-US,en;q=0.9"}
     try:
-        r = WEB.get(url, headers=headers, timeout=25,
-                    allow_redirects=True, verify=True)
-        log.debug("fetch_page: status=%d  content_len=%d  url=%s",
-                  r.status_code, len(r.content), r.url)
+        r = WEB.get(url, headers=headers, timeout=25, allow_redirects=True)
+        log.debug("fetch_page: status=%d len=%d", r.status_code, len(r.content))
         r.raise_for_status()
         return r.content
     except requests.exceptions.SSLError:
-        log.warning("fetch_page: SSL error for %s — retrying without verify", url)
+        log.warning("fetch_page: SSL error, retrying without verify")
         try:
-            r = WEB.get(url, headers=headers, timeout=25,
-                        allow_redirects=True, verify=False)
+            r = WEB.get(url, headers=headers, timeout=25, verify=False)
             return r.content
         except Exception as e:
-            log.error("fetch_page SSL fallback error: %s", e, exc_info=True)
-            return None
+            log.error("fetch_page SSL fallback: %s", e); return None
     except Exception as e:
-        log.error("fetch_page error: %s", e, exc_info=True)
-        return None
+        log.error("fetch_page: %s", e, exc_info=True); return None
 
+def screenshot_page(url: str) -> Optional[bytes]:
+    """Take a JPEG screenshot of a URL using Playwright (headless Chromium)."""
+    log.info("screenshot_page: %s", url)
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(args=["--no-sandbox","--disable-setuid-sandbox",
+                                               "--disable-dev-shm-usage"])
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            page.goto(url, timeout=25000, wait_until="domcontentloaded")
+            time.sleep(1.5)   # let JS render
+            img = page.screenshot(type="jpeg", quality=80, full_page=False)
+            browser.close()
+            log.info("screenshot_page: %d bytes", len(img))
+            return img
+    except Exception as e:
+        log.error("screenshot_page error: %s", e, exc_info=True)
+        return None
 
 def page_to_zip(url: str) -> Optional[bytes]:
-    """Download a page and its assets into a ZIP."""
-    log.info("fetch_page: url=%r", url)
-    html_bytes = fetch_page(url)
-    if not html_bytes:
-        return None
-    soup = BeautifulSoup(html_bytes, "html.parser")
+    log.info("page_to_zip: %s", url)
+    html = fetch_page(url)
+    if not html: return None
+    soup = BeautifulSoup(html, "html.parser")
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("index.html", html_bytes)
-        headers = {"User-Agent": "Mozilla/5.0"}
-        base = urllib.parse.urlparse(url)
-        base_url = f"{base.scheme}://{base.netloc}"
-        for tag in soup.find_all(["img", "link", "script"])[:30]:
-            src = tag.get("src") or tag.get("href", "")
-            if not src or src.startswith("data:"):
-                continue
-            asset_url = urllib.parse.urljoin(base_url, src)
+        zf.writestr("index.html", html)
+        base = f"{urllib.parse.urlparse(url).scheme}://{urllib.parse.urlparse(url).netloc}"
+        for tag in soup.find_all(["img","link","script"])[:25]:
+            src = tag.get("src") or tag.get("href","")
+            if not src or src.startswith("data:"): continue
+            asset_url = urllib.parse.urljoin(base, src)
             try:
-                ar = WEB.get(asset_url, headers=headers, timeout=10)
+                ar = WEB.get(asset_url, timeout=8)
                 fname = Path(urllib.parse.urlparse(asset_url).path).name or "asset"
                 zf.writestr(f"assets/{fname}", ar.content)
-            except Exception:
-                pass
+            except Exception: pass
     buf.seek(0)
     return buf.read()
 
+def page_to_text(url: str) -> str:
+    html = fetch_page(url)
+    if not html: return "❌ خطا در دریافت صفحه."
+    soup = BeautifulSoup(html, "html.parser")
+    for t in soup(["script","style","nav","footer","aside"]): t.decompose()
+    lines = [l for l in soup.get_text("\n", strip=True).split("\n") if l.strip()]
+    return "\n".join(lines[:100])
 
-def github_zip(repo_url: str) -> Optional[bytes]:
-    """Download GitHub repo as ZIP."""
-    # Normalize URL
-    m = re.match(r"https?://github\.com/([^/]+/[^/]+?)(?:\.git|/|$)", repo_url)
-    if not m:
-        return None
-    slug = m.group(1)
-    for branch in ["main", "master"]:
-        zip_url = f"https://github.com/{slug}/archive/refs/heads/{branch}.zip"
-        try:
-            r = WEB.get(zip_url, timeout=60, stream=True)
-            log.debug("HTTP %s status=%d len=%d", "r", r.status_code, len(r.content if hasattr(r, "content") else b""))
-            if r.status_code == 200:
-                return r.content
-        except Exception:
-            pass
-    return None
-
-
-def translate_text(text: str, target: str, source: str = "auto") -> str:
-    """Translate using MyMemory API, handling long texts and HTML entities."""
-    log.info("github_zip: url=%r", repo_url)
-    import html as html_mod
-    has_persian = bool(re.search(r'[\u0600-\u06FF]', text))
-    if source == "auto":
-        source = "fa" if has_persian else "en"
-    if source == target:
-        return text  # nothing to do
-
-    # MyMemory max 500 chars per request — split on sentences
-    def _translate_chunk(chunk: str) -> str:
-        pair = f"{source}|{target}"
-        try:
-            r = WEB.get(
-                "https://api.mymemory.translated.net/get",
-                params={"q": chunk, "langpair": pair},
-                timeout=20,
-            )
-            data = r.json()
-            translated = data["responseData"]["translatedText"]
-            # Unescape HTML entities (&#10; → \n, &amp; → & etc.)
-            return html_mod.unescape(translated)
-        except Exception as e:
-            log.error("translate chunk error: %s", e)
-            return chunk  # return original on failure
-
-    # Split into ≤500-char chunks on newlines/sentences
-    MAX_CHUNK = 490
-    chunks = []
-    current = ""
-    for line in text.split("\n"):
-        if len(current) + len(line) + 1 <= MAX_CHUNK:
-            current = (current + "\n" + line).lstrip("\n")
-        else:
-            if current:
-                chunks.append(current)
-            # If a single line is too long, split on ". "
-            while len(line) > MAX_CHUNK:
-                chunks.append(line[:MAX_CHUNK])
-                line = line[MAX_CHUNK:]
-            current = line
-    if current:
-        chunks.append(current)
-
-    translated_parts = []
-    for chunk in chunks:
-        translated_parts.append(_translate_chunk(chunk))
-        time.sleep(0.3)  # be polite to free API
-
-    return "\n".join(translated_parts)
-
-
-def ocr_image(img_bytes: bytes) -> str:
-    """Extract text from image using Tesseract OCR."""
+def page_to_pdf(url: str) -> Optional[bytes]:
+    """Generate PDF using wkhtmltopdf if available, else return HTML."""
+    log.info("page_to_pdf: %s", url)
     try:
-        img = Image.open(io.BytesIO(img_bytes))
-        # Try Persian + English
-        text = pytesseract.image_to_string(img, lang="fas+eng")
-        return text.strip() or "(متنی یافت نشد)"
-    except Exception as e:
-        log.error("OCR error: %s", e)
-        return "❌ خطا در پردازش تصویر."
-
-
-def ocr_to_pdf(text: str) -> bytes:
-    """Wrap OCR text in a PDF using updated fpdf2 API."""
-    log.info("ocr_image: img_bytes=%d", len(img_bytes))
-    from fpdf import FPDF
-    from fpdf.enums import XPos, YPos
-    pdf = FPDF()
-    pdf.set_margins(15, 15, 15)
-    pdf.add_page()
-    pdf.set_font("Helvetica", size=11)
-    for line in text.split("\n"):
-        # Sanitize to latin-1 for built-in font (OCR text may have odd chars)
-        safe_line = line.encode("latin-1", errors="replace").decode("latin-1")
-        pdf.cell(
-            0, 8,
-            text=safe_line,
-            new_x=XPos.LMARGIN,
-            new_y=YPos.NEXT,
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+            out = tf.name
+        result = subprocess.run(
+            ["wkhtmltopdf", "--quiet", "--load-error-handling", "ignore",
+             "--javascript-delay", "1000", url, out],
+            capture_output=True, timeout=30,
         )
-    # fpdf2 output() returns bytearray
-    result = pdf.output()
-    return bytes(result)
+        if result.returncode == 0 and Path(out).stat().st_size > 1000:
+            data = Path(out).read_bytes()
+            Path(out).unlink(missing_ok=True)
+            log.info("page_to_pdf: %d bytes", len(data))
+            return data
+        log.warning("wkhtmltopdf rc=%d stderr=%s", result.returncode,
+                    result.stderr.decode()[:200])
+        Path(out).unlink(missing_ok=True)
+    except Exception as e:
+        log.error("page_to_pdf: %s", e)
+    # Fallback: return raw HTML
+    return fetch_page(url)
 
-
-def scholar_search(query: str, page: int = 0) -> list[dict]:
-    """Search Google Scholar via scraping with page support."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/122.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
+# ─── Scholar ──────────────────────────────────────────────────────────────────
+def scholar_search(query: str, page=0) -> list[dict]:
+    log.info("scholar_search: %r page=%d", query, page)
     start = page * 10
-    url = (
-        f"https://scholar.google.com/scholar"
-        f"?q={urllib.parse.quote(query)}&hl=en&num=10&start={start}"
-    )
     try:
-        r = WEB.get(url, headers=headers, timeout=20)
+        r = WEB.get("https://scholar.google.com/scholar",
+                    params={"q": query, "hl": "en", "num": 10, "start": start},
+                    headers={"User-Agent": UA_DESK, "Accept-Language": "en-US,en;q=0.9"},
+                    timeout=20)
+        log.debug("scholar: status=%d len=%d", r.status_code, len(r.text))
         soup = BeautifulSoup(r.text, "html.parser")
         results = []
         for div in soup.select(".gs_ri"):
-            title_tag = div.select_one(".gs_rt a")
-            if not title_tag:
-                # Try h3 > a
-                title_tag = div.select_one("h3 a")
-            if not title_tag:
-                continue
-            snippet_tag = div.select_one(".gs_rs")
-            meta_tag = div.select_one(".gs_a")
+            ta = div.select_one(".gs_rt a") or div.select_one("h3 a")
+            if not ta: continue
+            sn = div.select_one(".gs_rs")
+            meta = div.select_one(".gs_a")
             results.append({
-                "title": title_tag.get_text(strip=True),
-                "link": title_tag.get("href", ""),
-                "snippet": snippet_tag.get_text(strip=True) if snippet_tag else "",
-                "meta": meta_tag.get_text(strip=True) if meta_tag else "",
+                "title": ta.get_text(strip=True),
+                "link":  ta.get("href",""),
+                "snippet": sn.get_text(strip=True) if sn else "",
+                "meta":    meta.get_text(strip=True) if meta else "",
             })
+        log.info("scholar_search: %d results", len(results))
         return results
     except Exception as e:
-        log.error("scholar_search error: %s", e)
+        log.error("scholar_search: %s", e, exc_info=True)
         return []
 
+# ─── Wikipedia ────────────────────────────────────────────────────────────────
+def wikipedia_search(query: str, lang="fa") -> list[dict]:
+    log.info("wikipedia_search: %r lang=%s", query, lang)
+    HDR = {"User-Agent": "BaleBot/1.0"}
+    for base in [f"https://{lang}.wikipedia.org",
+                 f"https://{lang}.m.wikipedia.org"]:
+        try:
+            r = WEB.get(f"{base}/w/api.php",
+                        params={"action":"opensearch","search":query,
+                                "limit":8,"namespace":0,"format":"json"},
+                        headers=HDR, timeout=15)
+            log.debug("wiki opensearch: status=%d", r.status_code)
+            if r.status_code == 200:
+                d = r.json()
+                titles = d[1] if len(d)>1 else []
+                descs  = d[2] if len(d)>2 else []
+                urls   = d[3] if len(d)>3 else []
+                results = [{"title": t,
+                             "snippet": descs[i] if i<len(descs) else "",
+                             "url": urls[i] if i<len(urls) else "",
+                             "key": t.replace(" ","_"),
+                             "lang": lang}
+                           for i,t in enumerate(titles)]
+                if results:
+                    log.info("wiki_search: %d results", len(results))
+                    return results
+        except Exception as e:
+            log.error("wikipedia_search %s: %s", base, e)
+    return []
 
-def youtube_search(query: str, max_results: int = 8) -> list[dict]:
-    """Search YouTube via yt-dlp."""
-    log.info("scholar_search: query=%r page=%d", query, page)
+def wikipedia_article(title: str, lang="fa") -> Optional[str]:
+    log.info("wikipedia_article: %r lang=%s", title, lang)
+    HDR = {"User-Agent": "BaleBot/1.0"}
+    key = urllib.parse.quote(title.replace(" ","_"))
+    for base in [f"https://{lang}.wikipedia.org",
+                 f"https://{lang}.m.wikipedia.org"]:
+        try:
+            r = WEB.get(f"{base}/api/rest_v1/page/summary/{key}",
+                        headers=HDR, timeout=15)
+            log.debug("wiki summary: status=%d", r.status_code)
+            if r.status_code == 200:
+                extract = r.json().get("extract","")
+                if extract and len(extract) > 80:
+                    # Try full text
+                    try:
+                        r2 = WEB.get(f"{base}/w/api.php",
+                                     params={"action":"query","titles":title,
+                                             "prop":"extracts","explaintext":1,
+                                             "exsectionformat":"plain",
+                                             "format":"json","utf8":1},
+                                     headers=HDR, timeout=20)
+                        log.debug("wiki full: status=%d", r2.status_code)
+                        if r2.status_code == 200:
+                            for pg in r2.json().get("query",{}).get("pages",{}).values():
+                                full = pg.get("extract","")
+                                if full and len(full) > len(extract):
+                                    return full
+                    except Exception: pass
+                    return extract
+        except Exception as e:
+            log.error("wikipedia_article %s: %s", base, e)
+    return None
+
+# ─── YouTube ──────────────────────────────────────────────────────────────────
+def youtube_search(query: str, max_results=8) -> list[dict]:
+    log.info("youtube_search: %r", query)
     try:
         result = subprocess.run(
             ["yt-dlp", "--flat-playlist", "--print",
              "%(id)s|||%(title)s|||%(uploader)s|||%(duration_string)s",
-             f"ytsearch{max_results}:{query}", "--no-warnings"],
+             f"ytsearch{max_results}:{query}", "--no-warnings",
+             "--no-check-certificate"],
             capture_output=True, text=True, timeout=30,
         )
         items = []
         for line in result.stdout.strip().split("\n"):
             parts = line.split("|||")
-            if len(parts) >= 2:
+            if len(parts) >= 2 and parts[0].strip():
                 vid_id = parts[0].strip()
                 items.append({
                     "id": vid_id,
                     "title": parts[1].strip(),
-                    "uploader": parts[2].strip() if len(parts) > 2 else "",
-                    "duration": parts[3].strip() if len(parts) > 3 else "",
-                    "url": f"https://youtu.be/{vid_id}",
+                    "uploader": parts[2].strip() if len(parts)>2 else "",
+                    "duration":  parts[3].strip() if len(parts)>3 else "",
+                    "url": f"https://www.youtube.com/watch?v={vid_id}",
                 })
+        log.info("youtube_search: %d results", len(items))
         return items
     except Exception as e:
-        log.error("youtube_search error: %s", e)
+        log.error("youtube_search: %s", e, exc_info=True)
         return []
 
-
-def youtube_download(url: str, audio_only: bool = False) -> Optional[tuple[bytes, str]]:
-    """Download YouTube video/audio. Returns (bytes, safe_filename) or None."""
-    import shutil as _shutil
-    ffmpeg_dir = str(Path(_shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
-
-    # Use a persistent temp dir (not context manager) so files survive
-    tmp = tempfile.mkdtemp(prefix="baleyt_")
-    try:
-        out_tpl = os.path.join(tmp, "%(title).50s.%(ext)s")
-        base = [
-            "yt-dlp", "--no-playlist", "-o", out_tpl,
-            "--no-warnings", "--no-check-certificate",
-            "--ffmpeg-location", ffmpeg_dir,
-            "--geo-bypass",
-            "--socket-timeout", "30", "--retries", "3",
-            "--fragment-retries", "3",
-        ]
-        if audio_only:
-            cmd = base + [
-                "-x", "--audio-format", "mp3", "--audio-quality", "5",
-                "--prefer-ffmpeg",
-                "-f", "bestaudio/best",
-                url,
-            ]
-        else:
-            cmd = base + [
-                "-f",
-                ("bestvideo[ext=mp4][height<=720][filesize<45M]"
-                 "+bestaudio[ext=m4a]"
-                 "/bestvideo[ext=mp4][height<=480]+bestaudio[ext=m4a]"
-                 "/best[ext=mp4][filesize<45M]"
-                 "/best[filesize<45M]/best"),
-                "--merge-output-format", "mp4",
-                url,
-            ]
-
-        log.info("yt-dlp cmd: %s", " ".join(cmd))
-        proc = subprocess.run(cmd, capture_output=True, timeout=300)
-        stdout_text = proc.stdout.decode(errors="replace")
-        stderr_text = proc.stderr.decode(errors="replace")
-
-        if proc.returncode != 0:
-            log.error("yt-dlp failed (rc=%d): %s", proc.returncode, stderr_text[:800])
-            # Geo-bypass retry
-            if any(x in stderr_text for x in ["not available in your country", "geo", "not available"]):
-                log.info("Retrying with tv_embedded…")
-                cmd2 = base + ["--extractor-args", "youtube:player_client=tv_embedded"]
-                if audio_only:
-                    cmd2 += ["-x", "--audio-format", "mp3", "--audio-quality", "5",
-                              "--prefer-ffmpeg", "-f", "bestaudio/best", url]
-                else:
-                    cmd2 += ["-f", "best[filesize<45M]/best",
-                              "--merge-output-format", "mp4", url]
-                proc2 = subprocess.run(cmd2, capture_output=True, timeout=300)
-                if proc2.returncode != 0:
-                    log.error("Geo retry failed: %s",
-                              proc2.stderr.decode(errors="replace")[:400])
-                    return None
-            else:
-                return None
-
-        # Find downloaded file
-        files = [f for f in Path(tmp).iterdir() if f.is_file()]
-        log.info("yt-dlp output files: %s", files)
-        if not files:
-            log.error("yt-dlp: no output files in %s", tmp)
-            return None
-
-        # Pick largest file (avoids .part files)
-        f = max(files, key=lambda x: x.stat().st_size)
-        data = f.read_bytes()
-        fname = f.name
-        log.info("Downloaded: %s (%d MB)", fname, len(data) // 1024 // 1024)
-
-        if not audio_only and len(data) > MAX_FILE_SIZE - 2 * 1024 * 1024:
-            log.info("Trimming oversized video…")
-            trimmed = _trim_video_ffmpeg(f, tmp, ffmpeg_dir)
-            if trimmed:
-                data, fp = trimmed
-                fname = Path(fp).name
-
-        # Sanitize filename for Bale API
-        fname = re.sub(r'[^\w\s\-\.]', '', fname).strip() or "video.mp4"
-        return data, fname
-
-    except subprocess.TimeoutExpired:
-        log.error("yt-dlp timed out")
-        return None
-    except Exception as e:
-        log.error("youtube_download exception: %s", e)
-        return None
-    finally:
-        # Clean up temp dir
-        try:
-            import shutil as _s
-            _s.rmtree(tmp, ignore_errors=True)
-        except Exception:
-            pass
-
-
-def _trim_video_ffmpeg(src: Path, tmp: str, ffmpeg_dir: str = "/usr/bin") -> Optional[tuple[bytes, Path]]:
-    """Re-encode video to fit ~48 MB."""
+def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
     log.info("youtube_download: url=%r audio=%s", url, audio_only)
-    out_path = Path(tmp) / ("trimmed_" + src.name)
-    target_bytes = 48 * 1024 * 1024
-    ffprobe = str(Path(ffmpeg_dir) / "ffprobe")
-    ffmpeg  = str(Path(ffmpeg_dir) / "ffmpeg")
+    import shutil
+    ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
+
+    # Build yt-dlp command
+    base_cmd = [
+        "yt-dlp", "--no-playlist", "-o", "%(title).60s.%(ext)s",
+        "--no-warnings", "--no-check-certificate",
+        "--ffmpeg-location", ffmpeg_dir,
+        "--geo-bypass",
+        "--geo-bypass-country", "DE",
+        "--socket-timeout", "30", "--retries", "5",
+        "--extractor-args", "youtube:player_client=ios,web",
+    ]
+
+    def _run(extra_args, search_url) -> Optional[tuple[bytes,str]]:
+        with tempfile.TemporaryDirectory() as tmp:
+            cmd = base_cmd + ["-o", os.path.join(tmp, "%(title).60s.%(ext)s")] + extra_args + [search_url]
+            log.debug("yt-dlp cmd: %s", " ".join(cmd))
+            proc = subprocess.run(cmd, capture_output=True, timeout=300)
+            stderr = proc.stderr.decode(errors="replace")
+            if proc.returncode != 0:
+                log.error("yt-dlp failed rc=%d: %s", proc.returncode, stderr[:600])
+                return None
+            files = list(Path(tmp).glob("*"))
+            if not files:
+                log.error("yt-dlp: no output files in %s", tmp)
+                return None
+            f = files[0]
+            data = f.read_bytes()
+            log.info("yt-dlp: downloaded %s  %dMB", f.name, len(data)//1024//1024)
+            return data, f.name
+
+    if audio_only:
+        result = _run(["-x","--audio-format","mp3","--audio-quality","5",
+                       "-f","bestaudio/best"], url)
+    else:
+        result = _run(["-f",
+                       "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]"
+                       "/bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
+                       "--merge-output-format","mp4"], url)
+        # Trim if too large
+        if result and len(result[0]) > MAX_FILE_SIZE - 1*1024*1024:
+            log.info("Video too large (%dMB), trimming…", len(result[0])//1024//1024)
+            with tempfile.TemporaryDirectory() as tmp:
+                src = Path(tmp) / result[1]
+                src.write_bytes(result[0])
+                trimmed = _trim_video(src, tmp, ffmpeg_dir)
+                if trimmed:
+                    result = trimmed
+
+    return result
+
+def _trim_video(src: Path, tmp: str, ffmpeg_dir="/usr/bin") -> Optional[tuple[bytes,Path]]:
+    out = Path(tmp) / ("trimmed_" + src.name)
+    ffprobe = str(Path(ffmpeg_dir)/"ffprobe")
+    ffmpeg  = str(Path(ffmpeg_dir)/"ffmpeg")
     try:
-        probe = subprocess.run(
-            [ffprobe, "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(src)],
-            capture_output=True, text=True, timeout=30,
-        )
+        probe = subprocess.run([ffprobe,"-v","error","-show_entries","format=duration",
+                                "-of","default=noprint_wrappers=1:nokey=1",str(src)],
+                               capture_output=True, text=True, timeout=30)
         duration = float(probe.stdout.strip() or "300")
-        video_bitrate = max(300, int((target_bytes * 8) / duration / 1000) - 128)
-        subprocess.run(
-            [ffmpeg, "-y", "-i", str(src),
-             "-c:v", "libx264", "-b:v", f"{video_bitrate}k",
-             "-c:a", "aac", "-b:a", "128k",
-             "-movflags", "+faststart", str(out_path)],
-            capture_output=True, timeout=300, check=True,
-        )
-        data = out_path.read_bytes()
-        return data, out_path
+        vbr = max(300, int((48*1024*1024*8)/duration/1000) - 128)
+        subprocess.run([ffmpeg,"-y","-i",str(src),"-c:v","libx264","-b:v",f"{vbr}k",
+                        "-c:a","aac","-b:a","128k","-movflags","+faststart",str(out)],
+                       capture_output=True, timeout=300, check=True)
+        data = out.read_bytes()
+        return data, out
     except Exception as e:
-        log.error("ffmpeg trim error: %s", e)
+        log.error("_trim_video: %s", e)
         return None
 
+# ─── GitHub ───────────────────────────────────────────────────────────────────
+def _gh_headers() -> dict:
+    h = {"Accept": "application/vnd.github+json",
+         "User-Agent": "BaleBot/1.0",
+         "X-GitHub-Api-Version": "2022-11-28"}
+    if GITHUB_TOKEN:
+        h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return h
 
-def pinterest_search(query: str) -> list[dict]:
-    """Search Pinterest images via DDG image search (site:pinterest.com) + direct scrape."""
-    results: list[dict] = []
-    UA = ("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
-          "(KHTML, like Gecko) Chrome/122.0.6261.119 Mobile Safari/537.36")
-
-    # Strategy 1: DDG image search scoped to pinterest.com
+def github_search_repos(query: str, page=0) -> list[dict]:
+    log.info("github_search_repos: %r page=%d", query, page)
     try:
-        # Get VQD token
-        r0 = WEB.get(
-            "https://duckduckgo.com/",
-            params={"q": f"site:pinterest.com {query}", "ia": "images", "iax": "images"},
-            headers={"User-Agent": UA},
-            timeout=15,
-        )
-        vqd_m = re.search(r'vqd=(["\'])([^"\']+)\1', r0.text) or \
-                re.search(r'vqd=([\d\-]+)', r0.text)
-        if vqd_m:
-            vqd = vqd_m.group(2) if vqd_m.lastindex == 2 else vqd_m.group(1)
-            ir = WEB.get(
-                "https://duckduckgo.com/i.js",
-                params={"q": f"site:pinterest.com {query}", "o": "json",
-                        "vqd": vqd, "f": ",,,,,", "p": "1", "l": "us-en"},
-                headers={"User-Agent": UA, "Referer": "https://duckduckgo.com/"},
-                timeout=15,
-            )
-            if ir.status_code == 200:
-                for item in ir.json().get("results", []):
-                    img = item.get("image") or item.get("thumbnail")
-                    if img and "pinimg.com" in img:
-                        results.append({"url": img, "title": item.get("title", query)})
-                    elif img:
-                        results.append({"url": img, "title": item.get("title", query)})
-                    if len(results) >= 10:
-                        break
-                if results:
-                    log.info("Pinterest via DDG: %d", len(results))
-                    return results
-    except Exception as e:
-        log.error("Pinterest DDG: %s", e)
-
-    # Strategy 2: Direct Pinterest HTML scrape with realistic headers
-    try:
-        pin_headers = {
-            "User-Agent": UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-        }
-        # First hit homepage to get cookies
-        WEB.get("https://www.pinterest.com/", timeout=10, headers=pin_headers)
-        r2 = WEB.get(
-            f"https://www.pinterest.com/search/pins/?q={urllib.parse.quote(query)}&rs=typed",
-            timeout=20, headers=pin_headers,
-        )
-        text = r2.text
-        # Extract all pinimg CDN URLs
-        seen: set[str] = set()
-        for pattern in [
-            r'"orig":\{"url":"(https://i\.pinimg\.com/[^"]+)"',
-            r'"736x":\{"url":"(https://i\.pinimg\.com/[^"]+)"',
-            r'"(https://i\.pinimg\.com/originals/[^"]+\.(?:jpg|jpeg|png))"',
-            r'"(https://i\.pinimg\.com/736x/[^"]+\.(?:jpg|jpeg|png))"',
-            r'src="(https://i\.pinimg\.com/[^"]+)"',
-        ]:
-            for u in re.findall(pattern, text):
-                clean = u.replace("\\u002F", "/").replace("\\/", "/")
-                if clean not in seen and len(clean) > 20:
-                    seen.add(clean)
-                    results.append({"url": clean, "title": query})
-            if len(results) >= 10:
-                break
-        if results:
-            log.info("Pinterest HTML: %d", len(results))
-            return results
-    except Exception as e:
-        log.error("Pinterest HTML: %s", e)
-
-    # Strategy 3: Fall back to general DDG image search (not scoped to pinterest)
-    try:
-        general = google_images_search(f"pinterest {query}", 8)
-        if general:
-            log.info("Pinterest via general images: %d", len(general))
-            return [{"url": g["img"], "title": g.get("title", query)} for g in general]
-    except Exception as e:
-        log.error("Pinterest general fallback: %s", e)
-
-    return results
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# NEW: Google Images search
-# ══════════════════════════════════════════════════════════════════════════════
-
-def google_images_search(query: str, max_results: int = 8) -> list[dict]:
-    """
-    log.info("pinterest_search: query=%r", query)
-    Search images — multiple strategies ordered by Iran-accessibility:
-    1. Bing Images (accessible from Iran, no bot-detection on mobile UA)
-    2. DuckDuckGo Images via vqd token
-    3. Wikimedia Commons API
-    4. Constructed Unsplash CDN URLs (fallback)
-    """
-    UA_MOB = ("Mozilla/5.0 (Linux; Android 13; SM-G991B) "
-              "AppleWebKit/537.36 (KHTML, like Gecko) "
-              "Chrome/122.0.6261.119 Mobile Safari/537.36")
-    UA_DESK = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-               "AppleWebKit/537.36 (KHTML, like Gecko) "
-               "Chrome/122.0.0.0 Safari/537.36")
-    results: list[dict] = []
-
-    # ── Strategy 1: Bing Images ───────────────────────────────────────────
-    try:
-        r = WEB.get(
-            "https://www.bing.com/images/search",
-            params={"q": query, "form": "HDRSC2", "first": "1", "tsc": "ImageHoverTitle"},
-            headers={
-                "User-Agent": UA_DESK,
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://www.bing.com/",
-            },
-            timeout=20,
-        )
-        # Bing embeds image URLs in murl: and imgurl: fields in data-m attrs
-        for pattern in [
-            r'"murl":"(https?://[^"]+\.(?:jpg|jpeg|png|webp|gif))"',
-            r'murl&quot;:&quot;(https?://[^&]+\.(?:jpg|jpeg|png|webp))&quot;',
-        ]:
-            for url_val in re.findall(pattern, r.text):
-                url_val = url_val.replace("&amp;", "&")
-                if url_val not in {x["img"] for x in results}:
-                    results.append({"img": url_val, "title": query})
-                if len(results) >= max_results:
-                    break
-            if len(results) >= max_results:
-                break
-        if results:
-            log.info("Bing images: %d", len(results))
-            return results
-    except Exception as e:
-        log.error("Bing images: %s", e)
-
-    # ── Strategy 2: DuckDuckGo Images ────────────────────────────────────
-    try:
-        r0 = WEB.get(
-            "https://duckduckgo.com/",
-            params={"q": query, "iax": "images", "ia": "images"},
-            headers={"User-Agent": UA_MOB},
-            timeout=15,
-        )
-        vqd_m = re.search(r'vqd=(["\']?)([^"\'&\s]+)\1', r0.text)
-        if vqd_m:
-            vqd = vqd_m.group(2)
-            img_r = WEB.get(
-                "https://duckduckgo.com/i.js",
-                params={"l": "us-en", "o": "json", "q": query, "vqd": vqd,
-                        "f": ",,,,,", "p": "-1"},
-                headers={"User-Agent": UA_MOB, "Referer": "https://duckduckgo.com/"},
-                timeout=15,
-            )
-            if img_r.status_code == 200:
-                for item in img_r.json().get("results", [])[:max_results]:
-                    img_url = item.get("image") or item.get("thumbnail")
-                    if img_url:
-                        results.append({"img": img_url, "title": item.get("title", query)})
-                if results:
-                    log.info("DDG images: %d", len(results))
-                    return results
-    except Exception as e:
-        log.error("DDG images: %s", e)
-
-    # ── Strategy 3: Wikimedia Commons ────────────────────────────────────
-    try:
-        r2 = WEB.get(
-            "https://commons.wikimedia.org/w/api.php",
-            params={"action": "query", "list": "search", "srsearch": query,
-                    "srnamespace": "6", "srlimit": max_results, "format": "json"},
-            headers={"User-Agent": "BaleBot/1.0"},
-            timeout=15,
-        )
-        for p in r2.json().get("query", {}).get("search", []):
-            ir = WEB.get(
-                "https://commons.wikimedia.org/w/api.php",
-                params={"action": "query", "titles": p["title"],
-                        "prop": "imageinfo", "iiprop": "url", "format": "json"},
-                headers={"User-Agent": "BaleBot/1.0"}, timeout=10,
-            )
-            for pg in ir.json().get("query", {}).get("pages", {}).values():
-                url = (pg.get("imageinfo") or [{}])[0].get("url", "")
-                if url and any(url.lower().endswith(e)
-                               for e in (".jpg", ".jpeg", ".png", ".webp")):
-                    results.append({"img": url, "title": p.get("title", query)})
-                    break
-            if len(results) >= max_results:
-                break
-        if results:
-            log.info("Wikimedia images: %d", len(results))
-            return results
-    except Exception as e:
-        log.error("Wikimedia images: %s", e)
-
-    return results
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# NEW: Pexels (free stock photos)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def pexels_search(query: str, per_page: int = 6) -> list[dict]:
-    """
-    Free stock photos — strategies:
-    1. Pixabay free API (no key needed for read-only searches)
-    2. Unsplash Source redirect CDN (always works)
-    3. Wikimedia Commons images (open)
-    """
-    log.info("pexels_search: query=%r", query)
-    results: list[dict] = []
-
-    # ── Strategy 1: Pixabay ───────────────────────────────────────────────
-    PIXABAY_KEY = "47075717-fbc72d1e73d12c83cfdb8b44e"  # public demo key
-    try:
-        r = WEB.get(
-            "https://pixabay.com/api/",
-            params={"key": PIXABAY_KEY, "q": query, "image_type": "photo",
-                    "per_page": per_page, "safesearch": "true", "lang": "en"},
-            headers={"User-Agent": "BaleBot/1.0"},
-            timeout=15,
-        )
-        log.debug("HTTP %s status=%d len=%d", "r", r.status_code, len(r.content if hasattr(r, "content") else b""))
+        r = WEB.get("https://api.github.com/search/repositories",
+                    params={"q": query, "sort": "stars", "per_page": 8,
+                            "page": page+1},
+                    headers=_gh_headers(), timeout=20)
+        log.debug("github_search: status=%d", r.status_code)
         if r.status_code == 200:
-            for h in r.json().get("hits", []):
-                url = h.get("webformatURL") or h.get("largeImageURL")
-                if url:
-                    results.append({"url": url, "title": h.get("tags", query)[:60]})
-            if results:
-                log.info("Pixabay: %d results", len(results))
-                return results
-        else:
-            log.warning("Pixabay status: %d", r.status_code)
+            items = r.json().get("items", [])
+            log.info("github_search: %d repos", len(items))
+            return items
+        log.error("github_search error: %s", r.text[:200])
+        return []
     except Exception as e:
-        log.error("Pixabay: %s", e)
+        log.error("github_search_repos: %s", e, exc_info=True)
+        return []
 
-    # ── Strategy 2: Unsplash Source redirect CDN ──────────────────────────
-    # Each request to source.unsplash.com redirects to a real Unsplash image
+def github_repo_info(full_name: str) -> Optional[dict]:
+    log.info("github_repo_info: %s", full_name)
     try:
-        slug = urllib.parse.quote(query.replace(" ", ","))
-        for i in range(min(per_page, 5)):
-            r2 = WEB.get(
-                f"https://source.unsplash.com/featured/800x600?{slug}&sig={i}",
-                allow_redirects=True, timeout=20,
-                headers={"User-Agent": "BaleBot/1.0"},
-            )
-            log.debug("HTTP %s status=%d len=%d", "r2", r2.status_code, len(r2.content if hasattr(r2, "content") else b""))
+        r = WEB.get(f"https://api.github.com/repos/{full_name}",
+                    headers=_gh_headers(), timeout=15)
+        if r.status_code == 200:
+            return r.json()
+        return None
+    except Exception as e:
+        log.error("github_repo_info: %s", e)
+        return None
+
+def github_latest_release(full_name: str) -> Optional[dict]:
+    log.info("github_latest_release: %s", full_name)
+    try:
+        r = WEB.get(f"https://api.github.com/repos/{full_name}/releases/latest",
+                    headers=_gh_headers(), timeout=15)
+        log.debug("gh release: status=%d", r.status_code)
+        if r.status_code == 200:
+            return r.json()
+        return None
+    except Exception as e:
+        log.error("github_latest_release: %s", e)
+        return None
+
+def github_zip(repo_url: str) -> Optional[bytes]:
+    log.info("github_zip: %s", repo_url)
+    m = re.match(r"https?://github\.com/([^/]+/[^/]+?)(?:\.git|/|$)", repo_url)
+    if not m:
+        log.error("github_zip: cannot parse URL")
+        return None
+    slug = m.group(1)
+    for branch in ["main","master"]:
+        url = f"https://github.com/{slug}/archive/refs/heads/{branch}.zip"
+        try:
+            r = WEB.get(url, timeout=120, stream=True)
+            log.debug("github_zip: %s status=%d", url, r.status_code)
+            if r.status_code == 200:
+                data = r.content
+                log.info("github_zip: %dMB", len(data)//1024//1024)
+                return data
+        except Exception as e:
+            log.error("github_zip %s: %s", branch, e)
+    return None
+
+# ─── Images ───────────────────────────────────────────────────────────────────
+def images_bing(query: str, max_results=8) -> list[dict]:
+    log.info("images_bing: %r", query)
+    try:
+        r = WEB.get("https://www.bing.com/images/search",
+                    params={"q": query, "form": "HDRSC2", "first":"1"},
+                    headers={"User-Agent": UA_DESK, "Referer": "https://www.bing.com/"},
+                    timeout=20)
+        log.debug("bing_images: status=%d len=%d", r.status_code, len(r.text))
+        results = []
+        seen: set[str] = set()
+        for pattern in [r'"murl":"(https?://[^"]+\.(?:jpg|jpeg|png|webp))"',
+                         r'murl&quot;:&quot;(https?://[^&]+\.(?:jpg|jpeg|png))'
+                         r'&quot;']:
+            for u in re.findall(pattern, r.text):
+                u = u.replace("&amp;","&")
+                if u not in seen and not any(x in u for x in ["bing.com","microsoft.com"]):
+                    seen.add(u)
+                    results.append({"url": u, "title": query})
+                if len(results) >= max_results: break
+            if len(results) >= max_results: break
+        log.info("images_bing: %d results", len(results))
+        return results
+    except Exception as e:
+        log.error("images_bing: %s", e, exc_info=True)
+        return []
+
+def images_pinterest(query: str, max_results=8) -> list[dict]:
+    log.info("images_pinterest: %r", query)
+    # Strategy 1: Pinterest API
+    try:
+        r = WEB.get(
+            "https://www.pinterest.com/resource/BaseSearchResource/get/",
+            headers={"User-Agent": UA_DESK, "X-Requested-With": "XMLHttpRequest",
+                     "Accept": "application/json"},
+            params={"source_url": f"/search/pins/?q={urllib.parse.quote(query)}",
+                    "data": json.dumps({"options":{"query":query,"scope":"pins"},
+                                        "context":{}}),
+                    "_": str(int(time.time()*1000))},
+            timeout=20)
+        log.debug("pinterest_api: status=%d", r.status_code)
+        if r.status_code == 200 and r.text.strip().startswith("{"):
+            pins = (r.json().get("resource_response",{})
+                            .get("data",{}).get("results",[]))
+            results = []
+            for pin in pins:
+                for size in ("orig","736x","474x"):
+                    u = pin.get("images",{}).get(size,{}).get("url","")
+                    if u:
+                        results.append({"url":u,"title":pin.get("title") or query})
+                        break
+                if len(results) >= max_results: break
+            if results:
+                log.info("pinterest_api: %d results", len(results))
+                return results
+    except Exception as e:
+        log.error("pinterest_api: %s", e)
+
+    # Strategy 2: HTML scrape
+    try:
+        r2 = WEB.get(f"https://www.pinterest.com/search/pins/?q={urllib.parse.quote(query)}&rs=typed",
+                     headers={"User-Agent": UA_DESK}, timeout=25)
+        log.debug("pinterest_html: status=%d len=%d", r2.status_code, len(r2.text))
+        seen: set[str] = set()
+        results = []
+        for pat in [r'"orig":\s*\{"url":"(https://i\.pinimg\.com/[^"]+)"',
+                    r'"(https://i\.pinimg\.com/originals/[^"]+\.(?:jpg|jpeg|png|webp))"',
+                    r'"(https://i\.pinimg\.com/736x/[^"]+\.(?:jpg|jpeg|png|webp))"']:
+            for u in re.findall(pat, r2.text):
+                u = u.replace("\\u002F","/")
+                if u not in seen:
+                    seen.add(u)
+                    results.append({"url":u,"title":query})
+                if len(results) >= max_results: break
+        if results:
+            log.info("pinterest_html: %d results", len(results))
+            return results
+        log.warning("pinterest_html: 0 results. Page head: %s", r2.text[:300])
+    except Exception as e:
+        log.error("pinterest_html: %s", e)
+
+    # Strategy 3: Fall back to Bing with pinterest site: filter
+    log.info("pinterest: falling back to Bing")
+    return images_bing(f"site:pinterest.com {query}", max_results)
+
+def images_pexels(query: str, max_results=8) -> list[dict]:
+    """Pixabay API (free, no key for basic use) + Unsplash CDN."""
+    log.info("images_pexels: %r", query)
+    PIXABAY_KEY = "47075717-fbc72d1e73d12c83cfdb8b44e"
+    try:
+        r = WEB.get("https://pixabay.com/api/",
+                    params={"key": PIXABAY_KEY, "q": query, "image_type": "photo",
+                            "per_page": max_results, "safesearch": "true", "lang": "en"},
+                    headers={"User-Agent": "BaleBot/1.0"}, timeout=15)
+        log.debug("pixabay: status=%d", r.status_code)
+        if r.status_code == 200:
+            hits = r.json().get("hits", [])
+            results = [{"url": h.get("webformatURL") or h.get("largeImageURL"),
+                         "title": h.get("tags", query)[:60]}
+                       for h in hits if h.get("webformatURL")]
+            if results:
+                log.info("pixabay: %d results", len(results))
+                return results
+        log.warning("pixabay: status=%d resp=%s", r.status_code, r.text[:100])
+    except Exception as e:
+        log.error("images_pexels pixabay: %s", e)
+
+    # Unsplash CDN fallback (redirects to real images)
+    try:
+        slug = urllib.parse.quote(query.replace(" ",","))
+        results = []
+        for i in range(min(max_results, 6)):
+            r2 = WEB.get(f"https://source.unsplash.com/featured/800x600?{slug}&sig={i}",
+                         allow_redirects=True, timeout=20,
+                         headers={"User-Agent": "BaleBot/1.0"})
+            log.debug("unsplash %d: status=%d len=%d", i, r2.status_code, len(r2.content))
             if r2.status_code == 200 and len(r2.content) > 5000:
                 results.append({"url": r2.url, "title": f"{query} #{i+1}",
                                  "_bytes": r2.content})
         if results:
-            log.info("Unsplash CDN: %d results", len(results))
+            log.info("unsplash: %d results", len(results))
             return results
     except Exception as e:
-        log.error("Unsplash CDN: %s", e)
+        log.error("images_pexels unsplash: %s", e)
+    return []
 
-    # ── Strategy 3: Wikimedia via google_images_search ────────────────────
-    wiki = google_images_search(query, per_page)
-    for w in wiki:
-        results.append({"url": w["img"], "title": w.get("title", query)})
-    return results
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# NEW: Wikipedia
-# ══════════════════════════════════════════════════════════════════════════════
-
-def wikipedia_search(query: str, lang: str = "fa") -> list[dict]:
-    """
-    Search Wikipedia with multiple mirrors:
-    - Primary: HTTPS Wikipedia API
-    - Mirror 1: wikipedia.org via different endpoint
-    - Mirror 2: For Persian, use fa.m.wikipedia.org (mobile, lighter)
-    """
-    log.info("wikipedia_search: query=%r lang=%r", query, lang)
-    results: list[dict] = []
-    HDR = {"User-Agent": "BaleBot/1.0 (educational; bale.ai)"}
-
-    def _build_result(title: str, snippet: str) -> dict:
-        key = title.replace(" ", "_")
-        return {
-            "title": title,
-            "snippet": snippet[:150],
-            "url": f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(key)}",
-            "key": key,
-        }
-
-    # Try 1: REST v1 search/title endpoint
-    for base in [
-        f"https://{lang}.wikipedia.org/api/rest_v1/page/search/title",
-        f"https://{lang}.m.wikipedia.org/api/rest_v1/page/search/title",
-    ]:
-        try:
-            r = WEB.get(base, params={"q": query, "limit": 8},
-                             headers=HDR, timeout=15)
-            log.debug("HTTP %s status=%d len=%d", "r", r.status_code, len(r.content if hasattr(r, "content") else b""))
-            if r.status_code == 200:
-                for p in r.json().get("pages", []):
-                    title = p.get("title", "")
-                    snippet = p.get("description") or p.get("excerpt", "")
-                    if title:
-                        results.append(_build_result(title, snippet))
-                if results:
-                    log.info("Wikipedia REST (%s): %d results", lang, len(results))
-                    return results
-        except Exception as e:
-            log.error("Wikipedia REST %s: %s", base, e)
-
-    # Try 2: action API (opensearch — simpler, works without session)
-    for base in [
-        f"https://{lang}.wikipedia.org/w/api.php",
-        f"https://{lang}.m.wikipedia.org/w/api.php",
-    ]:
-        try:
-            r2 = WEB.get(base, params={
-                "action": "opensearch", "search": query,
-                "limit": 8, "namespace": 0, "format": "json",
-            }, headers=HDR, timeout=15)
-            log.debug("HTTP %s status=%d len=%d", "r2", r2.status_code, len(r2.content if hasattr(r2, "content") else b""))
-            if r2.status_code == 200:
-                data = r2.json()
-                # opensearch returns [query, [titles], [descriptions], [urls]]
-                titles = data[1] if len(data) > 1 else []
-                descs  = data[2] if len(data) > 2 else []
-                urls   = data[3] if len(data) > 3 else []
-                for i, title in enumerate(titles):
-                    snippet = descs[i] if i < len(descs) else ""
-                    url = urls[i] if i < len(urls) else ""
-                    results.append({
-                        "title": title,
-                        "snippet": snippet[:150],
-                        "url": url or f"https://{lang}.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}",
-                        "key": title.replace(" ", "_"),
-                    })
-                if results:
-                    log.info("Wikipedia opensearch (%s): %d", lang, len(results))
-                    return results
-        except Exception as e:
-            log.error("Wikipedia opensearch %s: %s", base, e)
-
-    return results
-
-
-def wikipedia_article(title: str, lang: str = "fa") -> Optional[str]:
-    """
-    Fetch Wikipedia article plain text.
-    Tries: REST summary → REST sections → action API extracts.
-    Uses mobile subdomain as mirror if main fails.
-    """
-    log.info("wikipedia_article: title=%r lang=%r", title, lang)
-    HDR = {"User-Agent": "BaleBot/1.0 (educational; bale.ai)"}
-    key = urllib.parse.quote(title.replace(" ", "_"))
-
-    # Try REST summary (fastest, ~2KB)
-    for base in [f"https://{lang}.wikipedia.org", f"https://{lang}.m.wikipedia.org"]:
-        try:
-            r = WEB.get(f"{base}/api/rest_v1/page/summary/{key}",
-                             headers=HDR, timeout=15)
-            log.debug("HTTP %s status=%d len=%d", "r", r.status_code, len(r.content if hasattr(r, "content") else b""))
-            if r.status_code == 200:
-                extract = r.json().get("extract", "")
-                if extract and len(extract) > 80:
-                    # Append more content via action API
-                    try:
-                        r2 = WEB.get(
-                            f"{base}/w/api.php",
-                            params={"action": "query", "titles": title,
-                                    "prop": "extracts", "explaintext": 1,
-                                    "exsectionformat": "plain",
-                                    "format": "json", "utf8": 1},
-                            headers=HDR, timeout=20,
-                        )
-                        log.debug("HTTP %s status=%d len=%d", "r2", r2.status_code, len(r2.content if hasattr(r2, "content") else b""))
-                        if r2.status_code == 200:
-                            pages = r2.json().get("query", {}).get("pages", {})
-                            for pg in pages.values():
-                                full = pg.get("extract", "")
-                                if full and len(full) > len(extract):
-                                    return full
-                    except Exception:
-                        pass
-                    return extract
-        except Exception as e:
-            log.error("Wikipedia article %s/%s: %s", base, title, e)
-
-    # Last resort: action API extracts only
-    for base in [f"https://{lang}.wikipedia.org", f"https://{lang}.m.wikipedia.org"]:
-        try:
-            r3 = WEB.get(
-                f"{base}/w/api.php",
-                params={"action": "query", "titles": title,
-                        "prop": "extracts", "explaintext": 1,
-                        "exsectionformat": "plain",
-                        "format": "json", "utf8": 1},
-                headers=HDR, timeout=20,
-            )
-            log.debug("HTTP %s status=%d len=%d", "r3", r3.status_code, len(r3.content if hasattr(r3, "content") else b""))
-            if r3.status_code == 200:
-                for pg in r3.json().get("query", {}).get("pages", {}).values():
-                    txt = pg.get("extract", "")
-                    if txt:
-                        return txt
-        except Exception as e:
-            log.error("Wikipedia action %s/%s: %s", base, title, e)
-
-    return None
-
-
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# NEW: Currency converter (using free exchange API)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def currency_convert(amount: float, from_cur: str, to_cur: str) -> Optional[str]:
-    """Convert currency using exchangerate.host (free)."""
+def images_wikimedia(query: str, max_results=8) -> list[dict]:
+    log.info("images_wikimedia: %r", query)
     try:
-        r = WEB.get(
-            "https://api.exchangerate.host/convert",
-            params={"from": from_cur.upper(), "to": to_cur.upper(), "amount": amount},
-            timeout=15,
-        )
-        data = r.json()
-        if data.get("success"):
-            result = data["result"]
-            return f"{amount:,.2f} {from_cur.upper()} = {result:,.2f} {to_cur.upper()}"
+        r = WEB.get("https://commons.wikimedia.org/w/api.php",
+                    params={"action":"query","list":"search","srsearch":query,
+                            "srnamespace":"6","srlimit":max_results,"format":"json"},
+                    headers={"User-Agent":"BaleBot/1.0"}, timeout=15)
+        log.debug("wikimedia_search: status=%d", r.status_code)
+        results = []
+        for p in r.json().get("query",{}).get("search",[]):
+            ir = WEB.get("https://commons.wikimedia.org/w/api.php",
+                         params={"action":"query","titles":p["title"],
+                                 "prop":"imageinfo","iiprop":"url","format":"json"},
+                         headers={"User-Agent":"BaleBot/1.0"}, timeout=10)
+            log.debug("wikimedia_info: status=%d", ir.status_code)
+            for pg in ir.json().get("query",{}).get("pages",{}).values():
+                url = (pg.get("imageinfo") or [{}])[0].get("url","")
+                if url and any(url.lower().endswith(e)
+                               for e in (".jpg",".jpeg",".png",".webp")):
+                    results.append({"url":url,"title":p.get("title",query)})
+                    break
+            if len(results) >= max_results: break
+        log.info("images_wikimedia: %d results", len(results))
+        return results
     except Exception as e:
-        log.error("currency error: %s", e)
-    # Fallback: try frankfurter
+        log.error("images_wikimedia: %s", e, exc_info=True)
+        return []
+
+# ─── Misc ─────────────────────────────────────────────────────────────────────
+def translate_text(text: str, target: str, source="auto") -> str:
+    log.info("translate_text: target=%s len=%d", target, len(text))
+    import html as html_mod
+    has_fa = bool(re.search(r'[\u0600-\u06FF]', text))
+    if source == "auto":
+        source = "fa" if has_fa else "en"
+    if source == target:
+        return text
+    MAX = 490
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        if len(cur)+len(line)+1 <= MAX:
+            cur = (cur+"\n"+line).lstrip("\n")
+        else:
+            if cur: chunks.append(cur)
+            while len(line) > MAX:
+                chunks.append(line[:MAX]); line = line[MAX:]
+            cur = line
+    if cur: chunks.append(cur)
+    parts = []
+    for chunk in chunks:
+        try:
+            r = WEB.get("https://api.mymemory.translated.net/get",
+                        params={"q": chunk, "langpair": f"{source}|{target}"},
+                        timeout=20)
+            log.debug("translate chunk: status=%d", r.status_code)
+            t = r.json()["responseData"]["translatedText"]
+            parts.append(html_mod.unescape(t))
+        except Exception as e:
+            log.error("translate chunk: %s", e)
+            parts.append(chunk)
+        time.sleep(0.2)
+    return "\n".join(parts)
+
+def ocr_image(img_bytes: bytes) -> str:
+    log.info("ocr_image: %d bytes", len(img_bytes))
     try:
-        r2 = WEB.get(
-            f"https://api.frankfurter.app/latest?from={from_cur.upper()}&to={to_cur.upper()}",
-            timeout=15,
-        )
-        data2 = r2.json()
-        rate = data2.get("rates", {}).get(to_cur.upper())
-        if rate:
-            result = amount * rate
-            return f"{amount:,.2f} {from_cur.upper()} = {result:,.4f} {to_cur.upper()}"
+        img = Image.open(io.BytesIO(img_bytes))
+        text = pytesseract.image_to_string(img, lang="fas+eng")
+        log.info("ocr_image: extracted %d chars", len(text))
+        return text.strip() or "(متنی یافت نشد)"
     except Exception as e:
-        log.error("currency fallback error: %s", e)
+        log.error("ocr_image: %s", e, exc_info=True)
+        return "❌ خطا در پردازش تصویر."
+
+def ocr_to_pdf(text: str) -> bytes:
+    from fpdf import FPDF
+    from fpdf.enums import XPos, YPos
+    pdf = FPDF(); pdf.set_margins(15,15,15); pdf.add_page()
+    pdf.set_font("Helvetica", size=11)
+    for line in text.split("\n"):
+        safe = line.encode("latin-1", errors="replace").decode("latin-1")
+        pdf.cell(0, 8, text=safe, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    return bytes(pdf.output())
+
+def currency_convert(amount: float, frm: str, to: str) -> Optional[str]:
+    log.info("currency_convert: %s %s->%s", amount, frm, to)
+    try:
+        r = WEB.get("https://api.frankfurter.app/latest",
+                    params={"from": frm.upper(), "to": to.upper()}, timeout=15)
+        log.debug("frankfurter: status=%d", r.status_code)
+        if r.status_code == 200:
+            rate = r.json().get("rates",{}).get(to.upper())
+            if rate:
+                return f"{amount:,.2f} {frm.upper()} = {amount*rate:,.4f} {to.upper()}"
+    except Exception as e:
+        log.error("currency_convert: %s", e)
     return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# NEW: IP / website info lookup
-# ══════════════════════════════════════════════════════════════════════════════
 
 def ip_lookup(target: str) -> str:
-    """Look up IP or domain info."""
-    log.info("currency_convert: %s %s->%s", amount, from_cur, to_cur)
+    log.info("ip_lookup: %s", target)
     try:
-        # Resolve domain to IP if needed
+        import socket
         ip = target.strip()
-        if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
-            import socket
+        if not re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
             ip = socket.gethostbyname(ip)
-        r = WEB.get(f"https://ipapi.co/{ip}/json/", timeout=15)
+        r = WEB.get(f"https://ipapi.co/{ip}/json/",
+                    headers={"User-Agent":"BaleBot/1.0"}, timeout=15)
+        log.debug("ipapi: status=%d", r.status_code)
         d = r.json()
         if d.get("error"):
             return "❌ اطلاعاتی یافت نشد."
-        lines = [
-            f"🌐 *اطلاعات IP: {ip}*\n",
-            f"🏳 کشور: {d.get('country_name', '—')} ({d.get('country_code', '')})",
-            f"🏙 شهر: {d.get('city', '—')} / {d.get('region', '—')}",
-            f"📡 اپراتور: {d.get('org', '—')}",
-            f"🕐 منطقه زمانی: {d.get('timezone', '—')}",
-            f"📍 مختصات: {d.get('latitude', '—')}, {d.get('longitude', '—')}",
-        ]
-        return "\n".join(lines)
+        return (f"🌐 *اطلاعات IP: {ip}*\n\n"
+                f"🏳 کشور: {d.get('country_name','—')} ({d.get('country_code','')})\n"
+                f"🏙 شهر: {d.get('city','—')} / {d.get('region','—')}\n"
+                f"📡 اپراتور: {d.get('org','—')}\n"
+                f"🕐 منطقه زمانی: {d.get('timezone','—')}\n"
+                f"📍 مختصات: {d.get('latitude','—')}, {d.get('longitude','—')}")
     except Exception as e:
-        log.error("ip_lookup error: %s", e)
+        log.error("ip_lookup: %s", e, exc_info=True)
         return "❌ خطا در جستجوی IP."
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# NEW: URL shortener / expander
-# ══════════════════════════════════════════════════════════════════════════════
-
-def shorten_url(long_url: str) -> str:
-    """Shorten URL using TinyURL (no auth needed)."""
+def shorten_url(url: str) -> str:
+    log.info("shorten_url: %s", url)
     try:
-        r = WEB.get(
-            f"https://tinyurl.com/api-create.php?url={urllib.parse.quote(long_url)}",
-            timeout=15,
-        )
-        log.debug("HTTP %s status=%d len=%d", "r", r.status_code, len(r.content if hasattr(r, "content") else b""))
+        r = WEB.get(f"https://tinyurl.com/api-create.php?url={urllib.parse.quote(url)}",
+                    timeout=15)
+        log.debug("tinyurl: status=%d resp=%s", r.status_code, r.text[:60])
         if r.status_code == 200 and r.text.startswith("http"):
             return r.text.strip()
-        return "❌ خطا در کوتاه‌سازی لینک."
+        return "❌ خطا در کوتاه‌سازی."
     except Exception as e:
-        log.error("shorten_url error: %s", e)
-        return "❌ خطا در کوتاه‌سازی لینک."
+        log.error("shorten_url: %s", e)
+        return "❌ خطا در کوتاه‌سازی."
 
-
-def expand_url(short_url: str) -> str:
-    """Follow redirects to find the final URL."""
-    log.info("shorten_url: url=%r", long_url)
+def expand_url(url: str) -> str:
+    log.info("expand_url: %s", url)
     try:
-        r = WEB.head(short_url, allow_redirects=True, timeout=15)
-        final = r.url
-        hops = len(r.history)
-        return f"🔗 لینک نهایی:\n{final}\n\n_(تعداد ریدایرکت: {hops})_"
+        r = WEB.head(url, allow_redirects=True, timeout=15)
+        return f"🔗 لینک نهایی:\n{r.url}\n\n_(ریدایرکت‌ها: {len(r.history)})_"
     except Exception as e:
-        log.error("expand_url error: %s", e)
-        return "❌ خطا در بازکردن لینک."
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# NEW: Pastebin-style text share via paste.rs (free, no auth)
-# ══════════════════════════════════════════════════════════════════════════════
+        log.error("expand_url: %s", e)
+        return "❌ خطا در باز کردن لینک."
 
 def paste_text(content: str) -> Optional[str]:
-    """Upload text to paste.rs and return public URL."""
+    log.info("paste_text: %d chars", len(content))
     try:
-        r = WEB.post(
-            "https://paste.rs/",
-            data=content.encode("utf-8"),
-            headers={"Content-Type": "text/plain"},
-            timeout=15,
-        )
-        log.debug("HTTP %s status=%d len=%d", "r", r.status_code, len(r.content if hasattr(r, "content") else b""))
-        if r.status_code in (200, 201) and r.text.startswith("http"):
+        r = WEB.post("https://paste.rs/", data=content.encode("utf-8"),
+                     headers={"Content-Type":"text/plain"}, timeout=15)
+        log.debug("paste.rs: status=%d resp=%s", r.status_code, r.text[:60])
+        if r.status_code in (200,201) and r.text.startswith("http"):
             return r.text.strip()
         return None
     except Exception as e:
-        log.error("paste_text error: %s", e)
+        log.error("paste_text: %s", e)
         return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# NEW: QR Code generator
-# ══════════════════════════════════════════════════════════════════════════════
 
 def generate_qr(text: str) -> Optional[bytes]:
-    """Generate a QR code image for the given text."""
-    log.info("paste_text: len=%d", len(content))
+    log.info("generate_qr: %r", text[:40])
     try:
-        import qrcode  # type: ignore
+        import qrcode
         qr = qrcode.QRCode(version=1, box_size=10, border=4)
-        qr.add_data(text)
-        qr.make(fit=True)
+        qr.add_data(text); qr.make(fit=True)
         img = qr.make_image(fill_color="black", back_color="white")
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        buf.seek(0)
+        buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
         return buf.read()
     except ImportError:
-        # Fallback: use online API
-        try:
-            r = WEB.get(
-                f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={urllib.parse.quote(text)}",
-                timeout=15,
-            )
-            log.debug("HTTP %s status=%d len=%d", "r", r.status_code, len(r.content if hasattr(r, "content") else b""))
-            if r.status_code == 200:
-                return r.content
-        except Exception:
-            pass
-        return None
+        r = WEB.get(f"https://api.qrserver.com/v1/create-qr-code/?size=300x300"
+                    f"&data={urllib.parse.quote(text)}", timeout=15)
+        return r.content if r.status_code == 200 else None
     except Exception as e:
-        log.error("generate_qr error: %s", e)
+        log.error("generate_qr: %s", e)
         return None
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# USER STATE HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+def init_user(cid: int):
+    if cid not in user_stats:
+        user_stats[cid] = {"requests":0,"joined":datetime.now().strftime("%Y-%m-%d"),
+                           "searches":0,"downloads":0,"translations":0,"ocr":0}
 
+def bump(cid: int, key="requests"):
+    init_user(cid)
+    user_stats[cid]["requests"] = user_stats[cid].get("requests",0)+1
+    user_stats[cid][key]        = user_stats[cid].get(key,0)+1
 
+def get_state(cid: int) -> dict:
+    return user_state.get(cid, {})
 
-def init_user(chat_id: int):
-    if chat_id not in user_stats:
-        user_stats[chat_id] = {
-            "requests": 0,
-            "joined": datetime.now().strftime("%Y-%m-%d"),
-            "searches": 0,
-            "downloads": 0,
-            "translations": 0,
-            "ocr": 0,
-        }
+def set_state(cid: int, **kw):
+    user_state[cid] = kw
 
+def clear_state(cid: int):
+    user_state[cid] = {"mode": None}
 
-def bump(chat_id: int, key: str = "requests"):
-    init_user(chat_id)
-    user_stats[chat_id]["requests"] = user_stats[chat_id].get("requests", 0) + 1
-    user_stats[chat_id][key] = user_stats[chat_id].get(key, 0) + 1
-
-
-def stats_text(chat_id: int) -> str:
-    init_user(chat_id)
-    s = user_stats[chat_id]
-    return (
-        f"📊 *اطلاعات کاربری شما*\n\n"
-        f"🗓 تاریخ عضویت: {s['joined']}\n"
-        f"📈 مجموع درخواست‌ها: {s['requests']}\n"
-        f"🔎 جستجوها: {s.get('searches', 0)}\n"
-        f"📥 دانلودها: {s.get('downloads', 0)}\n"
-        f"🌐 ترجمه‌ها: {s.get('translations', 0)}\n"
-        f"🖼 OCR: {s.get('ocr', 0)}\n"
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Help text
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ═══════════════════════════════════════════════════════════════════════════════
+# STATIC TEXTS
+# ═══════════════════════════════════════════════════════════════════════════════
 HELP_TEXT = """❓ *راهنمای دستیار وب*
 
-🔎 *جستجو در وب* — تا ۱۰ نتیجه از DuckDuckGo با صفحه‌بندی
-📄 *نتایج HTML* — نتایج جستجو به فایل HTML
-🌐 *باز کردن سایت* — دریافت متن و HTML هر صفحه
-🗜 *ZIP آفلاین* — صفحه + منابع در قالب ZIP
-📥 *GitHub* — دانلود کل مخزن به ZIP
-🌐 *ترجمه* — ۶ زبان، پشتیبانی از متن طولانی
+🔎 *جستجو در وب* — نتایج به‌صورت دکمه، کلیک برای باز کردن
+🌐 *مشاهده سایت* — اسکرین‌شات + دکمه‌های متن / HTML / ZIP / PDF
+📚 *مقاله علمی* — Google Scholar با صفحه‌بندی
+📖 *ویکی‌پدیا* — جستجو + خواندن مقاله کامل
+📺 *یوتیوب* — جستجو (نتایج قابل کلیک) یا دانلود ویدیو
+🎵 *موسیقی MP3* — جستجو و دانلود MP3
+🖼 *دانلود عکس* — Bing / Pinterest / Pixabay / Wikimedia
+🐙 *GitHub* — جستجوی مخازن / دانلود ZIP / آخرین Release
+🌐 *ترجمه* — ۶ زبان، متن طولانی
 🖼 *OCR* — استخراج متن از عکس + PDF
-📚 *مقاله علمی* — جستجو Google Scholar با صفحه‌بندی
-📖 *ویکی‌پدیا* — جستجو و خواندن مقاله (فارسی/انگلیسی)
-📺 *یوتیوب* — دانلود ویدیو یا جستجو
-🎵 *موسیقی MP3* — دانلود MP3 از یوتیوب
-📌 *پینترست* — جستجو و دانلود تصاویر
-🖼 *تصاویر گوگل* — جستجو و دانلود عکس از گوگل
-📷 *Pexels* — عکس‌های رایگان با کیفیت بالا
-💱 *تبدیل ارز* — نرخ روز (مثال: 100 USD to IRR)
-🌐 *IP/دامنه* — اطلاعات موقعیت و اپراتور
-🔗 *کوتاه‌سازی لینک* — با TinyURL
-🔍 *بازکردن لینک کوتاه* — یافتن URL اصلی
-📋 *اشتراک متن* — آپلود متن و گرفتن لینک
-📱 *QR کد* — ساخت QR از هر متن یا لینک"""
+💱 *تبدیل ارز* — مثال: `100 USD to IRR`
+🌐 *IP/دامنه* — اطلاعات موقعیت
+🔗 *کوتاه‌سازی لینک* — TinyURL
+📱 *QR کد* — از هر متن یا لینک
+📋 *اشتراک متن* — paste.rs
+🔒 *حریم خصوصی* — توضیح کامل"""
 
+PRIVACY_TEXT = """🔒 *حریم خصوصی دستیار وب*
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Update dispatcher
-# ══════════════════════════════════════════════════════════════════════════════
+این ربات هیچ پیام، جستجو یا فایلی از شما را *ذخیره نمی‌کند*.
 
-def handle_update(update: dict):
-    """Route incoming update to correct handler."""
-    if "message" in update:
-        handle_message(update["message"])
-    elif "callback_query" in update:
-        handle_callback(update["callback_query"])
+📌 *چه چیزی پردازش می‌شود؟*
+• پیام‌های شما فقط برای اجرای همان درخواست استفاده می‌شوند.
+• نتایج جستجو به‌صورت موقت در حافظه نگه داشته می‌شوند تا دکمه‌ها کار کنند؛ پس از مدتی پاک می‌شوند.
+• هیچ پایگاه‌داده‌ای نداریم.
 
+🌐 *سرویس‌های خارجی*
+ربات برای انجام کارها به سرویس‌هایی مثل DuckDuckGo، Wikipedia، YouTube، GitHub و ... درخواست می‌فرستد. این سرویس‌ها سیاست حریم خصوصی خودشان را دارند.
 
-def handle_message(msg: dict):
-    chat_id = msg["chat"]["id"]
-    text = msg.get("text", "")
-    photo = msg.get("photo")
-    document = msg.get("document")
-    init_user(chat_id)
+🛡 *امنیت*
+• ربات روی سرور اختصاصی اجرا می‌شود.
+• توکن ربات محرمانه است و در کد قرار نمی‌گیرد.
 
-    # ── Commands ──────────────────────────────────────────────────────────
-    if text.startswith("/start"):
-        user_state[chat_id] = {"mode": None}
-        send_message(
-            chat_id,
-            "👋 سلام! به *دستیار وب* خوش آمدید.\n"
-            "یکی از گزینه‌های زیر را انتخاب کنید یا مستقیم سوال بپرسید:",
-            reply_markup=main_menu_keyboard(),
-            parse_mode="Markdown",
-        )
-        return
+📩 *سوال دارید؟*
+با مدیر ربات در تماس باشید."""
 
-    if text.startswith("/help"):
-        send_message(chat_id, HELP_TEXT, parse_mode="Markdown")
-        return
+# ═══════════════════════════════════════════════════════════════════════════════
+# URL KEY CACHE  (for site-view button callbacks)
+# ═══════════════════════════════════════════════════════════════════════════════
+url_cache: dict[str, str] = {}   # short_key → full_url
 
-    if text.startswith("/stats"):
-        send_message(chat_id, stats_text(chat_id), parse_mode="Markdown")
-        return
+def store_url(url: str) -> str:
+    key = hashlib.md5(url.encode()).hexdigest()[:10]
+    url_cache[key] = url
+    return key
 
-    if text.startswith("/cancel"):
-        user_state[chat_id] = {"mode": None}
-        send_message(chat_id, "✅ عملیات لغو شد.", reply_markup=main_menu_keyboard())
-        return
+def get_url(key: str) -> Optional[str]:
+    return url_cache.get(key)
 
-    if text.startswith("/ocr"):
-        # User replied with /ocr — check reply
-        reply = msg.get("reply_to_message")
-        if reply and reply.get("photo"):
-            process_ocr_photo(chat_id, reply["photo"], msg["message_id"])
-        else:
-            user_state[chat_id] = {"mode": "ocr"}
-            send_message(chat_id, "🖼 عکس حاوی متن را ارسال کنید.", reply_markup=cancel_keyboard())
-        return
-
-    # ── State-based handling ──────────────────────────────────────────────
-    mode = user_state.get(chat_id, {}).get("mode")
-
-    if photo:
-        if mode == "ocr" or not mode:
-            process_ocr_photo(chat_id, photo, msg["message_id"])
-            return
-
-    if not text:
-        return  # ignore non-text non-photo
-
-    if mode == "search":
-        do_search(chat_id, text)
-
-    elif mode == "html_search":
-        do_html_search(chat_id, text)
-
-    elif mode == "open":
-        do_open_url(chat_id, text)
-
-    elif mode == "pdf":
-        do_page_pdf(chat_id, text)
-
-    elif mode == "zip":
-        do_page_zip(chat_id, text)
-
-    elif mode == "github":
-        do_github(chat_id, text)
-
-    elif mode == "translate":
-        lang = user_state[chat_id].get("target_lang", "en")
-        do_translate(chat_id, text, lang)
-
-    elif mode == "scholar":
-        do_scholar(chat_id, text)
-
-    elif mode == "youtube_download":
-        do_youtube_download(chat_id, text)
-
-    elif mode == "youtube_search":
-        do_youtube_search(chat_id, text)
-
-    elif mode == "music":
-        do_music(chat_id, text)
-
-    elif mode == "pinterest":
-        do_pinterest(chat_id, text)
-
-    elif mode == "gimages":
-        do_google_images(chat_id, text)
-
-    elif mode == "pexels":
-        do_pexels(chat_id, text)
-
-    elif mode == "wiki":
-        do_wiki_search(chat_id, text)
-
-    elif mode == "wiki_article":
-        lang = user_state[chat_id].get("wiki_lang", "fa")
-        do_wiki_article(chat_id, text, lang)
-
-    elif mode == "currency":
-        do_currency(chat_id, text)
-
-    elif mode == "iplookup":
-        do_ip_lookup(chat_id, text)
-
-    elif mode == "shorten":
-        do_shorten(chat_id, text)
-
-    elif mode == "expand":
-        do_expand(chat_id, text)
-
-    elif mode == "paste":
-        do_paste(chat_id, text)
-
-    elif mode == "qr":
-        do_qr(chat_id, text)
-
-    elif mode == "ocr":
-        send_message(chat_id, "🖼 لطفاً یک عکس ارسال کنید.", reply_markup=cancel_keyboard())
-
-    else:
-        # No mode — treat as a quick web search
-        if text.startswith("http"):
-            do_open_url(chat_id, text)
-        else:
-            do_search(chat_id, text)
-
-
-def handle_callback(cb: dict):
-    chat_id = cb["message"]["chat"]["id"]
-    msg_id = cb["message"]["message_id"]
-    data = cb.get("data", "")
-
-    # Acknowledge
-    try:
-        api("answerCallbackQuery", callback_query_id=cb["id"])
-    except Exception:
-        pass
-
-    if data == "cancel":
-        user_state[chat_id] = {"mode": None}
-        send_message(chat_id, "✅ عملیات لغو شد.", reply_markup=main_menu_keyboard())
-        return
-
-    if data == "help":
-        send_message(chat_id, HELP_TEXT, parse_mode="Markdown")
-        return
-
-    if data == "stats":
-        send_message(chat_id, stats_text(chat_id), parse_mode="Markdown")
-        return
-
-    mode_map = {
-        "mode_search":     ("search",          "🔎 کلمه یا عبارت جستجو را بنویسید:"),
-        "mode_html_search":("html_search",     "📄 کلمه یا عبارت جستجو را بنویسید (خروجی HTML):"),
-        "mode_open":       ("open",            "🌐 آدرس سایت را وارد کنید (مثال: https://example.com):"),
-        "mode_pdf":        ("pdf",             "📑 آدرس سایت را وارد کنید تا HTML آن دریافت شود:"),
-        "mode_zip":        ("zip",             "🗜 آدرس سایت را وارد کنید برای دریافت ZIP آفلاین:"),
-        "mode_github":     ("github",          "📥 لینک مخزن GitHub را وارد کنید:"),
-        "mode_scholar":    ("scholar",         "📚 عنوان یا کلمه‌کلیدی مقاله را بنویسید:"),
-        "mode_music":      ("music",           "🎵 نام آهنگ یا آرتیست را بنویسید:"),
-        "mode_pinterest":  ("pinterest",       "📌 کلمه کلیدی برای جستجو در پینترست:"),
-        "mode_gimages":    ("gimages",         "🖼 کلمه کلیدی برای جستجوی تصاویر گوگل:"),
-        "mode_pexels":     ("pexels",          "📷 کلمه کلیدی برای جستجو در Pexels:"),
-        "mode_currency":   ("currency",        "💱 تبدیل ارز را وارد کنید:\nمثال: 100 USD to IRR\nیا: 50 EUR to USD"),
-        "mode_iplookup":   ("iplookup",        "🌐 آدرس IP یا دامنه را وارد کنید:\nمثال: 8.8.8.8 یا google.com"),
-        "mode_shorten":    ("shorten",         "🔗 لینک بلند را برای کوتاه‌سازی وارد کنید:"),
-        "mode_expand":     ("expand",          "🔍 لینک کوتاه را برای بازکردن وارد کنید:"),
-        "mode_paste":      ("paste",           "📋 متن مورد نظر برای اشتراک‌گذاری را ارسال کنید:"),
-        "mode_qr":         ("qr",              "📱 متن یا لینک مورد نظر برای ساخت QR کد را وارد کنید:"),
-        "mode_wiki":       ("wiki",            "📖 موضوع مورد نظر را برای جستجو در ویکی‌پدیا بنویسید:"),
-    }
-
-    if data in mode_map:
-        mode, prompt = mode_map[data]
-        user_state[chat_id] = {"mode": mode}
-        send_message(chat_id, prompt, reply_markup=cancel_keyboard())
-        return
-
-    if data == "mode_translate":
-        user_state[chat_id] = {"mode": "translate_lang"}
-        send_message(chat_id, "🌐 زبان مقصد ترجمه را انتخاب کنید:", reply_markup=translate_keyboard())
-        return
-
-    if data.startswith("trlang_"):
-        lang = data.split("_", 1)[1]
-        user_state[chat_id] = {"mode": "translate", "target_lang": lang}
-        lang_names = {"fa": "فارسی", "en": "انگلیسی", "ar": "عربی",
-                      "de": "آلمانی", "fr": "فرانسوی", "ru": "روسی"}
-        send_message(
-            chat_id,
-            f"✅ زبان مقصد: *{lang_names.get(lang, lang)}*\n\nمتن مورد نظر برای ترجمه را ارسال کنید:",
-            parse_mode="Markdown",
-            reply_markup=cancel_keyboard(),
-        )
-        return
-
-    if data == "mode_ocr":
-        user_state[chat_id] = {"mode": "ocr"}
-        send_message(chat_id, "🖼 عکس حاوی متن را ارسال کنید:", reply_markup=cancel_keyboard())
-        return
-
-    if data == "mode_youtube":
-        user_state[chat_id] = {"mode": "youtube_menu"}
-        send_message(chat_id, "📺 چه کاری می‌خواهید انجام دهید؟", reply_markup=youtube_keyboard())
-        return
-
-    if data == "yt_video":
-        user_state[chat_id] = {"mode": "youtube_download"}
-        send_message(chat_id, "📥 لینک یوتیوب را وارد کنید:", reply_markup=cancel_keyboard())
-        return
-
-    if data == "yt_search":
-        user_state[chat_id] = {"mode": "youtube_search"}
-        send_message(chat_id, "🔍 کلمه جستجو برای یوتیوب:", reply_markup=cancel_keyboard())
-        return
-
-    # ── Pagination callbacks ──────────────────────────────────────────────
-    # Format: search_next_2  /  search_prev_2  /  scholar_next_1  etc.
-    pag_match = re.match(r"(search|hsearch|scholar)_(next|prev)_(\d+)$", data)
-    if pag_match:
-        kind, direction, cur_page_str = pag_match.groups()
-        cur_page = int(cur_page_str)
-        new_page = cur_page + 1 if direction == "next" else cur_page - 1
-        new_page = max(0, new_page)
-        query = user_state.get(chat_id, {}).get("last_query", "")
-        if not query:
-            send_message(chat_id, "❌ جستجوی قبلی پیدا نشد. دوباره جستجو کنید.",
-                         reply_markup=main_menu_keyboard())
-            return
-        if kind == "search":
-            do_search(chat_id, query, new_page)
-        elif kind == "hsearch":
-            do_html_search(chat_id, query, new_page)
-        elif kind == "scholar":
-            do_scholar(chat_id, query, new_page)
-        return
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Feature handlers
-# ══════════════════════════════════════════════════════════════════════════════
-
-def do_search(chat_id: int, query: str, page: int = 0):
-    bump(chat_id, "searches")
-    send_chat_action(chat_id, "typing")
+# ═══════════════════════════════════════════════════════════════════════════════
+# DO_ HANDLERS
+# ═══════════════════════════════════════════════════════════════════════════════
+def do_search(cid: int, query: str, page=0):
+    bump(cid, "searches")
+    chat_action(cid)
     results = web_search(query, 10, page)
-    # Save state for pagination
-    user_state[chat_id] = {"mode": "search", "last_query": query, "page": page}
+    key = make_cache_key("ws", query, page)
+    cache_set(key, results)
+    set_state(cid, mode="search", last_query=query, page=page, cache_key=key)
     if not results:
-        send_message(chat_id,
-                     "❌ نتیجه‌ای یافت نشد.\n"
-                     "_ممکن است DuckDuckGo موقتاً پاسخ ندهد. دوباره تلاش کنید._",
-                     parse_mode="Markdown",
-                     reply_markup=main_menu_keyboard())
+        send_message(cid, "❌ نتیجه‌ای یافت نشد.", reply_markup=home_kb())
         return
-    offset = page * 10
-    lines = [f"🔎 *نتایج جستجو:* _{query}_  (صفحه {page + 1})\n"]
-    for i, r in enumerate(results, offset + 1):
-        snippet = r.get("snippet", "")
-        lines.append(f"{i}. [{r['title']}]({r['link']})")
-        if snippet:
-            lines.append(f"   _{snippet[:100]}_")
-    kb = pagination_keyboard(
-        f"search_prev_{page}", f"search_next_{page}",
-        page, len(results) == 10,
-    )
-    send_message(chat_id, "\n".join(lines)[:4000],
-                 parse_mode="Markdown", reply_markup=kb)
+    text = f"🔎 *نتایج جستجو:* _{query}_  (صفحه {page+1})\nروی هر نتیجه کلیک کنید:"
+    kb = search_results_kb(results, key, page, len(results)==10, "ws")
+    send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
 
-
-def do_html_search(chat_id: int, query: str, page: int = 0):
-    bump(chat_id, "searches")
-    send_chat_action(chat_id, "upload_document")
-    html_bytes = search_to_html(query, page)
-    safe_q = re.sub(r"[^\w\u0600-\u06FF]", "_", query)[:20]
-    send_document(chat_id, html_bytes, f"search_{safe_q}_p{page+1}.html",
-                  caption=f"📄 نتایج جستجو: {query} (صفحه {page+1})")
-    user_state[chat_id] = {"mode": "html_search", "last_query": query, "page": page}
-    kb = pagination_keyboard(
-        f"hsearch_prev_{page}", f"hsearch_next_{page}",
-        page, True,
-    )
-    send_message(chat_id, "✅ فایل HTML ارسال شد.", reply_markup=kb)
-
-
-def do_open_url(chat_id: int, url: str):
-    bump(chat_id, "downloads")
-    if not url.startswith("http"):
-        url = "https://" + url
-    send_chat_action(chat_id, "typing")
-    content = fetch_page(url)
-    if not content:
-        send_message(chat_id, "❌ خطا در دریافت صفحه.", reply_markup=main_menu_keyboard())
-        return
-    soup = BeautifulSoup(content, "html.parser")
-    # Extract readable text
-    for tag in soup(["script", "style", "nav", "footer", "aside"]):
-        tag.decompose()
-    text = soup.get_text(separator="\n", strip=True)
-    lines = [l for l in text.split("\n") if l.strip()][:60]
-    preview = "\n".join(lines)
-    send_message(chat_id, f"🌐 *محتوای صفحه:*\n\n{preview[:3000]}", parse_mode="Markdown")
-    # Also send HTML file
-    send_document(chat_id, content, "page.html", caption=f"📄 HTML صفحه: {url[:80]}")
-    user_state[chat_id] = {"mode": None}
-    send_message(chat_id, "✅ صفحه دریافت شد.", reply_markup=main_menu_keyboard())
-
-
-def do_page_pdf(chat_id: int, url: str):
-    bump(chat_id, "downloads")
-    if not url.startswith("http"):
-        url = "https://" + url
-    send_chat_action(chat_id, "upload_document")
-    content = fetch_page(url)
-    if not content:
-        send_message(chat_id, "❌ خطا در دریافت صفحه.", reply_markup=main_menu_keyboard())
-        return
-    send_document(chat_id, content, "page.html", caption=f"📑 HTML صفحه: {url[:80]}")
-    user_state[chat_id] = {"mode": None}
-    send_message(chat_id, "✅ فایل ارسال شد.", reply_markup=main_menu_keyboard())
-
-
-def do_page_zip(chat_id: int, url: str):
-    bump(chat_id, "downloads")
-    if not url.startswith("http"):
-        url = "https://" + url
-    send_chat_action(chat_id, "upload_document")
-    send_message(chat_id, "⏳ در حال دریافت صفحه و منابع آن...")
-    zip_bytes = page_to_zip(url)
-    if not zip_bytes:
-        send_message(chat_id, "❌ خطا در ساخت فایل ZIP.", reply_markup=main_menu_keyboard())
-        return
-    domain = urllib.parse.urlparse(url).netloc.replace(".", "_")
-    send_document(chat_id, zip_bytes, f"{domain}_offline.zip",
-                  caption=f"🗜 آرشیو آفلاین: {url[:60]}")
-    user_state[chat_id] = {"mode": None}
-    send_message(chat_id, "✅ ZIP ارسال شد.", reply_markup=main_menu_keyboard())
-
-
-def do_github(chat_id: int, url: str):
-    bump(chat_id, "downloads")
-    send_chat_action(chat_id, "upload_document")
-    send_message(chat_id, "⏳ در حال دانلود مخزن GitHub...")
-    zip_bytes = github_zip(url)
-    if not zip_bytes:
-        send_message(chat_id, "❌ مخزن یافت نشد یا حجم آن زیاد است.", reply_markup=main_menu_keyboard())
-        return
-    m = re.search(r"github\.com/([^/]+/[^/]+?)(?:\.git|/|$)", url)
-    slug = m.group(1).replace("/", "_") if m else "repo"
-    send_document(chat_id, zip_bytes, f"{slug}.zip", caption=f"📥 مخزن: {url[:80]}")
-    user_state[chat_id] = {"mode": None}
-    send_message(chat_id, "✅ ZIP مخزن ارسال شد.", reply_markup=main_menu_keyboard())
-
-
-def do_translate(chat_id: int, text: str, target: str):
-    bump(chat_id, "translations")
-    send_chat_action(chat_id, "typing")
-    result = translate_text(text, target)
-    send_message(chat_id, f"🌐 *ترجمه:*\n\n{result}", parse_mode="Markdown",
-                 reply_markup=main_menu_keyboard())
-
-
-def process_ocr_photo(chat_id: int, photos: list, reply_id: int = None):
-    bump(chat_id, "ocr")
-    send_chat_action(chat_id, "typing")
-    # Get largest photo
-    photo = sorted(photos, key=lambda p: p.get("file_size", 0))[-1]
-    if photo.get("file_size", 0) > MAX_OCR_SIZE:
-        send_message(chat_id, "❌ حجم عکس بیشتر از ۵ مگابایت است.")
-        return
-    file_url = get_file_url(photo["file_id"])
-    if not file_url:
-        send_message(chat_id, "❌ خطا در دریافت عکس.")
-        return
-    img_bytes = download_file(file_url, MAX_OCR_SIZE)
-    if not img_bytes:
-        send_message(chat_id, "❌ خطا در دانلود عکس.")
-        return
-    send_message(chat_id, "⏳ در حال پردازش تصویر...")
-    extracted = ocr_image(img_bytes)
-    send_message(chat_id, f"📝 *متن استخراج شده:*\n\n{extracted[:3500]}",
-                 parse_mode="Markdown", reply_to_message_id=reply_id)
-    # Send as PDF
-    try:
-        pdf_bytes = ocr_to_pdf(extracted)
-        send_document(chat_id, pdf_bytes, "ocr_result.pdf", caption="📑 متن OCR به‌صورت PDF")
-    except Exception as e:
-        log.error("OCR PDF error: %s", e)
-    user_state[chat_id] = {"mode": None}
-    send_message(chat_id, "✅ OCR انجام شد.", reply_markup=main_menu_keyboard())
-
-
-def do_scholar(chat_id: int, query: str, page: int = 0):
-    bump(chat_id, "searches")
-    send_chat_action(chat_id, "typing")
+def do_scholar(cid: int, query: str, page=0):
+    bump(cid, "searches")
+    chat_action(cid)
     results = scholar_search(query, page)
-    user_state[chat_id] = {"mode": "scholar", "last_query": query, "page": page}
+    key = make_cache_key("sc", query, page)
+    cache_set(key, results)
+    set_state(cid, mode="scholar", last_query=query, page=page, cache_key=key)
     if not results:
-        send_message(chat_id,
-                     "❌ مقاله‌ای یافت نشد.\n"
-                     "_ممکن است Google Scholar موقتاً دسترسی را محدود کرده باشد._",
-                     parse_mode="Markdown",
-                     reply_markup=main_menu_keyboard())
+        send_message(cid, "❌ مقاله‌ای یافت نشد.", reply_markup=home_kb())
         return
-    offset = page * 10
-    lines = [f"📚 *نتایج Google Scholar:* _{query}_  (صفحه {page + 1})\n"]
-    for i, r in enumerate(results, offset + 1):
-        lines.append(f"{i}. [{r['title']}]({r['link']})")
-        if r.get("meta"):
-            lines.append(f"   _{r['meta'][:80]}_")
-        if r.get("snippet"):
-            lines.append(f"   {r['snippet'][:120]}…")
-        lines.append("")
-    kb = pagination_keyboard(
-        f"scholar_prev_{page}", f"scholar_next_{page}",
-        page, len(results) >= 8,
-    )
-    send_message(chat_id, "\n".join(lines)[:4000],
-                 parse_mode="Markdown", reply_markup=kb)
+    text = f"📚 *Google Scholar:* _{query}_  (صفحه {page+1})"
+    kb = search_results_kb(results, key, page, len(results)>=8, "sc")
+    send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
 
-
-def do_youtube_search(chat_id: int, query: str):
-    bump(chat_id, "searches")
-    send_chat_action(chat_id, "typing")
-    results = youtube_search(query)
+def do_wiki_search(cid: int, query: str):
+    bump(cid, "searches")
+    chat_action(cid)
+    results = wikipedia_search(query, "fa")
+    lang = "fa"
     if not results:
-        send_message(chat_id, "❌ ویدیویی یافت نشد.", reply_markup=main_menu_keyboard())
+        results = wikipedia_search(query, "en")
+        lang = "en"
+    if not results:
+        send_message(cid, "❌ مقاله‌ای در ویکی‌پدیا یافت نشد.", reply_markup=home_kb())
         return
-    lines = [f"📺 *نتایج یوتیوب:* {query}\n"]
-    for i, r in enumerate(results, 1):
-        dur = f" ({r['duration']})" if r.get("duration") else ""
-        lines.append(f"{i}. [{r['title']}]({r['url']}){dur}")
-        if r.get("uploader"):
-            lines.append(f"   🎬 {r['uploader']}")
-    send_message(chat_id, "\n".join(lines)[:4000], parse_mode="Markdown",
-                 reply_markup=main_menu_keyboard())
-    user_state[chat_id] = {"mode": None}
+    key = make_cache_key("wk", query, 0)
+    cache_set(key, results)
+    set_state(cid, mode="wiki", last_query=query, cache_key=key, wiki_lang=lang)
+    text = f"📖 *ویکی‌پدیا:* _{query}_\nروی مقاله کلیک کنید:"
+    kb = wiki_result_kb(results, key, lang)
+    send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
 
-
-def do_youtube_download(chat_id: int, url: str):
-    bump(chat_id, "downloads")
-    url = url.strip()
-    if "youtu" not in url and "yt.be" not in url:
-        send_message(chat_id, "❌ لینک معتبر یوتیوب وارد کنید.\nمثال: https://youtu.be/xxxx",
-                     reply_markup=main_menu_keyboard())
+def do_wiki_article(cid: int, title: str, lang: str):
+    bump(cid, "searches")
+    chat_action(cid)
+    send_message(cid, f"⏳ در حال دریافت مقاله _{title}_…", parse_mode="Markdown")
+    text = wikipedia_article(title, lang)
+    if not text and lang == "fa":
+        text = wikipedia_article(title, "en")
+    if not text:
+        send_message(cid, "❌ مقاله یافت نشد.", reply_markup=home_kb())
         return
-    send_message(chat_id, "⏳ در حال دانلود ویدیو… (ممکن است چند دقیقه طول بکشد)")
-    send_chat_action(chat_id, "upload_video")
+    send_message(cid, f"📖 *{title}*\n\n{text[:3500]}", parse_mode="Markdown")
+    if len(text) > 3500:
+        send_document(cid, text.encode("utf-8"), f"{title[:40]}.txt",
+                      caption="📄 متن کامل مقاله")
+    send_message(cid, "✅", reply_markup=home_kb())
+    clear_state(cid)
+
+def do_open_url(cid: int, url: str):
+    bump(cid, "downloads")
+    if not url.startswith("http"):
+        url = "https://" + url
+    url_key = store_url(url)
+    send_message(cid, f"⏳ در حال گرفتن اسکرین‌شات از:\n{url}")
+    chat_action(cid, "upload_photo")
+    ss = screenshot_page(url)
+    if ss:
+        short_url = url[:60] + ("…" if len(url)>60 else "")
+        send_photo(cid, ss, caption=f"🌐 {short_url}",
+                   reply_markup=site_view_kb(url_key))
+    else:
+        send_message(cid, "⚠️ اسکرین‌شات ممکن نبود. از دکمه‌های زیر استفاده کنید:",
+                     reply_markup=site_view_kb(url_key))
+    clear_state(cid)
+
+def do_youtube_search_cmd(cid: int, query: str, page=0):
+    bump(cid, "searches")
+    chat_action(cid)
+    results = youtube_search(query, 8)
+    key = make_cache_key("yt", query, page)
+    cache_set(key, results)
+    set_state(cid, mode="yt_search", last_query=query, page=page, cache_key=key)
+    if not results:
+        send_message(cid, "❌ ویدیویی یافت نشد.", reply_markup=home_kb())
+        return
+    text = f"📺 *یوتیوب:* _{query}_\nروی ویدیو کلیک کنید تا دانلود شود:"
+    kb = yt_results_kb(results, key, page, len(results)==8)
+    send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
+
+def do_youtube_dl(cid: int, url: str):
+    bump(cid, "downloads")
+    if not ("youtu.be" in url or "youtube.com" in url):
+        send_message(cid, "❌ لینک یوتیوب معتبر وارد کنید.", reply_markup=home_kb())
+        return
+    send_message(cid, "⏳ در حال دانلود ویدیو… (ممکن است چند دقیقه طول بکشد)")
+    chat_action(cid, "upload_video")
     result = youtube_download(url, audio_only=False)
+    _finish_video(cid, result)
+
+def _finish_video(cid: int, result):
     if not result:
-        send_message(chat_id,
-                     "❌ خطا در دانلود ویدیو.\n"
-                     "• لینک ممکن است محدود یا خصوصی باشد\n"
-                     "• اجرا کنید: `yt-dlp -U` برای آپدیت",
-                     parse_mode="Markdown",
-                     reply_markup=main_menu_keyboard())
+        send_message(cid, "❌ دانلود ناموفق بود.\nاجرا کنید: `yt-dlp -U` برای آپدیت",
+                     parse_mode="Markdown", reply_markup=home_kb())
         return
     data, fname = result
     fname = Path(fname).name
-    size_mb = len(data) // 1024 // 1024
-    log.info("YT download: %s  size=%d MB", fname, size_mb)
-
+    size_mb = len(data)//1024//1024
     if len(data) > MAX_FILE_SIZE:
-        send_message(chat_id,
-                     f"❌ حجم ویدیو ({size_mb} MB) بیشتر از ۵۰ MB است.\n"
-                     "فایل پس از trim هنوز بزرگ است.",
-                     reply_markup=main_menu_keyboard())
+        send_message(cid, f"❌ حجم ویدیو ({size_mb}MB) بیشتر از ۵۰MB است.",
+                     reply_markup=home_kb())
         return
-
-    # Try sendVideo first (inline playback), fallback to sendDocument
     sent = False
     if fname.lower().endswith(".mp4"):
-        sent = send_video_bytes(chat_id, data, fname, caption=f"📺 {fname[:80]}")
+        sent = send_video(cid, data, fname, caption=f"📺 {fname[:60]}")
     if not sent:
-        sent = send_document(chat_id, data, fname, caption=f"📺 {fname[:80]}")
-
-    user_state[chat_id] = {"mode": None}
+        sent = send_document(cid, data, fname, caption=f"📺 {fname[:60]}")
     if sent:
-        send_message(chat_id, f"✅ ویدیو ارسال شد ({size_mb} MB).",
-                     reply_markup=main_menu_keyboard())
+        send_message(cid, f"✅ ارسال شد ({size_mb}MB).", reply_markup=home_kb())
     else:
-        send_message(chat_id,
-                     "❌ ارسال ویدیو ناموفق بود.\n"
-                     f"حجم: {size_mb} MB — سرور بله ممکن است آن را رد کرده باشد.",
-                     reply_markup=main_menu_keyboard())
+        send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+    clear_state(cid)
 
-
-def do_music(chat_id: int, query: str):
-    bump(chat_id, "downloads")
-    send_message(chat_id, f"⏳ در حال جستجو و دانلود MP3 برای: _{query}_…",
-                 parse_mode="Markdown")
-    send_chat_action(chat_id, "record_voice")
-    # Use a search URL directly so yt-dlp resolves the best match
-    search_url = f"ytsearch1:{query}"
-    result = youtube_download(search_url, audio_only=True)
+def do_music(cid: int, query: str):
+    bump(cid, "downloads")
+    send_message(cid, f"⏳ در حال جستجو و دانلود MP3: _{query}_…", parse_mode="Markdown")
+    chat_action(cid, "record_voice")
+    result = youtube_download(f"ytsearch1:{query}", audio_only=True)
     if not result:
-        send_message(chat_id,
-                     "❌ خطا در دانلود موسیقی.\n"
-                     "• نام آهنگ را به انگلیسی امتحان کنید\n"
-                     "• یا مستقیم لینک یوتیوب بدهید",
-                     parse_mode="Markdown",
-                     reply_markup=main_menu_keyboard())
+        send_message(cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb())
         return
     data, fname = result
     fname = Path(fname).name
     if len(data) > MAX_FILE_SIZE:
-        send_message(chat_id, "❌ حجم فایل صوتی زیاد است.", reply_markup=main_menu_keyboard())
+        send_message(cid, "❌ حجم فایل زیاد است.", reply_markup=home_kb())
         return
     if not fname.lower().endswith(".mp3"):
         fname = re.sub(r"\.[^.]+$", ".mp3", fname)
-    send_audio_bytes(chat_id, data, fname, caption=f"🎵 {query}")
-    user_state[chat_id] = {"mode": None}
-    send_message(chat_id, "✅ موسیقی ارسال شد.", reply_markup=main_menu_keyboard())
-
-
-def do_pinterest(chat_id: int, query: str):
-    bump(chat_id, "searches")
-    send_chat_action(chat_id, "upload_photo")
-    send_message(chat_id, f"⏳ در حال جستجو در پینترست: _{query}_…", parse_mode="Markdown")
-    results = pinterest_search(query)
-    if not results:
-        send_message(chat_id, "❌ تصویری یافت نشد.", reply_markup=main_menu_keyboard())
-        return
-    sent = 0
-    for r in results[:6]:
-        try:
-            img_bytes = download_file(r["url"], MAX_IMAGE_SIZE)
-            if img_bytes and len(img_bytes) > 1000:
-                send_photo_bytes(chat_id, img_bytes, caption=f"📌 {r.get('title', query)[:80]}")
-                sent += 1
-                time.sleep(0.4)
-        except Exception:
-            pass
-    msg = f"✅ {sent} تصویر از پینترست ارسال شد." if sent else "❌ تصویری دانلود نشد."
-    user_state[chat_id] = {"mode": None}
-    send_message(chat_id, msg, reply_markup=main_menu_keyboard())
-
-
-def do_google_images(chat_id: int, query: str):
-    bump(chat_id, "searches")
-    send_chat_action(chat_id, "upload_photo")
-    send_message(chat_id, f"⏳ در حال جستجوی تصاویر گوگل: _{query}_…", parse_mode="Markdown")
-    results = google_images_search(query, 8)
-    if not results:
-        send_message(chat_id, "❌ تصویری یافت نشد.", reply_markup=main_menu_keyboard())
-        return
-    sent = 0
-    for r in results[:6]:
-        try:
-            img_bytes = download_file(r["img"], MAX_IMAGE_SIZE)
-            if img_bytes and len(img_bytes) > 1000:
-                send_photo_bytes(chat_id, img_bytes, caption=f"🖼 {query}")
-                sent += 1
-                time.sleep(0.4)
-        except Exception:
-            pass
-    msg = f"✅ {sent} تصویر از گوگل ارسال شد." if sent else "❌ تصویری دانلود نشد."
-    user_state[chat_id] = {"mode": None}
-    send_message(chat_id, msg, reply_markup=main_menu_keyboard())
-
-
-def do_pexels(chat_id: int, query: str):
-    bump(chat_id, "searches")
-    send_chat_action(chat_id, "upload_photo")
-    send_message(chat_id, f"⏳ در حال جستجوی عکس رایگان: _{query}_…", parse_mode="Markdown")
-    results = pexels_search(query, 8)
-    if not results:
-        send_message(chat_id, "❌ عکسی یافت نشد.", reply_markup=main_menu_keyboard())
-        return
-    sent = 0
-    for r in results[:5]:
-        try:
-            img_bytes = r.get("_bytes") or download_file(r["url"], MAX_IMAGE_SIZE)
-            if img_bytes and len(img_bytes) > 1000:
-                send_photo_bytes(chat_id, img_bytes, caption=f"📷 {r.get('title', query)[:60]}")
-                sent += 1
-                time.sleep(0.4)
-        except Exception as e:
-            log.error("do_pexels send: %s", e)
-    msg = f"✅ {sent} عکس ارسال شد." if sent else "❌ عکسی دانلود نشد."
-    user_state[chat_id] = {"mode": None}
-    send_message(chat_id, msg, reply_markup=main_menu_keyboard())
-
-
-def do_wiki_search(chat_id: int, query: str):
-    bump(chat_id, "searches")
-    send_chat_action(chat_id, "typing")
-    # Try Persian first, then English
-    results = wikipedia_search(query, "fa")
-    lang_used = "fa"
-    if not results:
-        results = wikipedia_search(query, "en")
-        lang_used = "en"
-    if not results:
-        send_message(chat_id, "❌ مقاله‌ای در ویکی‌پدیا یافت نشد.", reply_markup=main_menu_keyboard())
-        return
-    lines = [f"📖 *نتایج ویکی‌پدیا:* _{query}_\n"]
-    for i, r in enumerate(results, 1):
-        snippet = r.get("snippet", "")[:100]
-        lines.append(f"{i}. [{r['title']}]({r['url']})")
-        if snippet:
-            lines.append(f"   _{snippet}…_")
-    lines.append(f"\n💡 برای خواندن کامل مقاله، عنوان آن را بنویسید.")
-    # Save state so next message reads the article
-    user_state[chat_id] = {"mode": "wiki_article", "wiki_lang": lang_used,
-                            "last_query": query}
-    send_message(chat_id, "\n".join(lines)[:4000], parse_mode="Markdown",
-                 reply_markup=cancel_keyboard())
-
-
-def do_wiki_article(chat_id: int, title: str, lang: str = "fa"):
-    bump(chat_id, "searches")
-    send_chat_action(chat_id, "typing")
-    send_message(chat_id, f"⏳ در حال دریافت مقاله: _{title}_…", parse_mode="Markdown")
-    text = wikipedia_article(title, lang)
-    if not lang == "fa" or not text:
-        text2 = wikipedia_article(title, "en")
-        text = text or text2
-    if not text:
-        send_message(chat_id, "❌ مقاله یافت نشد.", reply_markup=main_menu_keyboard())
-        return
-    # Send first 3500 chars as message, rest as text file
-    preview = text[:3500]
-    send_message(chat_id, f"📖 *{title}*\n\n{preview}", parse_mode="Markdown")
-    if len(text) > 3500:
-        send_document(chat_id, text.encode("utf-8"), f"{title[:40]}.txt",
-                      caption="📄 متن کامل مقاله")
-    user_state[chat_id] = {"mode": None}
-    send_message(chat_id, "✅ مقاله دریافت شد.", reply_markup=main_menu_keyboard())
-
-
-def do_currency(chat_id: int, text: str):
-    bump(chat_id, "requests")
-    # Parse: "100 USD to IRR"  or  "100 USD IRR"
-    m = re.match(
-        r"([\d,\.]+)\s+([A-Za-z]{3})\s+(?:to\s+)?([A-Za-z]{3})",
-        text.strip(), re.IGNORECASE,
-    )
-    if not m:
-        send_message(chat_id,
-                     "❌ فرمت اشتباه.\n"
-                     "مثال صحیح: `100 USD to IRR` یا `50 EUR USD`",
-                     parse_mode="Markdown",
-                     reply_markup=main_menu_keyboard())
-        return
-    amount_str, from_cur, to_cur = m.groups()
-    amount = float(amount_str.replace(",", ""))
-    send_chat_action(chat_id, "typing")
-    result = currency_convert(amount, from_cur, to_cur)
-    if result:
-        send_message(chat_id, f"💱 *{result}*", parse_mode="Markdown",
-                     reply_markup=main_menu_keyboard())
+    if send_audio(cid, data, fname, caption=f"🎵 {query}"):
+        send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
     else:
-        send_message(chat_id, "❌ خطا در تبدیل ارز. کدهای ارزی را بررسی کنید.",
-                     reply_markup=main_menu_keyboard())
-    user_state[chat_id] = {"mode": None}
+        send_message(cid, "❌ ارسال ناموفق.", reply_markup=home_kb())
+    clear_state(cid)
 
+def do_images(cid: int, query: str, source: str, page=0):
+    bump(cid, "searches")
+    chat_action(cid, "upload_photo")
+    source_names = {"bing":"🖼 Bing","pinterest":"📌 پینترست",
+                    "pexels":"📷 Pixabay","wiki":"🎨 Wikimedia"}
+    send_message(cid, f"⏳ جستجوی عکس [{source_names.get(source,source)}]: _{query}_…",
+                 parse_mode="Markdown")
+    offset = page * 6
+    fn_map = {"bing": images_bing, "pinterest": images_pinterest,
+              "pexels": images_pexels, "wiki": images_wikimedia}
+    fn = fn_map.get(source, images_bing)
+    results = fn(query, max_results=offset+8)
+    page_results = results[offset:offset+6]
+    key = make_cache_key(f"img_{source}", query, page)
+    cache_set(key, results)
+    set_state(cid, mode=f"img_{source}", last_query=query, page=page,
+              img_source=source, cache_key=key)
+    if not page_results:
+        send_message(cid, "❌ تصویری یافت نشد.", reply_markup=home_kb())
+        return
+    sent = 0
+    for r in page_results[:6]:
+        try:
+            img_bytes = r.get("_bytes") or download_bytes(r["url"], MAX_IMAGE_SIZE)
+            if img_bytes and len(img_bytes) > 1000:
+                if send_photo(cid, img_bytes, caption=r.get("title","")[:80]):
+                    sent += 1
+            time.sleep(0.3)
+        except Exception as ex:
+            log.error("do_images send: %s", ex)
+    kb = images_more_kb(key, page, source)
+    send_message(cid, f"✅ {sent} عکس ارسال شد.", reply_markup=kb)
 
-def do_ip_lookup(chat_id: int, target: str):
-    bump(chat_id, "requests")
-    send_chat_action(chat_id, "typing")
+def do_github_search(cid: int, query: str, page=0):
+    bump(cid, "searches")
+    chat_action(cid)
+    results = github_search_repos(query, page)
+    key = make_cache_key("gh", query, page)
+    cache_set(key, results)
+    set_state(cid, mode="gh_search", last_query=query, page=page, cache_key=key)
+    if not results:
+        send_message(cid, "❌ مخزنی یافت نشد.", reply_markup=home_kb())
+        return
+    text = f"🐙 *GitHub:* _{query}_  (صفحه {page+1})\nروی مخزن کلیک کنید:"
+    kb = gh_repo_kb(results, key, page, len(results)==8)
+    send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
+
+def do_github_zip(cid: int, url: str):
+    bump(cid, "downloads")
+    send_message(cid, "⏳ در حال دانلود ZIP مخزن…")
+    data = github_zip(url)
+    if not data:
+        send_message(cid, "❌ دانلود ناموفق.", reply_markup=home_kb())
+        return
+    m = re.search(r"github\.com/([^/]+/[^/]+?)(?:\.git|/|$)", url)
+    slug = m.group(1).replace("/","_") if m else "repo"
+    if send_document(cid, data, f"{slug}.zip", caption=f"📥 {url[:60]}"):
+        send_message(cid, "✅ ZIP ارسال شد.", reply_markup=home_kb())
+    else:
+        send_message(cid, "❌ ارسال ناموفق.", reply_markup=home_kb())
+    clear_state(cid)
+
+def do_github_release(cid: int, repo_full: str):
+    bump(cid, "downloads")
+    chat_action(cid)
+    rel = github_latest_release(repo_full)
+    if not rel:
+        send_message(cid, "❌ هیچ Release‌ای یافت نشد.", reply_markup=home_kb())
+        return
+    tag = rel.get("tag_name","")
+    body = rel.get("body","")[:500]
+    assets = rel.get("assets",[])
+    lines = [f"📦 *آخرین Release: {repo_full}*",
+             f"🏷 نسخه: `{tag}`",
+             f"📅 تاریخ: {rel.get('published_at','')[:10]}",
+             f"\n{body}" if body else ""]
+    if assets:
+        lines.append("\n*فایل‌های قابل دانلود:*")
+        for i, a in enumerate(assets[:8]):
+            size_mb = a.get("size",0)//1024//1024
+            lines.append(f"{i+1}. {a['name']} ({size_mb}MB)")
+    # Build asset download buttons
+    rows = []
+    for i, a in enumerate(assets[:6]):
+        safe_repo = repo_full.replace("/","__")
+        rows.append([{"text": f"⬇️ {a['name'][:40]}",
+                       "callback_data": f"ghrel_dl_{safe_repo}_{i}"}])
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+    # cache assets
+    akey = f"ghrel_{repo_full.replace('/','__')}"
+    cache_set(akey, assets)
+    send_message(cid, "\n".join(lines), parse_mode="Markdown",
+                 reply_markup={"inline_keyboard": rows})
+
+def do_ocr_photo(cid: int, photos: list, reply_id=None):
+    bump(cid, "ocr")
+    chat_action(cid)
+    photo = sorted(photos, key=lambda p: p.get("file_size",0))[-1]
+    if photo.get("file_size",0) > MAX_OCR_SIZE:
+        send_message(cid, "❌ حجم عکس بیشتر از ۵MB است.")
+        return
+    url = get_file_url(photo["file_id"])
+    if not url:
+        send_message(cid, "❌ خطا در دریافت فایل."); return
+    data = download_bytes(url, MAX_OCR_SIZE)
+    if not data:
+        send_message(cid, "❌ خطا در دانلود عکس."); return
+    send_message(cid, "⏳ در حال پردازش تصویر…")
+    extracted = ocr_image(data)
+    send_message(cid, f"📝 *متن استخراج شده:*\n\n{extracted[:3500]}",
+                 parse_mode="Markdown", reply_to_message_id=reply_id)
+    try:
+        pdf = ocr_to_pdf(extracted)
+        send_document(cid, pdf, "ocr_result.pdf", caption="📑 متن OCR به‌صورت PDF")
+    except Exception as e:
+        log.error("ocr_to_pdf: %s", e)
+    clear_state(cid)
+    send_message(cid, "✅ OCR انجام شد.", reply_markup=home_kb())
+
+def do_translate(cid: int, text: str, lang: str):
+    bump(cid, "translations")
+    chat_action(cid)
+    result = translate_text(text, lang)
+    send_message(cid, f"🌐 *ترجمه:*\n\n{result}",
+                 parse_mode="Markdown", reply_markup=home_kb())
+    clear_state(cid)
+
+def do_currency(cid: int, text: str):
+    m = re.match(r"([\d,\.]+)\s+([A-Za-z]{3})\s+(?:to\s+)?([A-Za-z]{3})",
+                 text.strip(), re.IGNORECASE)
+    if not m:
+        send_message(cid, "❌ فرمت اشتباه. مثال: `100 USD to IRR`",
+                     parse_mode="Markdown", reply_markup=home_kb())
+        return
+    amount, frm, to = m.groups()
+    amount = float(amount.replace(",",""))
+    result = currency_convert(amount, frm, to)
+    send_message(cid, f"💱 *{result}*" if result else "❌ خطا در تبدیل.",
+                 parse_mode="Markdown", reply_markup=home_kb())
+    clear_state(cid)
+
+def do_ip_lookup(cid: int, target: str):
+    chat_action(cid)
     result = ip_lookup(target.strip())
-    send_message(chat_id, result, parse_mode="Markdown", reply_markup=main_menu_keyboard())
-    user_state[chat_id] = {"mode": None}
+    send_message(cid, result, parse_mode="Markdown", reply_markup=home_kb())
+    clear_state(cid)
 
-
-def do_shorten(chat_id: int, url: str):
-    bump(chat_id, "requests")
-    if not url.startswith("http"):
-        url = "https://" + url
-    send_chat_action(chat_id, "typing")
+def do_shorten(cid: int, url: str):
+    if not url.startswith("http"): url = "https://"+url
     result = shorten_url(url)
-    send_message(chat_id, f"🔗 لینک کوتاه شده:\n{result}", reply_markup=main_menu_keyboard())
-    user_state[chat_id] = {"mode": None}
+    send_message(cid, f"🔗 {result}", reply_markup=home_kb())
+    clear_state(cid)
 
-
-def do_expand(chat_id: int, url: str):
-    bump(chat_id, "requests")
-    if not url.startswith("http"):
-        url = "https://" + url
-    send_chat_action(chat_id, "typing")
+def do_expand(cid: int, url: str):
+    if not url.startswith("http"): url = "https://"+url
     result = expand_url(url)
-    send_message(chat_id, result, parse_mode="Markdown", reply_markup=main_menu_keyboard())
-    user_state[chat_id] = {"mode": None}
+    send_message(cid, result, parse_mode="Markdown", reply_markup=home_kb())
+    clear_state(cid)
 
-
-def do_paste(chat_id: int, text: str):
-    bump(chat_id, "requests")
-    send_chat_action(chat_id, "typing")
+def do_paste(cid: int, text: str):
     url = paste_text(text)
     if url:
-        send_message(chat_id,
-                     f"📋 متن آپلود شد:\n{url}\n\n_(لینک عمومی — هر کسی می‌تواند ببیند)_",
-                     parse_mode="Markdown",
-                     reply_markup=main_menu_keyboard())
+        send_message(cid, f"📋 آپلود شد:\n{url}", reply_markup=home_kb())
     else:
-        send_message(chat_id, "❌ خطا در آپلود متن.", reply_markup=main_menu_keyboard())
-    user_state[chat_id] = {"mode": None}
+        send_message(cid, "❌ خطا در آپلود.", reply_markup=home_kb())
+    clear_state(cid)
 
-
-def do_qr(chat_id: int, text: str):
-    bump(chat_id, "requests")
-    send_chat_action(chat_id, "upload_photo")
-    qr_bytes = generate_qr(text)
-    if qr_bytes:
-        send_photo_bytes(chat_id, qr_bytes, caption=f"📱 QR کد برای:\n{text[:60]}")
+def do_qr(cid: int, text: str):
+    chat_action(cid, "upload_photo")
+    qr = generate_qr(text)
+    if qr:
+        send_photo(cid, qr, caption=f"📱 QR: {text[:60]}")
     else:
-        send_message(chat_id, "❌ خطا در ساخت QR کد.", reply_markup=main_menu_keyboard())
-    user_state[chat_id] = {"mode": None}
-    send_message(chat_id, "✅", reply_markup=main_menu_keyboard())
+        send_message(cid, "❌ خطا در ساخت QR.")
+    send_message(cid, "✅", reply_markup=home_kb())
+    clear_state(cid)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# MESSAGE HANDLER
+# ═══════════════════════════════════════════════════════════════════════════════
+def handle_message(msg: dict):
+    cid    = msg["chat"]["id"]
+    text   = msg.get("text","")
+    photos = msg.get("photo")
+    init_user(cid)
+    log.info("MSG cid=%d text=%r has_photo=%s", cid, text[:60], bool(photos))
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Polling loop
-# ══════════════════════════════════════════════════════════════════════════════
+    # Commands
+    if text.startswith("/start"):
+        clear_state(cid)
+        send_message(cid,
+            "👋 سلام! به *دستیار وب* خوش آمدید.\n"
+            "یکی از گزینه‌های زیر را انتخاب کنید:",
+            parse_mode="Markdown", reply_markup=main_menu_kb())
+        return
+    if text.startswith("/help"):
+        send_message(cid, HELP_TEXT, parse_mode="Markdown"); return
+    if text.startswith("/cancel"):
+        clear_state(cid)
+        send_message(cid, "✅ لغو شد.", reply_markup=main_menu_kb()); return
+    if text.startswith("/ocr"):
+        reply = msg.get("reply_to_message")
+        if reply and reply.get("photo"):
+            do_ocr_photo(cid, reply["photo"], msg["message_id"]); return
+        set_state(cid, mode="ocr")
+        send_message(cid, "🖼 عکس حاوی متن ارسال کنید:", reply_markup=cancel_kb()); return
+
+    # Photo
+    if photos:
+        st = get_state(cid)
+        if st.get("mode") == "ocr" or not st.get("mode"):
+            do_ocr_photo(cid, photos, msg["message_id"]); return
+
+    if not text: return
+
+    st   = get_state(cid)
+    mode = st.get("mode")
+
+    dispatch = {
+        "search":       lambda: do_search(cid, text),
+        "scholar":      lambda: do_scholar(cid, text),
+        "wiki":         lambda: do_wiki_search(cid, text),
+        "wiki_article": lambda: do_wiki_article(cid, text, st.get("wiki_lang","fa")),
+        "open":         lambda: do_open_url(cid, text),
+        "yt_dl":        lambda: do_youtube_dl(cid, text),
+        "yt_search":    lambda: do_youtube_search_cmd(cid, text),
+        "music":        lambda: do_music(cid, text),
+        "gh_search":    lambda: do_github_search(cid, text),
+        "gh_zip":       lambda: do_github_zip(cid, text),
+        "gh_release":   lambda: do_github_release(cid, text),
+        "translate":    lambda: do_translate(cid, text, st.get("target_lang","en")),
+        "currency":     lambda: do_currency(cid, text),
+        "iplookup":     lambda: do_ip_lookup(cid, text),
+        "shorten":      lambda: do_shorten(cid, text),
+        "expand":       lambda: do_expand(cid, text),
+        "paste":        lambda: do_paste(cid, text),
+        "qr":           lambda: do_qr(cid, text),
+        "ocr":          lambda: send_message(cid,"🖼 لطفاً عکس ارسال کنید.",reply_markup=cancel_kb()),
+        "images_pick":  lambda: do_images(cid, st.get("last_query", text),
+                                          st.get("img_source","bing")),
+    }
+    if mode in dispatch:
+        dispatch[mode]()
+    elif text.startswith("http"):
+        do_open_url(cid, text)
+    else:
+        do_search(cid, text)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CALLBACK HANDLER
+# ═══════════════════════════════════════════════════════════════════════════════
+def handle_callback(cb: dict):
+    cid  = cb["message"]["chat"]["id"]
+    data = cb.get("data","")
+    answer_cb(cb["id"])
+    init_user(cid)
+    log.info("CB cid=%d data=%r", cid, data)
+
+    st = get_state(cid)
+
+    # ── Home / Cancel ─────────────────────────────────────────────────────
+    if data in ("home","cancel"):
+        clear_state(cid)
+        send_message(cid, "🏠 منوی اصلی:", reply_markup=main_menu_kb()); return
+
+    if data == "help":
+        send_message(cid, HELP_TEXT, parse_mode="Markdown"); return
+
+    if data == "privacy":
+        send_message(cid, PRIVACY_TEXT, parse_mode="Markdown",
+                     reply_markup=home_kb()); return
+
+    if data == "stats":
+        s = user_stats.get(cid,{})
+        txt = (f"📊 *آمار کاربری*\n\n"
+               f"🗓 عضویت: {s.get('joined','—')}\n"
+               f"📈 مجموع: {s.get('requests',0)}\n"
+               f"🔎 جستجو: {s.get('searches',0)}\n"
+               f"📥 دانلود: {s.get('downloads',0)}\n"
+               f"🌐 ترجمه: {s.get('translations',0)}\n"
+               f"🖼 OCR: {s.get('ocr',0)}")
+        send_message(cid, txt, parse_mode="Markdown", reply_markup=home_kb()); return
+
+    # ── Mode launchers ────────────────────────────────────────────────────
+    mode_prompts = {
+        "mode_search":    ("search",    "🔎 کلمه یا عبارت جستجو را بنویسید:"),
+        "mode_open":      ("open",      "🌐 آدرس سایت را وارد کنید (https://…):"),
+        "mode_scholar":   ("scholar",   "📚 عنوان یا کلمه‌کلیدی مقاله:"),
+        "mode_wiki":      ("wiki",      "📖 موضوع ویکی‌پدیا:"),
+        "mode_music":     ("music",     "🎵 نام آهنگ یا آرتیست:"),
+        "mode_currency":  ("currency",  "💱 مثال: 100 USD to IRR"),
+        "mode_iplookup":  ("iplookup",  "🌐 آدرس IP یا دامنه:"),
+        "mode_shorten":   ("shorten",   "🔗 لینک بلند:"),
+        "mode_expand":    ("expand",    "🔍 لینک کوتاه:"),
+        "mode_paste":     ("paste",     "📋 متن مورد نظر را ارسال کنید:"),
+        "mode_qr":        ("qr",        "📱 متن یا لینک برای QR کد:"),
+    }
+    if data in mode_prompts:
+        mode, prompt = mode_prompts[data]
+        set_state(cid, mode=mode)
+        send_message(cid, prompt, reply_markup=cancel_kb()); return
+
+    if data == "mode_translate":
+        set_state(cid, mode="translate_lang")
+        send_message(cid, "🌐 زبان مقصد را انتخاب کنید:", reply_markup=translate_kb()); return
+
+    if data.startswith("trlang_"):
+        lang = data.split("_",1)[1]
+        set_state(cid, mode="translate", target_lang=lang)
+        send_message(cid, f"✅ زبان انتخاب شد. متن را بفرستید:", reply_markup=cancel_kb()); return
+
+    if data == "mode_ocr":
+        set_state(cid, mode="ocr")
+        send_message(cid, "🖼 عکس حاوی متن ارسال کنید:", reply_markup=cancel_kb()); return
+
+    # ── YouTube ───────────────────────────────────────────────────────────
+    if data == "mode_youtube":
+        send_message(cid, "📺 یوتیوب:", reply_markup=youtube_action_kb()); return
+    if data == "yt_video":
+        set_state(cid, mode="yt_dl")
+        send_message(cid, "📥 لینک ویدیو یوتیوب:", reply_markup=cancel_kb()); return
+    if data == "yt_search":
+        set_state(cid, mode="yt_search")
+        send_message(cid, "🔍 کلمه جستجو:", reply_markup=cancel_kb()); return
+
+    # YouTube result click → download
+    m = re.match(r"yt_res_(\w+)_(\d+)$", data)
+    if m:
+        key, idx = m.group(1), int(m.group(2))
+        results = cache_get(key)
+        if not results or idx >= len(results):
+            send_message(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید."); return
+        vid = results[idx]
+        send_message(cid, f"⏳ دانلود: _{vid['title']}_…", parse_mode="Markdown")
+        chat_action(cid, "upload_video")
+        result = youtube_download(vid["url"], audio_only=False)
+        _finish_video(cid, result); return
+
+    m = re.match(r"yt_page_(\d+)$", data)
+    if m:
+        page = int(m.group(1))
+        query = st.get("last_query","")
+        if query: do_youtube_search_cmd(cid, query, page)
+        return
+
+    # ── GitHub ────────────────────────────────────────────────────────────
+    if data == "mode_github":
+        send_message(cid, "🐙 GitHub:", reply_markup=github_action_kb()); return
+    if data == "gh_search":
+        set_state(cid, mode="gh_search")
+        send_message(cid, "🔍 نام مخزن یا کلمه کلیدی:", reply_markup=cancel_kb()); return
+    if data == "gh_zip":
+        set_state(cid, mode="gh_zip")
+        send_message(cid, "📥 لینک مخزن GitHub:", reply_markup=cancel_kb()); return
+    if data == "gh_release":
+        set_state(cid, mode="gh_release")
+        send_message(cid, "📦 نام کامل مخزن (مثال: microsoft/vscode):",
+                     reply_markup=cancel_kb()); return
+
+    # GitHub repo result click
+    m = re.match(r"gh_res_(\w+)_(\d+)$", data)
+    if m:
+        key, idx = m.group(1), int(m.group(2))
+        results = cache_get(key)
+        if not results or idx >= len(results):
+            send_message(cid, "❌ نتیجه منقضی شده."); return
+        repo = results[idx]
+        full = repo.get("full_name","")
+        desc = repo.get("description") or ""
+        txt = (f"🐙 *{full}*\n"
+               f"⭐ {repo.get('stargazers_count',0)} | "
+               f"🍴 {repo.get('forks_count',0)} | "
+               f"📝 {repo.get('language','—')}\n\n"
+               f"{desc[:300]}\n\n"
+               f"🔗 {repo.get('html_url','')}")
+        send_message(cid, txt, parse_mode="Markdown",
+                     reply_markup=gh_repo_action_kb(full)); return
+
+    m = re.match(r"gh_page_(\d+)$", data)
+    if m:
+        page = int(m.group(1))
+        query = st.get("last_query","")
+        if query: do_github_search(cid, query, page)
+        return
+
+    # GitHub repo actions
+    m = re.match(r"ghact_zip_(.+)$", data)
+    if m:
+        repo = m.group(1).replace("__","/")
+        do_github_zip(cid, f"https://github.com/{repo}"); return
+
+    m = re.match(r"ghact_rel_(.+)$", data)
+    if m:
+        repo = m.group(1).replace("__","/")
+        do_github_release(cid, repo); return
+
+    m = re.match(r"ghact_info_(.+)$", data)
+    if m:
+        repo = m.group(1).replace("__","/")
+        info = github_repo_info(repo)
+        if info:
+            txt = (f"📋 *{repo}*\n"
+                   f"⭐ Stars: {info.get('stargazers_count',0)}\n"
+                   f"🍴 Forks: {info.get('forks_count',0)}\n"
+                   f"👀 Watchers: {info.get('watchers_count',0)}\n"
+                   f"📝 Language: {info.get('language','—')}\n"
+                   f"📅 Created: {info.get('created_at','')[:10]}\n"
+                   f"🔄 Updated: {info.get('updated_at','')[:10]}\n"
+                   f"📄 License: {(info.get('license') or {}).get('name','—')}\n"
+                   f"🌐 {info.get('homepage') or info.get('html_url','')}")
+            send_message(cid, txt, parse_mode="Markdown", reply_markup=home_kb())
+        else:
+            send_message(cid, "❌ اطلاعاتی یافت نشد.", reply_markup=home_kb())
+        return
+
+    # GitHub release asset download
+    m = re.match(r"ghrel_dl_(.+)_(\d+)$", data)
+    if m:
+        repo = m.group(1).replace("__","/")
+        idx  = int(m.group(2))
+        akey = f"ghrel_{m.group(1)}"
+        assets = cache_get(akey)
+        if not assets or idx >= len(assets):
+            send_message(cid, "❌ نتیجه منقضی."); return
+        asset = assets[idx]
+        url = asset.get("browser_download_url","")
+        size_mb = asset.get("size",0)//1024//1024
+        if size_mb > 50:
+            send_message(cid, f"❌ حجم فایل ({size_mb}MB) بیش از ۵۰MB است.",
+                         reply_markup=home_kb()); return
+        send_message(cid, f"⏳ دانلود: {asset['name']} ({size_mb}MB)…")
+        chat_action(cid, "upload_document")
+        d = download_bytes(url, MAX_FILE_SIZE)
+        if d and send_document(cid, d, asset["name"], caption=f"📦 {repo}"):
+            send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
+        else:
+            send_message(cid, "❌ دانلود ناموفق.", reply_markup=home_kb())
+        return
+
+    # ── Images ────────────────────────────────────────────────────────────
+    if data == "mode_images":
+        set_state(cid, mode="images_query")
+        send_message(cid, "🖼 کلمه کلیدی عکس مورد نظر را بنویسید:",
+                     reply_markup=cancel_kb()); return
+
+    img_src_map = {"img_src_bing":"bing","img_src_pinterest":"pinterest",
+                   "img_src_pexels":"pexels","img_src_wiki":"wiki"}
+    if data in img_src_map:
+        src = img_src_map[data]
+        query = st.get("last_query","")
+        if not query:
+            send_message(cid, "❌ ابتدا کلمه کلیدی وارد کنید.", reply_markup=cancel_kb()); return
+        set_state(cid, mode=f"img_{src}", last_query=query, img_source=src, page=0)
+        do_images(cid, query, src, 0); return
+
+    # "دانلود بیشتر" button
+    m = re.match(r"img_more_(\w+)_(\w+)_(\d+)$", data)
+    if m:
+        source, key, page = m.group(1), m.group(2), int(m.group(3))
+        query = st.get("last_query","")
+        do_images(cid, query, source, page); return
+
+    # ── Site view buttons ─────────────────────────────────────────────────
+    m = re.match(r"site_(text|html|zip|pdf)_(\w+)$", data)
+    if m:
+        action, url_key = m.group(1), m.group(2)
+        url = get_url(url_key)
+        if not url:
+            send_message(cid, "❌ لینک منقضی شده.", reply_markup=home_kb()); return
+        chat_action(cid, "upload_document")
+        if action == "text":
+            txt = page_to_text(url)
+            send_message(cid, f"📝 متن صفحه:\n\n{txt[:3500]}", reply_markup=home_kb())
+            if len(txt) > 3500:
+                send_document(cid, txt.encode("utf-8"), "page_text.txt")
+        elif action == "html":
+            html = fetch_page(url)
+            if html: send_document(cid, html, "page.html", caption=f"🌐 {url[:60]}")
+            else: send_message(cid, "❌ خطا در دریافت HTML.", reply_markup=home_kb())
+        elif action == "zip":
+            send_message(cid, "⏳ در حال ساخت ZIP…")
+            zdata = page_to_zip(url)
+            if zdata:
+                domain = urllib.parse.urlparse(url).netloc.replace(".","_")
+                send_document(cid, zdata, f"{domain}_offline.zip")
+            else: send_message(cid, "❌ خطا در ZIP.", reply_markup=home_kb())
+        elif action == "pdf":
+            send_message(cid, "⏳ در حال تولید PDF…")
+            pdf = page_to_pdf(url)
+            if pdf:
+                ext = "pdf" if pdf[:4]==b"%PDF" else "html"
+                send_document(cid, pdf, f"page.{ext}", caption=f"📑 {url[:60]}")
+            else: send_message(cid, "❌ خطا در PDF.", reply_markup=home_kb())
+        send_message(cid, "✅", reply_markup=site_view_kb(url_key)); return
+
+    # ── Search result click (web, scholar) ────────────────────────────────
+    m = re.match(r"res_(\w+)_(\d+)$", data)
+    if m:
+        key, idx = m.group(1), int(m.group(2))
+        results = cache_get(key)
+        if not results or idx >= len(results):
+            send_message(cid, "❌ نتیجه منقضی."); return
+        r = results[idx]
+        # Show detail with options
+        link = r.get("link") or r.get("url","")
+        snippet = r.get("snippet") or r.get("meta","")
+        txt = (f"🔗 *{r.get('title','')}*\n\n"
+               f"{snippet[:400]}\n\n"
+               f"[باز کردن لینک]({link})")
+        url_key = store_url(link)
+        kb = {"inline_keyboard": [
+            [{"text": "🌐 مشاهده سایت",  "callback_data": f"site_ss_{url_key}"},
+             {"text": "📝 متن صفحه",     "callback_data": f"site_text_{url_key}"}],
+            [{"text": "🌐 HTML",          "callback_data": f"site_html_{url_key}"},
+             {"text": "🔙 برگشت به نتایج","callback_data": "results_back"}],
+        ]}
+        send_message(cid, txt, parse_mode="Markdown", reply_markup=kb); return
+
+    m = re.match(r"site_ss_(\w+)$", data)
+    if m:
+        url_key = m.group(1)
+        url = get_url(url_key)
+        if not url: send_message(cid, "❌ لینک منقضی."); return
+        send_message(cid, f"⏳ گرفتن اسکرین‌شات…")
+        ss = screenshot_page(url)
+        if ss: send_photo(cid, ss, caption=url[:60], reply_markup=site_view_kb(url_key))
+        else: send_message(cid, "❌ اسکرین‌شات ممکن نبود.", reply_markup=site_view_kb(url_key))
+        return
+
+    if data == "results_back":
+        query = st.get("last_query","")
+        page  = st.get("page", 0)
+        mode  = st.get("mode","")
+        if "scholar" in mode: do_scholar(cid, query, page)
+        elif query: do_search(cid, query, page)
+        else: send_message(cid, "🏠", reply_markup=main_menu_kb())
+        return
+
+    # ── Pagination (web search, scholar) ──────────────────────────────────
+    pm = re.match(r"page_(ws|sc)_(\d+)$", data)
+    if pm:
+        kind, page = pm.group(1), int(pm.group(2))
+        query = st.get("last_query","")
+        if not query: send_message(cid, "❌ جستجوی قبلی یافت نشد."); return
+        if kind == "ws": do_search(cid, query, page)
+        elif kind == "sc": do_scholar(cid, query, page)
+        return
+
+    # ── Wiki article click ────────────────────────────────────────────────
+    m = re.match(r"wiki_art_(\w+)_(\d+)_(\w+)$", data)
+    if m:
+        key, idx, lang = m.group(1), int(m.group(2)), m.group(3)
+        results = cache_get(key)
+        if not results or idx >= len(results):
+            send_message(cid, "❌ نتیجه منقضی."); return
+        article = results[idx]
+        do_wiki_article(cid, article["title"], lang); return
+
+    # ── Images query entry ────────────────────────────────────────────────
+    # (handled in handle_message when mode==images_query)
+    log.warning("Unhandled callback: %r", data)
+
+def handle_message_images_query(cid: int, text: str, st: dict):
+    """Called from handle_message when mode==images_query."""
+    set_state(cid, mode="images_source", last_query=text)
+    send_message(cid, f"🖼 منبع عکس برای _{text}_ را انتخاب کنید:",
+                 parse_mode="Markdown", reply_markup=image_source_kb())
+
+# Patch handle_message dispatch for images_query
+_orig_dispatch_key = "images_query"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN DISPATCH
+# ═══════════════════════════════════════════════════════════════════════════════
+def handle_update(update: dict):
+    if "message" in update:
+        msg = update["message"]
+        cid = msg["chat"]["id"]
+        text = msg.get("text","")
+        st = get_state(cid)
+        # Special case: images_query mode
+        if st.get("mode") == "images_query" and text and not text.startswith("/"):
+            init_user(cid)
+            handle_message_images_query(cid, text, st)
+        else:
+            handle_message(msg)
+    elif "callback_query" in update:
+        handle_callback(update["callback_query"])
 
 def run():
-    log.info("Bot starting (long polling)…")
+    log.info("Bot starting — token ends with …%s", TOKEN[-6:] if len(TOKEN)>6 else "???")
+    if TOKEN == "YOUR_BOT_TOKEN_HERE":
+        log.critical("BALE_TOKEN not set! Run: export BALE_TOKEN=your_token")
+        return
     offset = 0
     while True:
         try:
             resp = api("getUpdates", offset=offset, timeout=30)
             if not resp.get("ok"):
-                time.sleep(5)
-                continue
+                log.warning("getUpdates not ok: %s", resp)
+                time.sleep(5); continue
             for update in resp.get("result", []):
                 offset = update["update_id"] + 1
                 try:
                     handle_update(update)
                 except Exception as e:
-                    log.error("handle_update error: %s", e)
+                    log.error("handle_update: %s", e, exc_info=True)
         except KeyboardInterrupt:
-            log.info("Bot stopped.")
-            break
+            log.info("Bot stopped."); break
         except Exception as e:
-            log.error("Polling error: %s", e)
+            log.error("Polling error: %s", e, exc_info=True)
             time.sleep(5)
 
-
 if __name__ == "__main__":
-    if TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("⚠️  لطفاً BALE_TOKEN را تنظیم کنید:")
-        print("   export BALE_TOKEN='your_token_here'")
-        print("   python bale_bot.py")
-    else:
-        run()
+    run()
+ENDOFFILE
+echo "Written $(wc -l < /home/claude/bale_bot.py) lines"
