@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-دستیار وب — Bale Bot  (v6)
+دستیار وب — Bale Bot  (v7)
 Full-featured web assistant for Bale messenger.
 """
 
-import os, re, io, json, time, zipfile, logging, tempfile
+import os, re, io, json, time, zipfile, logging, tempfile, hashlib
 import requests, subprocess, urllib.parse, threading
 from datetime import datetime
 from pathlib import Path
@@ -20,16 +20,26 @@ import pytesseract
 # ═══════════════════════════════════════════════════════════════════════════════
 TOKEN          = os.getenv("BALE_TOKEN", "YOUR_BOT_TOKEN_HERE")
 BASE_URL       = f"https://tapi.bale.ai/bot{TOKEN}"
-MAX_FILE_SIZE  = 50 * 1024 * 1024
+MAX_FILE_SIZE  = 20 * 1024 * 1024
 MAX_IMAGE_SIZE = 10 * 1024 * 1024
 MAX_OCR_SIZE   =  5 * 1024 * 1024
-GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN", "")   # optional, raises rate limits
+GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN", "")
 
-# YouTube cookies file — export from browser for best download success rate.
-# How to get: install yt-dlp, run:
-#   yt-dlp --cookies-from-browser chrome --cookies /home/user/yt_cookies.txt  https://youtube.com
-# Then: export YOUTUBE_COOKIES_FILE=/home/user/yt_cookies.txt
+# YouTube: export cookies with:
+#   yt-dlp --cookies-from-browser chrome --cookies /path/yt_cookies.txt https://youtube.com
 YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "")
+
+# Telegram MTProto (for reading channels). Get from https://my.telegram.org
+TG_API_ID   = os.getenv("TG_API_ID", "")
+TG_API_HASH = os.getenv("TG_API_HASH", "")
+TG_SESSION  = os.getenv("TG_SESSION_FILE", "tg_session")  # session file path
+
+# Twitter: cookies file for yt-dlp (log into twitter.com in browser first)
+TWITTER_COOKIES_FILE = os.getenv("TWITTER_COOKIES_FILE", "")
+
+# Instagram: optional login credentials
+INSTAGRAM_USER = os.getenv("INSTAGRAM_USER", "")
+INSTAGRAM_PASS = os.getenv("INSTAGRAM_PASS", "")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -276,23 +286,17 @@ def get_file_url(file_id: str) -> Optional[str]:
     return None
 
 
-def download_bytes(url: str, max_bytes: int = 500 * 1024 * 1024) -> Optional[bytes]:
-    log.debug("download_bytes: %s  max=%.0fMB", url, max_bytes/1024/1024)
+def download_bytes(url: str, max_bytes=MAX_FILE_SIZE) -> Optional[bytes]:
+    log.debug("download_bytes: %s", url)
     try:
-        r = WEB.get(url, timeout=120, stream=True,
-                    headers={"User-Agent": UA_DESK})
-        log.debug("download_bytes: status=%d content-length=%s",
-                  r.status_code, r.headers.get("content-length", "?"))
+        r = WEB.get(url, timeout=30, stream=True)
         chunks, total = [], 0
-        for chunk in r.iter_content(65536):
-            chunks.append(chunk)
-            total += len(chunk)
+        for chunk in r.iter_content(8192):
+            chunks.append(chunk); total += len(chunk)
             if total > max_bytes:
-                log.warning("download_bytes: exceeded %.0fMB cap", max_bytes/1024/1024)
+                log.warning("download_bytes: exceeded %d bytes", max_bytes)
                 return None
-        result = b"".join(chunks)
-        log.info("download_bytes: got %.1fMB", len(result)/1024/1024)
-        return result
+        return b"".join(chunks)
     except Exception as e:
         log.error("download_bytes: %s — %s", url, e)
         return None
@@ -334,6 +338,10 @@ def main_menu_kb():
          {"text": "🎵 دانلود موسیقی MP3", "callback_data": "mode_music"}],
         [{"text": "🖼 دانلود عکس",        "callback_data": "mode_images"},
          {"text": "🐙 GitHub",            "callback_data": "mode_github"}],
+        [{"text": "✈️ کانال تلگرام",      "callback_data": "mode_tg_channel"},
+         {"text": "🐦 توییتر / X",        "callback_data": "mode_twitter"}],
+        [{"text": "📸 اینستاگرام",        "callback_data": "mode_instagram"},
+         {"text": "🎵 تیک‌تاک",           "callback_data": "mode_tiktok"}],
         [{"text": "🌐 ترجمه",             "callback_data": "mode_translate"},
          {"text": "🖼 OCR متن از عکس",   "callback_data": "mode_ocr"}],
         [{"text": "💱 تبدیل ارز",         "callback_data": "mode_currency"},
@@ -389,7 +397,58 @@ def github_action_kb():
         [{"text": "❌ انصراف",           "callback_data": "cancel"}],
     ]}
 
-def translate_kb():
+def tg_channel_kb():
+    return {"inline_keyboard": [
+        [{"text": "📖 خواندن پیام‌ها (عمومی)",  "callback_data": "tg_read_web"},
+         {"text": "🔐 خواندن با MTProto",        "callback_data": "tg_read_mtproto"}],
+        [{"text": "📥 دانلود رسانه پیام",        "callback_data": "tg_dl_media"}],
+        [{"text": "❌ انصراف",                    "callback_data": "cancel"}],
+    ]}
+
+def twitter_kb():
+    return {"inline_keyboard": [
+        [{"text": "📰 پیام‌های کاربر",   "callback_data": "tw_timeline"},
+         {"text": "📥 دانلود ویدیو/عکس","callback_data": "tw_dl"}],
+        [{"text": "❌ انصراف",            "callback_data": "cancel"}],
+    ]}
+
+def instagram_kb():
+    return {"inline_keyboard": [
+        [{"text": "📋 پست‌های پروفایل",  "callback_data": "ig_profile"},
+         {"text": "📥 دانلود پست/ریل",   "callback_data": "ig_dl"}],
+        [{"text": "❌ انصراف",            "callback_data": "cancel"}],
+    ]}
+
+def tiktok_kb():
+    return {"inline_keyboard": [
+        [{"text": "🎥 ویدیوهای کاربر",   "callback_data": "tt_user"},
+         {"text": "📥 دانلود ویدیو",     "callback_data": "tt_dl"}],
+        [{"text": "❌ انصراف",            "callback_data": "cancel"}],
+    ]}
+
+def social_results_kb(results: list, cache_key: str, platform: str) -> dict:
+    """Generic results keyboard for social media posts."""
+    rows = []
+    for i, r in enumerate(results[:10]):
+        text = r.get("text", r.get("title", ""))[:35] or f"پیام {i+1}"
+        icons = ("📷" if r.get("has_photo") else "") + ("🎬" if r.get("has_video") or r.get("is_video") else "")
+        label = f"{icons} {text}".strip()[:48]
+        rows.append([{"text": label, "callback_data": f"soc_{platform}_{cache_key}_{i}"}])
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+    return {"inline_keyboard": rows}
+
+def social_post_kb(url: str, platform: str, has_media: bool) -> dict:
+    """Buttons under a displayed post."""
+    url_key = hashlib.md5(url.encode()).hexdigest()[:10]
+    url_cache[url_key] = url
+    rows = []
+    if has_media:
+        rows.append([{"text": "📥 دانلود رسانه", "callback_data": f"soc_dl_{platform}_{url_key}"}])
+    rows.append([{"text": "🔗 باز کردن لینک",  "callback_data": f"site_ss_{url_key}"},
+                 {"text": "🏠 منوی اصلی",       "callback_data": "home"}])
+    return {"inline_keyboard": rows}
+
+
     langs = [("🇮🇷 فارسی","fa"),("🇬🇧 انگلیسی","en"),
              ("🇸🇦 عربی","ar"),("🇩🇪 آلمانی","de"),
              ("🇫🇷 فرانسوی","fr"),("🇷🇺 روسی","ru")]
@@ -556,13 +615,14 @@ def fetch_page(url: str) -> Optional[bytes]:
 
 def screenshot_page(url: str) -> Optional[bytes]:
     """
-    1080×1920 viewport screenshot using Playwright.
-    Single shot — not scrolled. Returns JPEG bytes.
+    Full-page scrolling screenshot using Playwright.
+    Takes viewport-height screenshots while scrolling, stitches them vertically.
+    Returns JPEG bytes.
     """
     log.info("screenshot_page: %s", url)
     try:
         from playwright.sync_api import sync_playwright
-        VW, VH = 1080, 1920
+        VW, VH = 1280, 900
         with sync_playwright() as p:
             browser = p.chromium.launch(args=[
                 "--no-sandbox", "--disable-setuid-sandbox",
@@ -570,13 +630,49 @@ def screenshot_page(url: str) -> Optional[bytes]:
             ])
             page = browser.new_page(viewport={"width": VW, "height": VH})
             page.goto(url, timeout=25000, wait_until="domcontentloaded")
-            time.sleep(2)
-            img = page.screenshot(type="jpeg", quality=82, clip={
-                "x": 0, "y": 0, "width": VW, "height": VH,
-            })
+            time.sleep(2)  # wait for JS
+
+            # Get full page height
+            full_h = page.evaluate("document.body.scrollHeight")
+            full_h = min(full_h, 12000)  # cap at ~12000px
+            log.debug("screenshot: page height=%dpx", full_h)
+
+            # Scroll and capture strips
+            strips: list[bytes] = []
+            y = 0
+            while y < full_h:
+                page.evaluate(f"window.scrollTo(0, {y})")
+                time.sleep(0.3)
+                strip = page.screenshot(type="jpeg", quality=75, clip={
+                    "x": 0, "y": 0, "width": VW, "height": VH,
+                })
+                strips.append(strip)
+                y += VH
+                if len(strips) >= 15:  # max 15 strips = ~13500px
+                    break
+
             browser.close()
-        log.info("screenshot_page: %dKB", len(img)//1024)
-        return img
+
+        if not strips:
+            return None
+
+        # Stitch strips vertically using Pillow
+        images = [Image.open(io.BytesIO(s)) for s in strips]
+        total_h = sum(im.height for im in images)
+        stitched = Image.new("RGB", (VW, total_h))
+        offset = 0
+        for im in images:
+            stitched.paste(im, (0, offset))
+            offset += im.height
+
+        # Encode final image
+        out = io.BytesIO()
+        stitched.save(out, format="JPEG", quality=75, optimize=True)
+        out.seek(0)
+        result = out.read()
+        log.info("screenshot_page: stitched %d strips → %dKB", len(strips), len(result)//1024)
+        return result
+
     except Exception as e:
         log.error("screenshot_page error: %s", e, exc_info=True)
         return None
@@ -611,38 +707,8 @@ def page_to_text(url: str) -> str:
     return "\n".join(lines[:100])
 
 def page_to_pdf(url: str) -> Optional[bytes]:
-    """
-    Generate a full-page PDF using Playwright's built-in PDF print.
-    This captures the entire page (scrollable content) as a proper PDF,
-    not a screenshot. Falls back to wkhtmltopdf, then raw HTML.
-    """
+    """Generate PDF using wkhtmltopdf if available, else return HTML."""
     log.info("page_to_pdf: %s", url)
-
-    # Strategy 1: Playwright PDF (best quality, full page)
-    try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            browser = p.chromium.launch(args=[
-                "--no-sandbox", "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage", "--disable-gpu",
-            ])
-            page = browser.new_page(viewport={"width": 1080, "height": 1920})
-            page.goto(url, timeout=30000, wait_until="networkidle")
-            time.sleep(2)
-            pdf_bytes = page.pdf(
-                format="A4",
-                print_background=True,
-                margin={"top": "10mm", "bottom": "10mm",
-                        "left": "10mm", "right": "10mm"},
-            )
-            browser.close()
-        if pdf_bytes and len(pdf_bytes) > 500:
-            log.info("page_to_pdf (playwright): %dKB", len(pdf_bytes)//1024)
-            return pdf_bytes
-    except Exception as e:
-        log.warning("page_to_pdf playwright failed: %s", e)
-
-    # Strategy 2: wkhtmltopdf
     try:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
             out = tf.name
@@ -661,19 +727,16 @@ def page_to_pdf(url: str) -> Optional[bytes]:
         if Path(out).exists() and Path(out).stat().st_size > 500:
             data = Path(out).read_bytes()
             Path(out).unlink(missing_ok=True)
-            log.info("page_to_pdf (wkhtmltopdf): %dKB", len(data)//1024)
+            log.info("page_to_pdf: %dKB", len(data)//1024)
             return data
-        log.warning("wkhtmltopdf rc=%d stderr=%s",
-                    result.returncode, result.stderr.decode()[:200])
+        log.warning("wkhtmltopdf rc=%d stderr=%s", result.returncode,
+                    result.stderr.decode()[:300])
         Path(out).unlink(missing_ok=True)
     except subprocess.TimeoutExpired:
-        log.warning("page_to_pdf: wkhtmltopdf timed out")
+        log.warning("page_to_pdf: wkhtmltopdf timed out — falling back to HTML")
     except Exception as e:
-        log.error("page_to_pdf wkhtmltopdf: %s", e)
-
-    # Strategy 3: raw HTML fallback (better than nothing)
-    log.warning("page_to_pdf: falling back to raw HTML")
-    return fetch_page(url)
+        log.error("page_to_pdf: %s", e)
+    return fetch_page(url)  # fallback: raw HTML
 
 # ─── Scholar ──────────────────────────────────────────────────────────────────
 def scholar_search(query: str, page=0) -> list[dict]:
@@ -797,232 +860,75 @@ def youtube_search(query: str, max_results=8) -> list[dict]:
         return []
 
 def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
-    """
-    Multi-strategy YouTube downloader.
-    Tries in order:
-      1. yt-dlp with cookies file (if YOUTUBE_COOKIES_FILE is set)
-      2. yt-dlp via Invidious public instance URL (bypasses IP blocks)
-      3. pytubefix (different client fingerprint)
-      4. cobalt.tools API (free public service)
-    """
     log.info("youtube_download: url=%r audio=%s", url, audio_only)
-
-    # Normalize URL (handle search queries)
-    is_search = url.startswith("ytsearch")
-    video_id = None
-    if not is_search:
-        m = re.search(r"(?:v=|youtu\.be/|/v/|/embed/)([A-Za-z0-9_-]{11})", url)
-        if m:
-            video_id = m.group(1)
-
     import shutil
     ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
-    cookies_file = os.getenv("YOUTUBE_COOKIES_FILE", "")   # e.g. /home/user/cookies.txt
 
-    # ── Helper: run yt-dlp with given args ────────────────────────────────────
-    def _ytdlp(extra_args: list, target_url: str,
-               extra_base: list = None) -> Optional[tuple[bytes,str]]:
+    base_cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--no-warnings",
+        "--no-check-certificate",
+        "--ffmpeg-location", ffmpeg_dir,
+        "--geo-bypass",
+        "--socket-timeout", "30",
+        "--retries", "5",
+        "--extractor-args", "youtube:player_client=ios,tv_embedded,web",
+    ]
+
+    def _run(extra_args, target_url) -> Optional[tuple[bytes,str]]:
         with tempfile.TemporaryDirectory() as tmp:
-            base = [
-                "yt-dlp", "--no-playlist",
-                "--no-warnings", "--no-check-certificate",
-                "--ffmpeg-location", ffmpeg_dir,
-                "--geo-bypass", "--socket-timeout", "30", "--retries", "3",
-                "-o", os.path.join(tmp, "%(title).60s.%(ext)s"),
-            ]
-            if extra_base:
-                base += extra_base
-            cmd = base + extra_args + [target_url]
-            log.debug("yt-dlp: %s", " ".join(cmd))
+            out_tpl = os.path.join(tmp, "%(title).60s.%(ext)s")
+            cmd = base_cmd + ["-o", out_tpl] + extra_args + [target_url]
+            log.debug("yt-dlp cmd: %s", " ".join(cmd))
             proc = subprocess.run(cmd, capture_output=True, timeout=300)
             stderr = proc.stderr.decode(errors="replace")
             stdout = proc.stdout.decode(errors="replace")
             if proc.returncode != 0:
-                log.warning("yt-dlp rc=%d | %s | %s",
-                            proc.returncode, stderr[:400], stdout[:200])
+                log.error("yt-dlp rc=%d stderr=%s", proc.returncode, stderr[:800])
                 return None
-            files = [f for f in Path(tmp).glob("*") if f.stat().st_size > 1000]
+            log.debug("yt-dlp stdout: %s", stdout[:300])
+            files = list(Path(tmp).glob("*"))
             if not files:
-                log.warning("yt-dlp: no output files")
+                log.error("yt-dlp: no output files in %s", tmp)
                 return None
-            f = sorted(files, key=lambda x: x.stat().st_size, reverse=True)[0]
+            f = files[0]
             data = f.read_bytes()
-            log.info("yt-dlp OK: %s  %.1fMB", f.name, len(data)/1024/1024)
+            log.info("yt-dlp: %s  %.1fMB", f.name, len(data)/1024/1024)
             return data, f.name
 
-    # ── Strategy 1: yt-dlp with browser cookies (most reliable) ─────────────
-    if cookies_file and Path(cookies_file).exists():
-        log.info("Strategy 1: yt-dlp + cookies file")
-        base_extra = ["--cookies", cookies_file]
-        if audio_only:
-            r = _ytdlp(["-x", "--audio-format", "mp3", "--audio-quality", "5"],
-                       url, base_extra)
-        else:
-            r = _ytdlp(["-f", "bestvideo+bestaudio/best",
-                        "--merge-output-format", "mp4"], url, base_extra)
-        if r: return _maybe_trim(r, ffmpeg_dir)
-
-    # ── Strategy 2: yt-dlp via Invidious (bypasses YouTube IP blocks) ────────
-    if not is_search and video_id:
-        log.info("Strategy 2: yt-dlp via Invidious for video_id=%s", video_id)
-        # Public Invidious instances — yt-dlp handles them natively
-        invidious_instances = [
-            "https://yewtu.be",
-            "https://inv.nadeko.net",
-            "https://invidious.nerdvpn.de",
-            "https://iv.melmac.space",
-            "https://invidious.privacydev.net",
-        ]
-        for instance in invidious_instances:
-            inv_url = f"{instance}/watch?v={video_id}"
-            log.debug("Trying Invidious: %s", inv_url)
-            if audio_only:
-                r = _ytdlp(["-x", "--audio-format", "mp3", "--audio-quality", "5"],
-                           inv_url)
-            else:
-                r = _ytdlp(["-f", "bestvideo+bestaudio/best",
-                            "--merge-output-format", "mp4"], inv_url)
-            if r:
-                log.info("Invidious download succeeded via %s", instance)
-                return _maybe_trim(r, ffmpeg_dir)
-        log.warning("All Invidious instances failed")
-
-    # ── Strategy 3: pytubefix (different client, bypasses many blocks) ────────
-    if not is_search and video_id:
-        log.info("Strategy 3: pytubefix video_id=%s", video_id)
-        try:
-            from pytubefix import YouTube
-            from pytubefix.cli import on_progress
-            yt = YouTube(
-                f"https://www.youtube.com/watch?v={video_id}",
-                use_oauth=False,
-                allow_oauth_cache=True,
-                on_progress_callback=on_progress,
-            )
-            with tempfile.TemporaryDirectory() as tmp:
-                if audio_only:
-                    stream = (yt.streams
-                                .filter(only_audio=True)
-                                .order_by("abr").last())
-                    if not stream:
-                        raise ValueError("No audio stream found")
-                    safe_title = re.sub(r'[^\w\s-]', '', yt.title)[:50]
-                    fpath = stream.download(output_path=tmp,
-                                           filename=f"{safe_title}.mp4")
-                    # Convert to mp3 with ffmpeg
-                    mp3_path = Path(fpath).with_suffix(".mp3")
-                    subprocess.run(
-                        [str(Path(ffmpeg_dir)/"ffmpeg"), "-y", "-i", fpath,
-                         "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k",
-                         str(mp3_path)],
-                        capture_output=True, timeout=120, check=True,
-                    )
-                    data = mp3_path.read_bytes()
-                    fname = mp3_path.name
-                else:
-                    stream = (yt.streams
-                                .filter(progressive=True, file_extension="mp4")
-                                .order_by("resolution").last())
-                    if not stream:
-                        stream = yt.streams.filter(file_extension="mp4").first()
-                    if not stream:
-                        raise ValueError("No video stream found")
-                    safe_title = re.sub(r'[^\w\s-]', '', yt.title)[:50]
-                    fpath = stream.download(output_path=tmp,
-                                           filename=f"{safe_title}.mp4")
-                    data = Path(fpath).read_bytes()
-                    fname = Path(fpath).name
-            log.info("pytubefix OK: %s  %.1fMB", fname, len(data)/1024/1024)
-            return _maybe_trim((data, fname), ffmpeg_dir)
-        except Exception as e:
-            log.warning("pytubefix failed: %s", e)
-
-    # ── Strategy 4: cobalt.tools public API ──────────────────────────────────
-    if not is_search and video_id:
-        log.info("Strategy 4: cobalt.tools API")
-        try:
-            cobalt_url = f"https://www.youtube.com/watch?v={video_id}"
-            payload = {
-                "url": cobalt_url,
-                "videoQuality": "480",
-                "youtubeVideoCodec": "h264",
-                "filenameStyle": "basic",
-                "downloadMode": "audio" if audio_only else "auto",
-            }
-            headers = {
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "User-Agent": UA_DESK,
-            }
-            # Try multiple cobalt instances
-            for cobalt_api in [
-                "https://api.cobalt.tools/",
-                "https://cobalt.api.timelessnesses.me/",
-            ]:
-                resp = WEB.post(cobalt_api, json=payload,
-                                headers=headers, timeout=20)
-                log.debug("cobalt %s: status=%d", cobalt_api, resp.status_code)
-                if resp.status_code != 200:
-                    continue
-                data = resp.json()
-                status = data.get("status", "")
-                dl_url = data.get("url") or data.get("stream")
-                log.info("cobalt status=%s url=%s", status, str(dl_url)[:80])
-                if status in ("redirect", "stream", "tunnel") and dl_url:
-                    content = download_bytes(dl_url)
-                    if content and len(content) > 10000:
-                        ext = "mp3" if audio_only else "mp4"
-                        fname = f"{video_id}.{ext}"
-                        log.info("cobalt OK: %.1fMB", len(content)/1024/1024)
-                        return _maybe_trim((content, fname), ffmpeg_dir)
-                elif status == "picker":
-                    # cobalt returns multiple streams — grab first
-                    picks = data.get("picker", [])
-                    if picks:
-                        dl_url = picks[0].get("url")
-                        if dl_url:
-                            content = download_bytes(dl_url)
-                            if content and len(content) > 10000:
-                                ext = "mp3" if audio_only else "mp4"
-                                fname = f"{video_id}.{ext}"
-                                return _maybe_trim((content, fname), ffmpeg_dir)
-        except Exception as e:
-            log.warning("cobalt.tools failed: %s", e)
-
-    # ── Strategy 5: yt-dlp with mweb client (last resort) ────────────────────
-    log.info("Strategy 5: yt-dlp mweb/android client")
-    for client in ["mweb", "android", "android_vr"]:
-        log.debug("Trying client: %s", client)
-        args_base = [
-            "--extractor-args", f"youtube:player_client={client}",
-        ]
-        if audio_only:
-            r = _ytdlp(["-x", "--audio-format", "mp3", "--audio-quality", "5"],
-                       url, args_base)
-        else:
-            r = _ytdlp(["--merge-output-format", "mp4"], url, args_base)
-        if r:
-            return _maybe_trim(r, ffmpeg_dir)
-
-    log.error("youtube_download: ALL strategies failed for %r", url)
-    return None
-
-
-def _maybe_trim(result: tuple[bytes,str], ffmpeg_dir: str) -> tuple[bytes,str]:
-    """Trim video if it's extremely large (>500MB), otherwise pass through."""
-    data, fname = result
-    if len(data) > 500 * 1024 * 1024:
-        log.info("_maybe_trim: %.1fMB — trimming", len(data)/1024/1024)
-        with tempfile.TemporaryDirectory() as tmp2:
-            src = Path(tmp2) / fname
-            src.write_bytes(data)
-            trimmed = _trim_video(src, tmp2, ffmpeg_dir)
-            if trimmed:
-                tdata, tpath = trimmed
-                return tdata, Path(tpath).name
-    return data, fname
-
-
+    if audio_only:
+        # Try mp3 first, fallback to best audio then convert
+        for args in [
+            ["-x", "--audio-format", "mp3", "--audio-quality", "5", "-f", "bestaudio/best"],
+            ["-x", "--audio-format", "mp3", "--audio-quality", "5"],
+            ["-f", "bestaudio", "--audio-format", "mp3", "-x"],
+        ]:
+            result = _run(args, url)
+            if result:
+                return result
+        return None
+    else:
+        # Try progressive quality steps — no strict codec filter
+        for fmt in [
+            "bestvideo[height<=720]+bestaudio/best[height<=720]",
+            "bestvideo+bestaudio/best",
+            "best[height<=720]",
+            "best",
+        ]:
+            result = _run(["-f", fmt, "--merge-output-format", "mp4"], url)
+            if result:
+                # Trim if too large
+                if len(result[0]) > MAX_FILE_SIZE - 1*1024*1024:
+                    log.info("Video %.1fMB too large, trimming…", len(result[0])/1024/1024)
+                    with tempfile.TemporaryDirectory() as tmp2:
+                        src = Path(tmp2) / result[1]
+                        src.write_bytes(result[0])
+                        trimmed = _trim_video(src, tmp2, ffmpeg_dir)
+                        if trimmed:
+                            result = trimmed
+                return result
+        return None
 
 def _trim_video(src: Path, tmp: str, ffmpeg_dir="/usr/bin") -> Optional[tuple[bytes,Path]]:
     out = Path(tmp) / ("trimmed_" + src.name)
@@ -1043,7 +949,354 @@ def _trim_video(src: Path, tmp: str, ffmpeg_dir="/usr/bin") -> Optional[tuple[by
         log.error("_trim_video: %s", e)
         return None
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOCIAL MEDIA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── Generic yt-dlp social downloader ────────────────────────────────────────
+def social_download_ytdlp(url: str, audio_only=False,
+                           cookies_file: str = "") -> Optional[tuple[bytes, str]]:
+    """Download from any yt-dlp-supported URL (TikTok, Instagram, Twitter, etc.)"""
+    log.info("social_download_ytdlp: %r  audio=%s", url, audio_only)
+    import shutil
+    ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
+    base = [
+        "yt-dlp", "--no-playlist", "--no-warnings", "--no-check-certificate",
+        "--ffmpeg-location", ffmpeg_dir,
+        "--socket-timeout", "30", "--retries", "3",
+    ]
+    if cookies_file and Path(cookies_file).exists():
+        base += ["--cookies", cookies_file]
+
+    def _run(extra, target):
+        with tempfile.TemporaryDirectory() as tmp:
+            cmd = base + ["-o", os.path.join(tmp, "%(title).60s.%(ext)s")] + extra + [target]
+            log.debug("social yt-dlp: %s", " ".join(cmd))
+            proc = subprocess.run(cmd, capture_output=True, timeout=300)
+            if proc.returncode != 0:
+                log.warning("social yt-dlp rc=%d: %s",
+                            proc.returncode, proc.stderr.decode(errors="replace")[:500])
+                return None
+            files = [f for f in Path(tmp).glob("*") if f.stat().st_size > 100]
+            if not files:
+                return None
+            f = sorted(files, key=lambda x: x.stat().st_size, reverse=True)[0]
+            data = f.read_bytes()
+            log.info("social yt-dlp OK: %s  %.1fMB", f.name, len(data)/1024/1024)
+            return data, f.name
+
+    if audio_only:
+        return _run(["-x", "--audio-format", "mp3", "--audio-quality", "5"], url)
+    else:
+        for fmt in [
+            ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"],
+            ["-f", "best", "--merge-output-format", "mp4"],
+            ["--merge-output-format", "mp4"],
+        ]:
+            r = _run(fmt, url)
+            if r:
+                return r
+    return None
+
+
+# ─── Telegram channel reader ─────────────────────────────────────────────────
+def tg_channel_read_web(channel: str, limit: int = 20) -> list[dict]:
+    """
+    Read public Telegram channel via t.me/s/ preview (no auth needed).
+    Returns list of {id, text, date, has_photo, has_video, url}.
+    """
+    log.info("tg_channel_read_web: @%s limit=%d", channel, limit)
+    channel = channel.lstrip("@").strip()
+    try:
+        r = WEB.get(f"https://t.me/s/{channel}",
+                    headers={"User-Agent": UA_DESK,
+                             "Accept-Language": "en-US,en;q=0.9"},
+                    timeout=20)
+        log.debug("tg_web: status=%d len=%d", r.status_code, len(r.text))
+        if r.status_code != 200:
+            log.error("tg_channel_read_web: status=%d", r.status_code)
+            return []
+        soup = BeautifulSoup(r.text, "html.parser")
+        messages = []
+        for wrap in soup.select(".tgme_widget_message_wrap")[:limit]:
+            msg_div = wrap.select_one(".tgme_widget_message")
+            if not msg_div:
+                continue
+            msg_id = msg_div.get("data-post", "")
+            # Text
+            text_el = wrap.select_one(".tgme_widget_message_text")
+            text = text_el.get_text("\n", strip=True) if text_el else ""
+            # Date
+            time_el = wrap.select_one("time")
+            date = time_el.get("datetime", "") if time_el else ""
+            # Message link
+            link_el = wrap.select_one("a.tgme_widget_message_date")
+            msg_url = link_el.get("href", "") if link_el else ""
+            # Media
+            has_photo = bool(wrap.select(".tgme_widget_message_photo_wrap,"
+                                         ".tgme_widget_message_photo"))
+            has_video = bool(wrap.select(".tgme_widget_message_video_wrap,"
+                                         ".tgme_widget_message_video_player"))
+            has_doc   = bool(wrap.select(".tgme_widget_message_document"))
+            messages.append({
+                "id": msg_id,
+                "text": text[:500],
+                "date": date[:16].replace("T", " "),
+                "url": msg_url,
+                "has_photo": has_photo,
+                "has_video": has_video,
+                "has_doc": has_doc,
+            })
+        log.info("tg_channel_read_web: %d messages from @%s", len(messages), channel)
+        return list(reversed(messages))   # newest last
+    except Exception as e:
+        log.error("tg_channel_read_web: %s", e, exc_info=True)
+        return []
+
+
+async def tg_channel_read_mtproto(channel: str, limit: int = 20) -> list[dict]:
+    """
+    Read Telegram channel via MTProto (Telethon).
+    Requires TG_API_ID and TG_API_HASH env vars.
+    Works for both public and private channels (if account is a member).
+    """
+    log.info("tg_channel_read_mtproto: @%s", channel)
+    if not TG_API_ID or not TG_API_HASH:
+        log.error("TG_API_ID / TG_API_HASH not set")
+        return []
+    try:
+        from telethon import TelegramClient
+        from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
+        client = TelegramClient(TG_SESSION, int(TG_API_ID), TG_API_HASH)
+        await client.start()
+        messages = []
+        async for msg in client.iter_messages(channel, limit=limit):
+            has_photo = isinstance(getattr(msg, "media", None), MessageMediaPhoto)
+            has_doc   = isinstance(getattr(msg, "media", None), MessageMediaDocument)
+            messages.append({
+                "id": str(msg.id),
+                "text": (msg.text or "")[:500],
+                "date": str(msg.date)[:16],
+                "url": f"https://t.me/{channel.lstrip('@')}/{msg.id}",
+                "has_photo": has_photo,
+                "has_video": False,
+                "has_doc": has_doc,
+                "_msg_obj": msg,
+            })
+        await client.disconnect()
+        log.info("tg_mtproto: %d messages", len(messages))
+        return list(reversed(messages))
+    except Exception as e:
+        log.error("tg_channel_read_mtproto: %s", e, exc_info=True)
+        return []
+
+
+def tg_download_media_web(msg_url: str) -> Optional[tuple[bytes, str]]:
+    """Download media from a public Telegram message URL via yt-dlp."""
+    log.info("tg_download_media: %s", msg_url)
+    return social_download_ytdlp(msg_url)
+
+
+# ─── Twitter / X ─────────────────────────────────────────────────────────────
+# Public Nitter instances (Twitter frontend, no auth needed)
+NITTER_INSTANCES = [
+    "https://nitter.privacydev.net",
+    "https://nitter.poast.org",
+    "https://nitter.1d4.us",
+    "https://nitter.kavin.rocks",
+    "https://twiiit.com",
+]
+
+def twitter_get_channel(username: str, limit: int = 20) -> list[dict]:
+    """Read Twitter/X user timeline via Nitter (no auth needed)."""
+    log.info("twitter_get_channel: @%s", username)
+    username = username.lstrip("@").strip()
+    for instance in NITTER_INSTANCES:
+        url = f"{instance}/{username}"
+        try:
+            r = WEB.get(url, headers={"User-Agent": UA_DESK,
+                                       "Accept-Language": "en-US,en;q=0.9"},
+                        timeout=15)
+            log.debug("nitter %s: status=%d len=%d", instance, r.status_code, len(r.text))
+            if r.status_code != 200:
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+            tweets = []
+            for item in soup.select(".timeline-item")[:limit]:
+                # Skip pinned/retweet header
+                tweet_content = item.select_one(".tweet-content")
+                if not tweet_content:
+                    continue
+                text = tweet_content.get_text("\n", strip=True)
+                date_el = item.select_one(".tweet-date a")
+                date = date_el.get("title", "") if date_el else ""
+                link_el = item.select_one(".tweet-date a")
+                tweet_path = link_el.get("href", "") if link_el else ""
+                tweet_url = f"https://twitter.com{tweet_path}" if tweet_path.startswith("/") else tweet_path
+                nitter_url = f"{instance}{tweet_path}" if tweet_path else ""
+                has_video = bool(item.select(".attachment.video-container, .gif"))
+                has_photo = bool(item.select(".attachment.image"))
+                tweets.append({
+                    "text": text[:500],
+                    "date": date[:16],
+                    "url": tweet_url,
+                    "nitter_url": nitter_url,
+                    "has_video": has_video,
+                    "has_photo": has_photo,
+                })
+            if tweets:
+                log.info("twitter_get_channel: %d tweets via %s", len(tweets), instance)
+                return tweets
+        except Exception as e:
+            log.warning("nitter %s failed: %s", instance, e)
+    log.error("twitter_get_channel: all Nitter instances failed")
+    return []
+
+
+def twitter_download_media(tweet_url: str) -> Optional[tuple[bytes, str]]:
+    """Download video/image from a tweet via yt-dlp + Nitter fallback."""
+    log.info("twitter_download_media: %s", tweet_url)
+    # Try yt-dlp with twitter cookies first
+    cookies = TWITTER_COOKIES_FILE if TWITTER_COOKIES_FILE else ""
+    result = social_download_ytdlp(tweet_url, cookies_file=cookies)
+    if result:
+        return result
+    # Convert to Nitter URL and try again
+    m = re.search(r"(?:twitter\.com|x\.com)/([^/]+)/status/(\d+)", tweet_url)
+    if m:
+        username, tweet_id = m.groups()
+        for instance in NITTER_INSTANCES:
+            nitter_url = f"{instance}/{username}/status/{tweet_id}"
+            log.debug("Trying nitter: %s", nitter_url)
+            r = social_download_ytdlp(nitter_url)
+            if r:
+                return r
+    return None
+
+
+# ─── Instagram ───────────────────────────────────────────────────────────────
+def instagram_download(url: str) -> Optional[tuple[bytes, str]]:
+    """Download Instagram post/reel via yt-dlp, with instaloader fallback."""
+    log.info("instagram_download: %s", url)
+    # Strategy 1: yt-dlp
+    result = social_download_ytdlp(url)
+    if result:
+        return result
+    # Strategy 2: instaloader
+    try:
+        import instaloader
+        L = instaloader.Instaloader(
+            download_videos=True,
+            download_video_thumbnails=False,
+            download_geotags=False,
+            download_comments=False,
+            save_metadata=False,
+            compress_json=False,
+            quiet=True,
+        )
+        if INSTAGRAM_USER and INSTAGRAM_PASS:
+            try:
+                L.login(INSTAGRAM_USER, INSTAGRAM_PASS)
+                log.info("instaloader: logged in as %s", INSTAGRAM_USER)
+            except Exception as e:
+                log.warning("instaloader login failed: %s", e)
+        # Extract shortcode from URL
+        m = re.search(r"instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)", url)
+        if not m:
+            return None
+        shortcode = m.group(1)
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+        with tempfile.TemporaryDirectory() as tmp:
+            L.dirname_pattern = tmp
+            L.download_post(post, target=tmp)
+            # Find largest video or image
+            files = list(Path(tmp).rglob("*.mp4"))
+            if not files:
+                files = list(Path(tmp).rglob("*.jpg")) + list(Path(tmp).rglob("*.png"))
+            if files:
+                f = sorted(files, key=lambda x: x.stat().st_size, reverse=True)[0]
+                data = f.read_bytes()
+                log.info("instaloader OK: %s  %.1fMB", f.name, len(data)/1024/1024)
+                return data, f.name
+    except Exception as e:
+        log.error("instaloader: %s", e)
+    return None
+
+
+def instagram_get_profile(username: str) -> list[dict]:
+    """Get recent Instagram posts from a public profile via instaloader."""
+    log.info("instagram_get_profile: @%s", username)
+    try:
+        import instaloader
+        L = instaloader.Instaloader(quiet=True)
+        if INSTAGRAM_USER and INSTAGRAM_PASS:
+            try:
+                L.login(INSTAGRAM_USER, INSTAGRAM_PASS)
+            except Exception:
+                pass
+        profile = instaloader.Profile.from_username(L.context, username.lstrip("@"))
+        posts = []
+        for post in profile.get_posts():
+            posts.append({
+                "url": f"https://www.instagram.com/p/{post.shortcode}/",
+                "shortcode": post.shortcode,
+                "text": (post.caption or "")[:300],
+                "date": str(post.date_local)[:16],
+                "is_video": post.is_video,
+                "likes": post.likes,
+                "typename": post.typename,
+            })
+            if len(posts) >= 12:
+                break
+        log.info("instagram_get_profile: %d posts", len(posts))
+        return posts
+    except Exception as e:
+        log.error("instagram_get_profile: %s", e)
+        return []
+
+
+# ─── TikTok ──────────────────────────────────────────────────────────────────
+def tiktok_download(url: str) -> Optional[tuple[bytes, str]]:
+    """Download TikTok video via yt-dlp (no auth needed for public videos)."""
+    log.info("tiktok_download: %s", url)
+    return social_download_ytdlp(url)
+
+
+def tiktok_user_videos(username: str, limit: int = 10) -> list[dict]:
+    """Get TikTok user video list via yt-dlp flat extraction."""
+    log.info("tiktok_user_videos: @%s", username)
+    username = username.lstrip("@")
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--flat-playlist", "--no-warnings", "--no-check-certificate",
+             "--print", "%(id)s|||%(title)s|||%(duration_string)s|||%(url)s",
+             f"https://www.tiktok.com/@{username}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        items = []
+        for line in result.stdout.strip().split("\n"):
+            parts = line.split("|||")
+            if len(parts) >= 2:
+                vid_id = parts[0].strip()
+                items.append({
+                    "id": vid_id,
+                    "title": parts[1].strip(),
+                    "duration": parts[2].strip() if len(parts)>2 else "",
+                    "url": parts[3].strip() if len(parts)>3 else
+                           f"https://www.tiktok.com/@{username}/video/{vid_id}",
+                })
+            if len(items) >= limit:
+                break
+        log.info("tiktok_user_videos: %d videos", len(items))
+        return items
+    except Exception as e:
+        log.error("tiktok_user_videos: %s", e)
+        return []
+
+
 # ─── GitHub ───────────────────────────────────────────────────────────────────
+
 def _gh_headers() -> dict:
     h = {"Accept": "application/vnd.github+json",
          "User-Agent": "BaleBot/1.0",
@@ -1600,10 +1853,9 @@ def do_youtube_dl(cid: int, url: str):
 def _finish_video(cid: int, result):
     if not result:
         send_message(cid,
-                     "❌ دانلود ناموفق بود.\n\n"
-                     "💡 *راه‌حل:* کوکی‌های مرورگر Chrome خود را export کنید:\n"
-                     "`yt-dlp --cookies-from-browser chrome --cookies /path/yt_cookies.txt https://youtube.com`\n"
-                     "سپس: `export YOUTUBE_COOKIES_FILE=/path/yt_cookies.txt`",
+                     "❌ دانلود ناموفق بود.\n"
+                     "• اجرا کنید: `yt-dlp -U`\n"
+                     "• یا یک ویدیو دیگر امتحان کنید.",
                      parse_mode="Markdown", reply_markup=home_kb())
         return
     data, fname = result
@@ -1623,12 +1875,7 @@ def do_music(cid: int, query: str):
     chat_action(cid, "record_voice")
     result = youtube_download(f"ytsearch1:{query}", audio_only=True)
     if not result:
-        send_message(cid,
-                     "❌ دانلود ناموفق بود.\n\n"
-                     "💡 *راه‌حل:* کوکی‌های مرورگر Chrome خود را export کنید:\n"
-                     "`yt-dlp --cookies-from-browser chrome --cookies /path/yt_cookies.txt https://youtube.com`\n"
-                     "سپس: `export YOUTUBE_COOKIES_FILE=/path/yt_cookies.txt`",
-                     parse_mode="Markdown", reply_markup=home_kb())
+        send_message(cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb())
         return
     data, fname = result
     fname = Path(fname).name
@@ -1820,9 +2067,222 @@ def do_qr(cid: int, text: str):
     send_message(cid, "✅", reply_markup=home_kb())
     clear_state(cid)
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# MESSAGE HANDLER
+# SOCIAL MEDIA HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def do_tg_read(cid: int, channel: str, use_mtproto: bool = False):
+    """Read Telegram channel messages and show as clickable buttons."""
+    bump(cid, "searches")
+    channel = channel.strip().lstrip("@")
+    send_message(cid, f"⏳ در حال دریافت پیام‌های @{channel}…")
+    chat_action(cid)
+
+    if use_mtproto and TG_API_ID and TG_API_HASH:
+        import asyncio
+        try:
+            loop = asyncio.new_event_loop()
+            messages = loop.run_until_complete(tg_channel_read_mtproto(channel, 20))
+            loop.close()
+        except Exception as e:
+            log.error("MTProto loop: %s", e)
+            messages = []
+        if not messages:
+            send_message(cid,
+                "❌ MTProto ناموفق بود.\n"
+                "مطمئن شوید TG_API_ID و TG_API_HASH تنظیم شده‌اند.",
+                reply_markup=home_kb())
+            return
+    else:
+        messages = tg_channel_read_web(channel, 20)
+        if not messages:
+            send_message(cid,
+                "❌ پیامی یافت نشد.\n"
+                "• کانال باید عمومی باشد\n"
+                "• نام کانال را بررسی کنید (بدون @)",
+                reply_markup=home_kb())
+            return
+
+    key = make_cache_key("tg", channel, 0)
+    cache_set(key, messages)
+    set_state(cid, mode="tg_channel", last_query=channel, cache_key=key)
+
+    title = f"✈️ @{channel} — آخرین {len(messages)} پیام"
+    kb = social_results_kb(messages, key, "tg")
+    send_message(cid, title, reply_markup=kb)
+
+
+def do_tg_show_message(cid: int, msg_data: dict):
+    """Display a single Telegram message with media download option."""
+    text = msg_data.get("text", "")
+    date = msg_data.get("date", "")
+    url  = msg_data.get("url", "")
+    has_media = msg_data.get("has_photo") or msg_data.get("has_video") or msg_data.get("has_doc")
+
+    lines = []
+    if date:
+        lines.append(f"🕐 {date}")
+    if text:
+        lines.append(f"\n{text}")
+    if url:
+        lines.append(f"\n[🔗 لینک پیام]({url})")
+
+    kb = social_post_kb(url, "tg", bool(has_media)) if url else home_kb()
+    send_message(cid, "\n".join(lines) or "_(پیام بدون متن)_",
+                 parse_mode="Markdown", reply_markup=kb)
+
+
+def do_tg_dl_media(cid: int, msg_url: str):
+    """Download media from a Telegram message URL."""
+    bump(cid, "downloads")
+    send_message(cid, f"⏳ در حال دانلود رسانه از:\n{msg_url}")
+    chat_action(cid, "upload_document")
+    result = tg_download_media_web(msg_url)
+    if not result:
+        send_message(cid, "❌ دانلود ناموفق — این پیام ممکن است رسانه نداشته باشد.",
+                     reply_markup=home_kb())
+        return
+    data, fname = result
+    smart_send(cid, data, fname, caption=f"✈️ {fname[:60]}")
+    send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
+    clear_state(cid)
+
+
+def do_twitter_timeline(cid: int, username: str):
+    """Fetch and display Twitter/X user timeline via Nitter."""
+    bump(cid, "searches")
+    username = username.strip().lstrip("@")
+    send_message(cid, f"⏳ در حال دریافت توییت‌های @{username}…")
+    chat_action(cid)
+    tweets = twitter_get_channel(username, 20)
+    if not tweets:
+        send_message(cid,
+            "❌ توییتی یافت نشد.\n"
+            "• ممکن است Nitter instances در دسترس نباشند\n"
+            "• نام کاربری را بررسی کنید",
+            reply_markup=home_kb())
+        return
+    key = make_cache_key("tw", username, 0)
+    cache_set(key, tweets)
+    set_state(cid, mode="twitter", last_query=username, cache_key=key)
+    kb = social_results_kb(tweets, key, "tw")
+    send_message(cid, f"🐦 @{username} — {len(tweets)} توییت اخیر:", reply_markup=kb)
+
+
+def do_twitter_show(cid: int, tweet: dict):
+    """Display a single tweet with download option."""
+    text    = tweet.get("text", "")
+    date    = tweet.get("date", "")
+    url     = tweet.get("url", "")
+    has_vid = tweet.get("has_video")
+    has_img = tweet.get("has_photo")
+    has_media = has_vid or has_img
+
+    lines = []
+    if date:
+        lines.append(f"🕐 {date}")
+    lines.append(f"\n{text}" if text else "_(توییت بدون متن)_")
+    if url:
+        lines.append(f"\n[🔗 لینک توییت]({url})")
+
+    kb = social_post_kb(url, "tw", has_media) if url else home_kb()
+    send_message(cid, "\n".join(lines), parse_mode="Markdown", reply_markup=kb)
+
+
+def do_twitter_dl(cid: int, url: str):
+    """Download media from a tweet URL."""
+    bump(cid, "downloads")
+    send_message(cid, f"⏳ در حال دانلود از توییت…")
+    chat_action(cid, "upload_video")
+    result = twitter_download_media(url)
+    if not result:
+        send_message(cid, "❌ دانلود ناموفق.\nاین توییت ممکن است رسانه نداشته باشد.",
+                     reply_markup=home_kb())
+        return
+    data, fname = result
+    smart_send(cid, data, fname, caption=f"🐦 {fname[:60]}")
+    send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
+    clear_state(cid)
+
+
+def do_instagram_profile(cid: int, username: str):
+    """Fetch and display Instagram profile posts."""
+    bump(cid, "searches")
+    username = username.strip().lstrip("@")
+    send_message(cid, f"⏳ در حال دریافت پست‌های @{username}…")
+    chat_action(cid)
+    posts = instagram_get_profile(username)
+    if not posts:
+        send_message(cid,
+            "❌ پستی یافت نشد.\n"
+            "• پروفایل باید عمومی باشد\n"
+            "• برای پروفایل‌های خصوصی INSTAGRAM_USER/PASS تنظیم کنید",
+            reply_markup=home_kb())
+        return
+    key = make_cache_key("ig", username, 0)
+    cache_set(key, posts)
+    set_state(cid, mode="instagram", last_query=username, cache_key=key)
+    kb = social_results_kb(posts, key, "ig")
+    send_message(cid, f"📸 @{username} — {len(posts)} پست اخیر:", reply_markup=kb)
+
+
+def do_instagram_dl(cid: int, url: str):
+    """Download Instagram post/reel."""
+    bump(cid, "downloads")
+    send_message(cid, f"⏳ در حال دانلود از اینستاگرام…")
+    chat_action(cid, "upload_video")
+    result = instagram_download(url)
+    if not result:
+        send_message(cid,
+            "❌ دانلود ناموفق.\n"
+            "• پست باید عمومی باشد\n"
+            "• یا INSTAGRAM_USER/PASS تنظیم کنید",
+            reply_markup=home_kb())
+        return
+    data, fname = result
+    smart_send(cid, data, fname, caption=f"📸 {fname[:60]}")
+    send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
+    clear_state(cid)
+
+
+def do_tiktok_user(cid: int, username: str):
+    """Fetch TikTok user video list."""
+    bump(cid, "searches")
+    username = username.strip().lstrip("@")
+    send_message(cid, f"⏳ در حال دریافت ویدیوهای @{username}…")
+    chat_action(cid)
+    videos = tiktok_user_videos(username, 10)
+    if not videos:
+        send_message(cid,
+            "❌ ویدیویی یافت نشد.\n"
+            "• نام کاربری را بررسی کنید\n"
+            "• پروفایل باید عمومی باشد",
+            reply_markup=home_kb())
+        return
+    key = make_cache_key("tt", username, 0)
+    cache_set(key, videos)
+    set_state(cid, mode="tiktok", last_query=username, cache_key=key)
+    kb = social_results_kb(videos, key, "tt")
+    send_message(cid, f"🎵 @{username} — {len(videos)} ویدیو اخیر:", reply_markup=kb)
+
+
+def do_tiktok_dl(cid: int, url: str):
+    """Download TikTok video."""
+    bump(cid, "downloads")
+    send_message(cid, f"⏳ در حال دانلود از TikTok…")
+    chat_action(cid, "upload_video")
+    result = tiktok_download(url)
+    if not result:
+        send_message(cid, "❌ دانلود ناموفق.", reply_markup=home_kb())
+        return
+    data, fname = result
+    smart_send(cid, data, fname, caption=f"🎵 {fname[:60]}")
+    send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
+    clear_state(cid)
+
+
+
 def handle_message(msg: dict):
     cid    = msg["chat"]["id"]
     text   = msg.get("text","")
@@ -1883,11 +2343,31 @@ def handle_message(msg: dict):
         "ocr":          lambda: send_message(cid,"🖼 لطفاً عکس ارسال کنید.",reply_markup=cancel_kb()),
         "images_pick":  lambda: do_images(cid, st.get("last_query", text),
                                           st.get("img_source","bing")),
+        # Social media
+        "tg_read":      lambda: do_tg_read(cid, text, False),
+        "tg_mtproto":   lambda: do_tg_read(cid, text, True),
+        "tg_dl":        lambda: do_tg_dl_media(cid, text),
+        "twitter_tl":   lambda: do_twitter_timeline(cid, text),
+        "twitter_dl":   lambda: do_twitter_dl(cid, text),
+        "ig_profile":   lambda: do_instagram_profile(cid, text),
+        "ig_dl":        lambda: do_instagram_dl(cid, text),
+        "tt_user":      lambda: do_tiktok_user(cid, text),
+        "tt_dl":        lambda: do_tiktok_dl(cid, text),
     }
     if mode in dispatch:
         dispatch[mode]()
     elif text.startswith("http"):
-        do_open_url(cid, text)
+        # Smart URL detection for social media links
+        if any(x in text for x in ["tiktok.com", "vm.tiktok.com"]):
+            do_tiktok_dl(cid, text)
+        elif any(x in text for x in ["twitter.com", "x.com", "t.co"]):
+            do_twitter_dl(cid, text)
+        elif "instagram.com" in text:
+            do_instagram_dl(cid, text)
+        elif "t.me" in text:
+            do_tg_dl_media(cid, text)
+        else:
+            do_open_url(cid, text)
     else:
         do_search(cid, text)
 
@@ -2199,8 +2679,143 @@ def handle_callback(cb: dict):
         article = results[idx]
         do_wiki_article(cid, article["title"], lang); return
 
+    # ── Telegram channel ──────────────────────────────────────────────────
+    if data == "mode_tg_channel":
+        set_state(cid, mode="tg_channel_menu")
+        send_message(cid, "✈️ کانال تلگرام:", reply_markup=tg_channel_kb()); return
+
+    if data == "tg_read_web":
+        set_state(cid, mode="tg_read")
+        send_message(cid,
+            "✈️ نام کانال عمومی را وارد کنید:\n_(بدون @ — مثال: `durov`)_",
+            parse_mode="Markdown", reply_markup=cancel_kb()); return
+
+    if data == "tg_read_mtproto":
+        if not TG_API_ID or not TG_API_HASH:
+            send_message(cid,
+                "❌ MTProto پیکربندی نشده.\n\n"
+                "برای فعال‌سازی:\n"
+                "1. به https://my.telegram.org بروید\n"
+                "2. API_ID و API_HASH بگیرید\n"
+                "`export TG_API_ID=12345`\n"
+                "`export TG_API_HASH=abc123`",
+                parse_mode="Markdown", reply_markup=home_kb()); return
+        set_state(cid, mode="tg_mtproto")
+        send_message(cid,
+            "✈️ نام کانال را وارد کنید (عمومی یا خصوصی):",
+            reply_markup=cancel_kb()); return
+
+    if data == "tg_dl_media":
+        set_state(cid, mode="tg_dl")
+        send_message(cid,
+            "✈️ لینک پیام تلگرام را وارد کنید:\n"
+            "_(مثال: `https://t.me/channel/123`)_",
+            parse_mode="Markdown", reply_markup=cancel_kb()); return
+
+    # ── Twitter/X ─────────────────────────────────────────────────────────
+    if data == "mode_twitter":
+        send_message(cid, "🐦 توییتر / X:", reply_markup=twitter_kb()); return
+
+    if data == "tw_timeline":
+        set_state(cid, mode="twitter_tl")
+        send_message(cid,
+            "🐦 نام کاربری توییتر را وارد کنید:\n_(مثال: `elonmusk`)_",
+            parse_mode="Markdown", reply_markup=cancel_kb()); return
+
+    if data == "tw_dl":
+        set_state(cid, mode="twitter_dl")
+        send_message(cid,
+            "🐦 لینک توییت را وارد کنید:\n"
+            "_(مثال: `https://twitter.com/user/status/123`)_",
+            parse_mode="Markdown", reply_markup=cancel_kb()); return
+
+    # ── Instagram ─────────────────────────────────────────────────────────
+    if data == "mode_instagram":
+        send_message(cid, "📸 اینستاگرام:", reply_markup=instagram_kb()); return
+
+    if data == "ig_profile":
+        set_state(cid, mode="ig_profile")
+        send_message(cid,
+            "📸 نام کاربری اینستاگرام را وارد کنید:\n_(مثال: `natgeo`)_",
+            parse_mode="Markdown", reply_markup=cancel_kb()); return
+
+    if data == "ig_dl":
+        set_state(cid, mode="ig_dl")
+        send_message(cid,
+            "📸 لینک پست یا ریل را وارد کنید:\n"
+            "_(مثال: `https://www.instagram.com/p/ABC123/`)_",
+            parse_mode="Markdown", reply_markup=cancel_kb()); return
+
+    # ── TikTok ────────────────────────────────────────────────────────────
+    if data == "mode_tiktok":
+        send_message(cid, "🎵 TikTok:", reply_markup=tiktok_kb()); return
+
+    if data == "tt_user":
+        set_state(cid, mode="tt_user")
+        send_message(cid,
+            "🎵 نام کاربری TikTok را وارد کنید:\n_(مثال: `khaby.lame`)_",
+            parse_mode="Markdown", reply_markup=cancel_kb()); return
+
+    if data == "tt_dl":
+        set_state(cid, mode="tt_dl")
+        send_message(cid,
+            "🎵 لینک ویدیو TikTok را وارد کنید:",
+            reply_markup=cancel_kb()); return
+
+    # ── Social result item click: soc_{platform}_{cache_key}_{idx} ───────
+    m = re.match(r"soc_(tg|tw|ig|tt)_(\w+)_(\d+)$", data)
+    if m:
+        platform, key, idx = m.group(1), m.group(2), int(m.group(3))
+        results = cache_get(key)
+        if not results or idx >= len(results):
+            send_message(cid, "❌ نتیجه منقضی."); return
+        item = results[idx]
+        if platform == "tg":
+            do_tg_show_message(cid, item)
+        elif platform == "tw":
+            do_twitter_show(cid, item)
+        elif platform == "ig":
+            # Show post info + download button
+            url = item.get("url", "")
+            text = item.get("text", "")[:300]
+            date = item.get("date", "")
+            is_vid = item.get("is_video", False)
+            likes = item.get("likes", 0)
+            lines = [f"📸 {'🎬 ریل' if is_vid else '🖼 پست'}",
+                     f"❤️ {likes:,}" if likes else "",
+                     f"🕐 {date}" if date else "",
+                     f"\n{text}" if text else "",
+                     f"\n[🔗 لینک]({url})" if url else ""]
+            kb = social_post_kb(url, "ig", True) if url else home_kb()
+            send_message(cid, "\n".join(l for l in lines if l),
+                         parse_mode="Markdown", reply_markup=kb)
+        elif platform == "tt":
+            url = item.get("url", "")
+            title = item.get("title", "")
+            dur = item.get("duration", "")
+            text = f"🎵 *{title}*\n⏱ {dur}\n[🔗 لینک]({url})"
+            kb = social_post_kb(url, "tt", True) if url else home_kb()
+            send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
+        return
+
+    # ── Social media download button: soc_dl_{platform}_{url_key} ────────
+    m = re.match(r"soc_dl_(tg|tw|ig|tt)_(\w+)$", data)
+    if m:
+        platform, url_key = m.group(1), m.group(2)
+        url = url_cache.get(url_key, "")
+        if not url:
+            send_message(cid, "❌ لینک منقضی."); return
+        if platform == "tg":
+            do_tg_dl_media(cid, url)
+        elif platform == "tw":
+            do_twitter_dl(cid, url)
+        elif platform == "ig":
+            do_instagram_dl(cid, url)
+        elif platform == "tt":
+            do_tiktok_dl(cid, url)
+        return
+
     # ── Images query entry ────────────────────────────────────────────────
-    # (handled in handle_message when mode==images_query)
     log.warning("Unhandled callback: %r", data)
 
 def handle_message_images_query(cid: int, text: str, st: dict):
@@ -2235,14 +2850,6 @@ def run():
     if TOKEN == "YOUR_BOT_TOKEN_HERE":
         log.critical("BALE_TOKEN not set! Run: export BALE_TOKEN=your_token")
         return
-    if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).exists():
-        log.info("YouTube cookies: %s ✅", YOUTUBE_COOKIES_FILE)
-    else:
-        log.warning(
-            "YouTube cookies NOT configured — downloads may fail on datacenter IPs.\n"
-            "  Fix: yt-dlp --cookies-from-browser chrome --cookies /path/yt_cookies.txt https://youtube.com\n"
-            "  Then: export YOUTUBE_COOKIES_FILE=/path/yt_cookies.txt"
-        )
     offset = 0
     while True:
         try:
