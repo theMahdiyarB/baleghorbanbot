@@ -1,60 +1,97 @@
-# 🤖 دستیار وب — Bale Web Assistant Bot
+# 🤖 بله قربان — Bale Web Assistant Bot
 
-یک ربات جامع برای پیام‌رسان **بله** با قابلیت‌های متعدد جستجو، دانلود، ترجمه و بیشتر.
+یک ربات جامع برای پیام‌رسان **بله** با قابلیت‌های متعدد جستجو، دانلود، شبکه‌های اجتماعی و بیشتر.
 
 ---
 
 ## ✨ قابلیت‌ها
 
-| دستور / حالت | توضیح |
+| ابزار | توضیح |
 |---|---|
-| 🔎 **جستجو در وب** | تا ۱۰ نتیجه از DuckDuckGo با عنوان و لینک |
-| 📄 **نتایج HTML** | نتایج جستجو به‌صورت فایل HTML قابل ذخیره |
-| 🌐 **باز کردن سایت** | دریافت متن و فایل HTML هر صفحه‌ای |
-| 📑 **PDF از صفحه** | دانلود HTML صفحه برای مرور آفلاین |
-| 🗜 **ZIP آفلاین** | صفحه + منابع (CSS/JS/تصاویر) در قالب ZIP |
-| 📥 **GitHub** | دانلود کل مخزن GitHub به‌صورت ZIP |
-| 🌐 **ترجمه** | ترجمه متن به فارسی، انگلیسی، عربی، آلمانی، فرانسوی، روسی |
+| 🔎 **جستجو در وب** | تا ۱۰ نتیجه از DuckDuckGo — نتایج قابل کلیک با صفحه‌بندی |
+| 🌐 **مشاهده سایت** | اسکرین‌شات ۱۹۲۰×۱۰۸۰ + دکمه‌های متن / HTML / ZIP / PDF |
+| 📚 **مقاله علمی** | جستجوی Google Scholar با صفحه‌بندی و نتایج قابل کلیک |
+| 📖 **ویکی‌پدیا** | جستجو + خواندن مقاله کامل (فارسی و انگلیسی) |
+| 📺 **یوتیوب** | جستجو با تامبنیل، دانلود ویدیو/صوت، ارسال لینک مستقیم |
+| 🎵 **موسیقی MP3** | دانلود صوتی از یوتیوب |
+| 🖼 **دانلود عکس** | Bing / Pinterest / Pixabay / Wikimedia با «دانلود بیشتر» |
+| 🐙 **GitHub** | جستجوی مخازن + دانلود ZIP + دانلود Release |
+| ✈️ **کانال تلگرام** | خواندن پیام‌های کانال عمومی (scrape) یا MTProto |
+| 🐦 **توییتر / X** | تایم‌لاین کاربر + دانلود عکس خودکار + دانلود ویدیو |
+| 📸 **اینستاگرام** | پست‌های پروفایل + دانلود عکس خودکار + دانلود ریل |
+| 🎵 **تیک‌تاک** | لیست ویدیوها با تامبنیل + دانلود مستقیم |
+| 📰 **اخبار RSS** | دریافت فید + کشف خودکار فید از سایت |
+| 🌐 **ترجمه** | ترجمه به فارسی، انگلیسی، عربی، آلمانی، فرانسوی، روسی |
 | 🖼 **OCR** | استخراج متن از عکس + خروجی PDF |
-| 📚 **مقاله علمی** | جستجو در Google Scholar |
-| 📺 **یوتیوب** | دانلود ویدیو یا جستجو در یوتیوب |
-| 🎵 **موسیقی MP3** | دانلود MP3 اولین نتیجه یوتیوب |
-| 📌 **پینترست** | جستجو و دانلود تصاویر از Pinterest |
-| 📊 **آمار کاربری** | تعداد درخواست‌ها، دانلودها و ... |
+| 🌐 **IP / دامنه** | موقعیت، اپراتور، منطقه زمانی |
+| 🔒 **حریم خصوصی** | توضیح کامل نحوه عدم ذخیره داده |
+
+### 🔗 تشخیص خودکار لینک
+فقط لینک بفرستید — ربات خودکار تشخیص می‌دهد:
+- `youtube.com` / `youtu.be` → دانلود ویدیو
+- `tiktok.com` / `vm.tiktok.com` → دانلود ویدیو
+- `twitter.com` / `x.com` → دانلود رسانه
+- `instagram.com` → دانلود پست/ریل
+- `t.me/…` → دانلود رسانه تلگرام
+- سایر لینک‌ها → اسکرین‌شات + گزینه‌های بیشتر
+
+### 📤 ارسال فایل هوشمند
+- فایل‌های بزرگ به **قطعه‌های ۱۹MB** تقسیم می‌شوند
+- پسوندهای غیر پشتیبانی‌شده در **ZIP** بسته‌بندی می‌شوند
+- پیام ترکیب قطعه‌ها ارسال می‌شود: `cat file.part*of3.ext > file.ext`
 
 ---
 
 ## 🛠 نصب و راه‌اندازی
 
-### پیش‌نیازها
+### ۱. پیش‌نیازهای سیستم
 
 ```bash
-# Python 3.10+
-python --version
-
-# Tesseract OCR (برای قابلیت OCR)
-sudo apt-get install tesseract-ocr tesseract-ocr-fas tesseract-ocr-eng
+sudo apt-get update
+sudo apt-get install -y \
+  tesseract-ocr tesseract-ocr-fas tesseract-ocr-eng \
+  ffmpeg wkhtmltopdf python3-pip python3-dev
 ```
 
-### نصب کتابخانه‌ها
+### ۲. نصب کتابخانه‌های Python
 
 ```bash
 pip install -r requirements.txt
+python -m playwright install chromium
+python -m playwright install-deps chromium
 ```
 
-### تنظیم توکن
+### ۳. متغیرهای محیطی (ضروری)
 
 ```bash
+# توکن ربات بله (الزامی)
 export BALE_TOKEN="توکن_ربات_شما"
 ```
 
-یا مستقیماً در فایل `bale_bot.py` خط زیر را ویرایش کنید:
+### ۴. متغیرهای اختیاری
 
-```python
-TOKEN = "توکن_ربات_شما"
+```bash
+# YouTube — کوکی مرورگر (توصیه‌شده برای سرورهای دیتاسنتر)
+yt-dlp --cookies-from-browser chrome --cookies /path/yt_cookies.txt https://youtube.com
+export YOUTUBE_COOKIES_FILE=/path/yt_cookies.txt
+
+# GitHub — افزایش rate limit API
+export GITHUB_TOKEN=your_github_personal_token
+
+# Telegram MTProto — خواندن کانال‌های خصوصی
+# از https://my.telegram.org بگیرید
+export TG_API_ID=12345678
+export TG_API_HASH=abcdef1234567890abcdef1234567890
+
+# Twitter — کوکی برای دانلود توییت‌های محدودشده
+export TWITTER_COOKIES_FILE=/path/twitter_cookies.txt
+
+# Instagram — برای پروفایل‌های خصوصی
+export INSTAGRAM_USER=your_username
+export INSTAGRAM_PASS=your_password
 ```
 
-### اجرا
+### ۵. اجرا
 
 ```bash
 python bale_bot.py
@@ -70,7 +107,7 @@ python bale_bot.py
 | `/help` | نمایش راهنمای کامل |
 | `/stats` | نمایش آمار کاربری |
 | `/cancel` | لغو عملیات جاری |
-| `/ocr` | (روی پیام عکس ریپلای کنید) استخراج متن |
+| `/ocr` | ریپلای روی عکس → استخراج متن |
 
 ---
 
@@ -78,61 +115,61 @@ python bale_bot.py
 
 ```ini
 [Unit]
-Description=Bale Web Assistant Bot
+Description=بله قربان Bot
 After=network.target
 
 [Service]
 Type=simple
 User=YOUR_USER
 WorkingDirectory=/path/to/bot
-Environment="BALE_TOKEN=your_token_here"
+EnvironmentFile=/path/to/bot/.env
 ExecStart=/usr/bin/python3 /path/to/bot/bale_bot.py
 Restart=always
 RestartSec=10
+StandardOutput=append:/var/log/bale_bot.log
+StandardError=append:/var/log/bale_bot.log
 
 [Install]
 WantedBy=multi-user.target
+```
+
+فایل `.env`:
+```bash
+BALE_TOKEN=your_token_here
+YOUTUBE_COOKIES_FILE=/path/yt_cookies.txt
+GITHUB_TOKEN=optional_token
 ```
 
 ```bash
 sudo systemctl enable bale-bot
 sudo systemctl start bale-bot
 sudo systemctl status bale-bot
+sudo journalctl -u bale-bot -f   # مشاهده لاگ
 ```
-
----
-
-## ⚙️ محدودیت‌ها
-
-- حداکثر حجم فایل ارسالی: **۵۰ مگابایت**
-- حداکثر حجم تصویر برای OCR: **۵ مگابایت**
-- حداکثر حجم تصویر آپلودی: **۱۰ مگابایت**
-- متن ترجمه: حداکثر **۵۰۰ کاراکتر** در هر درخواست (API رایگان)
 
 ---
 
 ## 🔧 ساختار فایل
 
 ```
-bale_bot.py       ← فایل اصلی ربات
-requirements.txt  ← کتابخانه‌های مورد نیاز
-README.md         ← این فایل
+bale_bot.py        ← فایل اصلی ربات (۳۱۰۰+ خط)
+requirements.txt   ← کتابخانه‌های مورد نیاز
+README.md          ← این فایل
+bale_bot.log       ← فایل لاگ (ایجاد می‌شود)
+tg_session.session ← نشست Telethon (ایجاد می‌شود)
 ```
 
 ---
 
-## 📝 نکات توسعه
+## 📊 معماری فنی
 
-- ربات از **Long Polling** استفاده می‌کند (نیازی به سرور با IP ثابت نیست)
-- برای استفاده از **Webhook** می‌توانید متد `setWebhook` را در API بله فعال کنید
-- API بله بر پایه API تلگرام طراحی شده — می‌توانید از کتابخانه‌های تلگرام نیز استفاده کنید
-
----
-
-## 📞 پشتیبانی
-
-در صورت مشکل، از بخش بازو در پشتیبانی بله استفاده کنید.
+- **Long Polling** — بدون نیاز به IP ثابت یا دامنه
+- **result_cache** — نتایج جستجو ذخیره موقت برای دکمه‌های callback
+- **url_cache** — ذخیره URL برای دکمه‌های site-view
+- **smart_send** — ارسال هوشمند با chunking 19MB (مطابق index.js)
+- **127+ log statement** — لاگ DEBUG کامل در stdout + فایل
+- **۵ استراتژی YouTube** — cookies، Invidious، pytubefix، cobalt، yt-dlp clients
 
 ---
 
-**© 1404 — دستیار وب برای بله**
+**© 1404 — بله قربان**

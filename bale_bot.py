@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-دستیار وب — Bale Bot  (v7)
+بله قربان — Bale Bot  (v5)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -342,14 +342,10 @@ def main_menu_kb():
          {"text": "🐦 توییتر / X",        "callback_data": "mode_twitter"}],
         [{"text": "📸 اینستاگرام",        "callback_data": "mode_instagram"},
          {"text": "🎵 تیک‌تاک",           "callback_data": "mode_tiktok"}],
-        [{"text": "🌐 ترجمه",             "callback_data": "mode_translate"},
-         {"text": "🖼 OCR متن از عکس",   "callback_data": "mode_ocr"}],
-        [{"text": "💱 تبدیل ارز",         "callback_data": "mode_currency"},
+        [{"text": "📰 اخبار RSS",         "callback_data": "mode_rss"},
+         {"text": "🌐 ترجمه",             "callback_data": "mode_translate"}],
+        [{"text": "🖼 OCR متن از عکس",   "callback_data": "mode_ocr"},
          {"text": "🌐 IP / دامنه",        "callback_data": "mode_iplookup"}],
-        [{"text": "🔗 کوتاه‌سازی لینک",  "callback_data": "mode_shorten"},
-         {"text": "📱 ساخت QR کد",        "callback_data": "mode_qr"}],
-        [{"text": "📋 اشتراک‌گذاری متن", "callback_data": "mode_paste"},
-         {"text": "🔍 باز کردن لینک",    "callback_data": "mode_expand"}],
         [{"text": "📊 آمار کاربری",       "callback_data": "stats"},
          {"text": "🔒 حریم خصوصی",       "callback_data": "privacy"}],
         [{"text": "❓ راهنما",             "callback_data": "help"}],
@@ -836,7 +832,7 @@ def youtube_search(query: str, max_results=8) -> list[dict]:
     try:
         result = subprocess.run(
             ["yt-dlp", "--flat-playlist", "--print",
-             "%(id)s|||%(title)s|||%(uploader)s|||%(duration_string)s",
+             "%(id)s|||%(title)s|||%(uploader)s|||%(duration_string)s|||%(thumbnail)s",
              f"ytsearch{max_results}:{query}", "--no-warnings",
              "--no-check-certificate"],
             capture_output=True, text=True, timeout=30,
@@ -851,6 +847,8 @@ def youtube_search(query: str, max_results=8) -> list[dict]:
                     "title": parts[1].strip(),
                     "uploader": parts[2].strip() if len(parts)>2 else "",
                     "duration":  parts[3].strip() if len(parts)>3 else "",
+                    "thumbnail": parts[4].strip() if len(parts)>4 else
+                                 f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg",
                     "url": f"https://www.youtube.com/watch?v={vid_id}",
                 })
         log.info("youtube_search: %d results", len(items))
@@ -1117,39 +1115,43 @@ def twitter_get_channel(username: str, limit: int = 20) -> list[dict]:
         try:
             r = WEB.get(url, headers={"User-Agent": UA_DESK,
                                        "Accept-Language": "en-US,en;q=0.9"},
-                        timeout=15)
+                        timeout=20)
             log.debug("nitter %s: status=%d len=%d", instance, r.status_code, len(r.text))
             if r.status_code != 200:
                 continue
             soup = BeautifulSoup(r.text, "html.parser")
             tweets = []
             for item in soup.select(".timeline-item")[:limit]:
-                # Skip pinned/retweet header
                 tweet_content = item.select_one(".tweet-content")
                 if not tweet_content:
                     continue
+                # Full text — no truncation
                 text = tweet_content.get_text("\n", strip=True)
                 date_el = item.select_one(".tweet-date a")
                 date = date_el.get("title", "") if date_el else ""
-                link_el = item.select_one(".tweet-date a")
-                tweet_path = link_el.get("href", "") if link_el else ""
+                tweet_path = date_el.get("href", "") if date_el else ""
                 tweet_url = f"https://twitter.com{tweet_path}" if tweet_path.startswith("/") else tweet_path
                 nitter_url = f"{instance}{tweet_path}" if tweet_path else ""
                 has_video = bool(item.select(".attachment.video-container, .gif"))
-                has_photo = bool(item.select(".attachment.image"))
+                # Collect all image URLs
+                img_tags = item.select(".still-image img, .attachment.image img")
+                img_urls = [img.get("src","") for img in img_tags if img.get("src")]
+                # Make absolute
+                img_urls = [f"{instance}{u}" if u.startswith("/") else u for u in img_urls]
                 tweets.append({
-                    "text": text[:500],
-                    "date": date[:16],
+                    "text": text,
+                    "date": date[:19].replace("T", " "),
                     "url": tweet_url,
                     "nitter_url": nitter_url,
                     "has_video": has_video,
-                    "has_photo": has_photo,
+                    "has_photo": bool(img_urls),
+                    "img_urls": img_urls,
                 })
             if tweets:
-                log.info("twitter_get_channel: %d tweets via %s", len(tweets), instance)
+                log.info("twitter: %d tweets via %s", len(tweets), instance)
                 return tweets
         except Exception as e:
-            log.warning("nitter %s failed: %s", instance, e)
+            log.warning("nitter %s: %s", instance, e)
     log.error("twitter_get_channel: all Nitter instances failed")
     return []
 
@@ -1229,23 +1231,26 @@ def instagram_get_profile(username: str) -> list[dict]:
     log.info("instagram_get_profile: @%s", username)
     try:
         import instaloader
-        L = instaloader.Instaloader(quiet=True)
+        L = instaloader.Instaloader(quiet=True, download_pictures=False)
         if INSTAGRAM_USER and INSTAGRAM_PASS:
             try:
                 L.login(INSTAGRAM_USER, INSTAGRAM_PASS)
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("instaloader login failed: %s", e)
         profile = instaloader.Profile.from_username(L.context, username.lstrip("@"))
         posts = []
         for post in profile.get_posts():
+            # Get display URL (thumbnail for images/videos)
+            display_url = getattr(post, "url", "") or getattr(post, "display_url", "")
             posts.append({
                 "url": f"https://www.instagram.com/p/{post.shortcode}/",
                 "shortcode": post.shortcode,
-                "text": (post.caption or "")[:300],
+                "text": post.caption or "",   # Full caption — no truncation
                 "date": str(post.date_local)[:16],
                 "is_video": post.is_video,
                 "likes": post.likes,
                 "typename": post.typename,
+                "display_url": display_url,
             })
             if len(posts) >= 12:
                 break
@@ -1264,13 +1269,13 @@ def tiktok_download(url: str) -> Optional[tuple[bytes, str]]:
 
 
 def tiktok_user_videos(username: str, limit: int = 10) -> list[dict]:
-    """Get TikTok user video list via yt-dlp flat extraction."""
+    """Get TikTok user video list with thumbnails via yt-dlp flat extraction."""
     log.info("tiktok_user_videos: @%s", username)
     username = username.lstrip("@")
     try:
         result = subprocess.run(
             ["yt-dlp", "--flat-playlist", "--no-warnings", "--no-check-certificate",
-             "--print", "%(id)s|||%(title)s|||%(duration_string)s|||%(url)s",
+             "--print", "%(id)s|||%(title)s|||%(duration_string)s|||%(url)s|||%(thumbnail)s",
              f"https://www.tiktok.com/@{username}"],
             capture_output=True, text=True, timeout=30,
         )
@@ -1285,6 +1290,7 @@ def tiktok_user_videos(username: str, limit: int = 10) -> list[dict]:
                     "duration": parts[2].strip() if len(parts)>2 else "",
                     "url": parts[3].strip() if len(parts)>3 else
                            f"https://www.tiktok.com/@{username}/video/{vid_id}",
+                    "thumbnail": parts[4].strip() if len(parts)>4 else "",
                 })
             if len(items) >= limit:
                 break
@@ -1667,9 +1673,106 @@ def generate_qr(text: str) -> Optional[bytes]:
         log.error("generate_qr: %s", e)
         return None
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# USER STATE HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── RSS ──────────────────────────────────────────────────────────────────────
+def rss_fetch(url: str, limit: int = 15) -> list[dict]:
+    """
+    Fetch and parse an RSS/Atom feed. Returns list of items with:
+    title, link, summary, published, img_url.
+    """
+    log.info("rss_fetch: %s", url)
+    try:
+        r = WEB.get(url, headers={"User-Agent": UA_DESK}, timeout=20)
+        log.debug("rss_fetch: status=%d len=%d", r.status_code, len(r.content))
+        if r.status_code != 200:
+            return []
+        soup = BeautifulSoup(r.content, "xml")
+
+        # Detect feed type
+        items_sel = soup.select("item") or soup.select("entry")
+        items = []
+        for it in items_sel[:limit]:
+            # Title
+            title = (it.find("title") or {}).get_text(strip=True) if it.find("title") else ""
+            # Link
+            link_tag = it.find("link")
+            if link_tag:
+                link = link_tag.get("href") or link_tag.get_text(strip=True)
+            else:
+                link = ""
+            # Summary / description
+            summary_tag = it.find("summary") or it.find("description") or \
+                          it.find("content") or it.find("content:encoded")
+            raw_summary = summary_tag.get_text(strip=True) if summary_tag else ""
+            # Strip HTML from summary
+            summary_soup = BeautifulSoup(raw_summary, "html.parser")
+            summary = summary_soup.get_text(" ", strip=True)[:600]
+            # Published date
+            pub_tag = it.find("pubDate") or it.find("published") or it.find("updated")
+            published = pub_tag.get_text(strip=True)[:25] if pub_tag else ""
+            # Image URL — try media:thumbnail, enclosure, og:image
+            img_url = ""
+            media = it.find("media:thumbnail") or it.find("media:content")
+            if media:
+                img_url = media.get("url", "")
+            if not img_url:
+                enc = it.find("enclosure", type=lambda t: t and "image" in t)
+                if enc:
+                    img_url = enc.get("url", "")
+            if not img_url and summary_tag:
+                img_tag = BeautifulSoup(str(summary_tag), "html.parser").find("img")
+                if img_tag:
+                    img_url = img_tag.get("src", "")
+
+            items.append({
+                "title": title,
+                "link": link,
+                "summary": summary,
+                "published": published,
+                "img_url": img_url,
+            })
+        log.info("rss_fetch: %d items", len(items))
+        return items
+    except Exception as e:
+        log.error("rss_fetch: %s", e, exc_info=True)
+        return []
+
+
+def rss_search_feeds(site_url: str) -> list[str]:
+    """Try to auto-discover RSS feed URLs from a website."""
+    log.info("rss_search_feeds: %s", site_url)
+    found = []
+    try:
+        r = WEB.get(site_url, headers={"User-Agent": UA_DESK}, timeout=15)
+        soup = BeautifulSoup(r.content, "html.parser")
+        # Look for <link rel="alternate" type="application/rss+xml">
+        for link in soup.find_all("link", rel="alternate"):
+            t = link.get("type", "")
+            if "rss" in t or "atom" in t:
+                href = link.get("href", "")
+                if href:
+                    if not href.startswith("http"):
+                        base = urllib.parse.urlparse(site_url)
+                        href = f"{base.scheme}://{base.netloc}{href}"
+                    found.append(href)
+        # Common feed paths
+        if not found:
+            base = site_url.rstrip("/")
+            for path in ["/feed", "/rss", "/feed.xml", "/atom.xml", "/rss.xml"]:
+                candidate = base + path
+                try:
+                    pr = WEB.head(candidate, timeout=8)
+                    ct = pr.headers.get("content-type", "")
+                    if pr.status_code == 200 and ("xml" in ct or "rss" in ct or "atom" in ct):
+                        found.append(candidate)
+                except Exception:
+                    pass
+    except Exception as e:
+        log.error("rss_search_feeds: %s", e)
+    log.info("rss_search_feeds: found %d feeds", len(found))
+    return found[:5]
+
+
 def init_user(cid: int):
     if cid not in user_stats:
         user_stats[cid] = {"requests":0,"joined":datetime.now().strftime("%Y-%m-%d"),
@@ -1692,26 +1795,30 @@ def clear_state(cid: int):
 # ═══════════════════════════════════════════════════════════════════════════════
 # STATIC TEXTS
 # ═══════════════════════════════════════════════════════════════════════════════
-HELP_TEXT = """❓ *راهنمای دستیار وب*
+HELP_TEXT = """❓ *راهنمای بله قربان*
 
-🔎 *جستجو در وب* — نتایج به‌صورت دکمه، کلیک برای باز کردن
-🌐 *مشاهده سایت* — اسکرین‌شات + دکمه‌های متن / HTML / ZIP / PDF
+🔎 *جستجو در وب* — نتایج قابل کلیک از DuckDuckGo با صفحه‌بندی
+🌐 *مشاهده سایت* — اسکرین‌شات ۱۹۲۰×۱۰۸۰ + دکمه‌های متن / HTML / ZIP / PDF
 📚 *مقاله علمی* — Google Scholar با صفحه‌بندی
 📖 *ویکی‌پدیا* — جستجو + خواندن مقاله کامل
-📺 *یوتیوب* — جستجو (نتایج قابل کلیک) یا دانلود ویدیو
-🎵 *موسیقی MP3* — جستجو و دانلود MP3
-🖼 *دانلود عکس* — Bing / Pinterest / Pixabay / Wikimedia
-🐙 *GitHub* — جستجوی مخازن / دانلود ZIP / آخرین Release
+📺 *یوتیوب* — جستجو (تامبنیل + دانلود)، ارسال لینک مستقیم هم کار می‌کند
+🎵 *موسیقی MP3* — دانلود صوتی از یوتیوب
+🖼 *دانلود عکس* — Bing / Pinterest / Pixabay / Wikimedia با دانلود بیشتر
+🐙 *GitHub* — جستجوی مخازن / ZIP / دانلود Release
+✈️ *کانال تلگرام* — پیام‌های کانال عمومی یا با MTProto
+🐦 *توییتر/X* — تایم‌لاین کاربر + دانلود ویدیو/عکس خودکار
+📸 *اینستاگرام* — پست‌های پروفایل + دانلود ریل/عکس خودکار
+🎵 *تیک‌تاک* — لیست ویدیوها + دانلود (لینک مستقیم هم کار می‌کند)
+📰 *اخبار RSS* — دریافت فید + کشف خودکار فید سایت
 🌐 *ترجمه* — ۶ زبان، متن طولانی
 🖼 *OCR* — استخراج متن از عکس + PDF
-💱 *تبدیل ارز* — مثال: `100 USD to IRR`
-🌐 *IP/دامنه* — اطلاعات موقعیت
-🔗 *کوتاه‌سازی لینک* — TinyURL
-📱 *QR کد* — از هر متن یا لینک
-📋 *اشتراک متن* — paste.rs
-🔒 *حریم خصوصی* — توضیح کامل"""
+🌐 *IP/دامنه* — اطلاعات موقعیت و اپراتور
 
-PRIVACY_TEXT = """🔒 *حریم خصوصی دستیار وب*
+💡 *لینک مستقیم* ارسال کنید — ربات خودکار تشخیص می‌دهد:
+یوتیوب / تیک‌تاک / توییتر / اینستاگرام / تلگرام → دانلود
+سایر لینک‌ها → اسکرین‌شات + گزینه‌های بیشتر"""
+
+PRIVACY_TEXT = """🔒 *حریم خصوصی بله قربان*
 
 این ربات هیچ پیام، جستجو یا فایلی از شما را *ذخیره نمی‌کند*.
 
@@ -1808,6 +1915,10 @@ def do_wiki_article(cid: int, title: str, lang: str):
                       caption="📄 متن کامل مقاله")
     send_message(cid, "✅", reply_markup=home_kb())
     clear_state(cid)
+
+def _is_youtube(url: str) -> bool:
+    return any(x in url for x in ["youtube.com/watch", "youtu.be/", "youtube.com/shorts/",
+                                    "youtube.com/live/", "m.youtube.com"])
 
 def do_open_url(cid: int, url: str):
     bump(cid, "downloads")
@@ -2072,6 +2183,97 @@ def do_qr(cid: int, text: str):
 # SOCIAL MEDIA HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def do_rss(cid: int, query: str):
+    """Handle RSS input: URL → fetch feed; non-URL → search for feeds on site."""
+    bump(cid, "searches")
+    chat_action(cid)
+
+    if query.startswith("http"):
+        # Direct RSS URL or website URL → auto-discover
+        if not any(x in query for x in ["rss", "feed", "atom", "xml"]):
+            send_message(cid, "🔍 در حال جستجوی RSS در سایت…")
+            feeds = rss_search_feeds(query)
+            if not feeds:
+                # Try the URL itself as a feed
+                feeds = [query]
+            if len(feeds) > 1:
+                rows = [[{"text": f"📰 {f[:50]}", "callback_data": f"rss_url_{store_url(f)}"}]
+                        for f in feeds[:5]]
+                rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+                send_message(cid, f"📰 {len(feeds)} فید یافت شد:",
+                             reply_markup={"inline_keyboard": rows})
+                return
+            query = feeds[0]
+
+        # Fetch the feed
+        send_message(cid, f"⏳ در حال دریافت فید RSS…")
+        items = rss_fetch(query, 15)
+        if not items:
+            send_message(cid,
+                "❌ فید یافت نشد یا معتبر نیست.\n"
+                "آدرس فید RSS را مستقیم وارد کنید (مثال: https://example.com/rss)",
+                reply_markup=home_kb())
+            return
+        key = make_cache_key("rss", query, 0)
+        cache_set(key, items)
+        store_url(query)
+        set_state(cid, mode="rss", last_query=query, cache_key=key)
+        _display_rss_list(cid, items, key)
+    else:
+        # Non-URL: treat as search query for news
+        send_message(cid,
+            "📰 آدرس فید RSS یا سایت خبری را وارد کنید:\n\n"
+            "مثال‌ها:\n"
+            "• `https://www.bbc.com/persian/index.xml`\n"
+            "• `https://www.isna.ir` ← کشف خودکار\n"
+            "• `https://feeds.bbci.co.uk/news/rss.xml`",
+            parse_mode="Markdown", reply_markup=cancel_kb())
+
+
+def _display_rss_list(cid: int, items: list, key: str):
+    """Show RSS items as clickable buttons."""
+    rows = []
+    for i, item in enumerate(items[:15]):
+        title = item.get("title", f"خبر {i+1}")[:45]
+        rows.append([{"text": f"📰 {title}", "callback_data": f"rss_item_{key}_{i}"}])
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+    send_message(cid, f"📰 *{len(items)} خبر دریافت شد:*\nروی هر خبر کلیک کنید:",
+                 parse_mode="Markdown",
+                 reply_markup={"inline_keyboard": rows})
+
+
+def _show_rss_item(cid: int, item: dict):
+    """Display a single RSS item with full text and auto-send image."""
+    title = item.get("title", "")
+    link  = item.get("link", "")
+    summary = item.get("summary", "")
+    published = item.get("published", "")
+    img_url = item.get("img_url", "")
+
+    lines = [f"📰 *{title}*" if title else ""]
+    if published:
+        lines.append(f"🕐 {published[:19]}")
+    if summary:
+        lines.append(f"\n{summary}")
+    if link:
+        lines.append(f"\n[🔗 متن کامل]({link})")
+
+    # Auto-download and send image if available
+    if img_url:
+        try:
+            img_bytes = download_bytes(img_url, MAX_IMAGE_SIZE)
+            if img_bytes and len(img_bytes) > 500:
+                send_photo(cid, img_bytes, caption=title[:80] if title else "")
+        except Exception as e:
+            log.warning("rss img: %s", e)
+
+    text = "\n".join(l for l in lines if l)
+    url_key = store_url(link) if link else ""
+    kb = site_view_kb(url_key) if url_key else home_kb()
+    send_message(cid, text or "_(خبر بدون متن)_",
+                 parse_mode="Markdown", reply_markup=kb)
+
+
 def do_tg_read(cid: int, channel: str, use_mtproto: bool = False):
     """Read Telegram channel messages and show as clickable buttons."""
     bump(cid, "searches")
@@ -2171,23 +2373,38 @@ def do_twitter_timeline(cid: int, username: str):
 
 
 def do_twitter_show(cid: int, tweet: dict):
-    """Display a single tweet with download option."""
-    text    = tweet.get("text", "")
-    date    = tweet.get("date", "")
-    url     = tweet.get("url", "")
-    has_vid = tweet.get("has_video")
-    has_img = tweet.get("has_photo")
-    has_media = has_vid or has_img
+    """Display tweet, auto-download photos, show video download button."""
+    text      = tweet.get("text", "")
+    date      = tweet.get("date", "")
+    url       = tweet.get("url", "")
+    has_vid   = tweet.get("has_video", False)
+    img_urls  = tweet.get("img_urls", [])
 
     lines = []
     if date:
         lines.append(f"🕐 {date}")
-    lines.append(f"\n{text}" if text else "_(توییت بدون متن)_")
+    if text:
+        lines.append(f"\n{text}")
     if url:
         lines.append(f"\n[🔗 لینک توییت]({url})")
 
-    kb = social_post_kb(url, "tw", has_media) if url else home_kb()
-    send_message(cid, "\n".join(lines), parse_mode="Markdown", reply_markup=kb)
+    send_message(cid, "\n".join(lines) or "_(توییت بدون متن)_", parse_mode="Markdown")
+
+    # Auto-download and send images
+    for img_url in img_urls[:4]:
+        try:
+            img_bytes = download_bytes(img_url, MAX_IMAGE_SIZE)
+            if img_bytes and len(img_bytes) > 500:
+                send_photo(cid, img_bytes, caption="🐦")
+        except Exception as e:
+            log.warning("twitter img dl: %s", e)
+
+    # Show video download button if has video
+    kb = social_post_kb(url, "tw", has_vid) if url else home_kb()
+    if has_vid or not img_urls:
+        send_message(cid, "👆", reply_markup=kb)
+    else:
+        send_message(cid, "✅", reply_markup=home_kb())
 
 
 def do_twitter_dl(cid: int, url: str):
@@ -2294,7 +2511,7 @@ def handle_message(msg: dict):
     if text.startswith("/start"):
         clear_state(cid)
         send_message(cid,
-            "👋 سلام! به *دستیار وب* خوش آمدید.\n"
+            "👋 سلام! به *بله قربان* خوش آمدید.\n"
             "یکی از گزینه‌های زیر را انتخاب کنید:",
             parse_mode="Markdown", reply_markup=main_menu_kb())
         return
@@ -2353,18 +2570,22 @@ def handle_message(msg: dict):
         "ig_dl":        lambda: do_instagram_dl(cid, text),
         "tt_user":      lambda: do_tiktok_user(cid, text),
         "tt_dl":        lambda: do_tiktok_dl(cid, text),
+        # RSS
+        "rss":          lambda: do_rss(cid, text),
     }
     if mode in dispatch:
         dispatch[mode]()
     elif text.startswith("http"):
-        # Smart URL detection for social media links
-        if any(x in text for x in ["tiktok.com", "vm.tiktok.com"]):
+        # Smart URL detection — route to correct handler automatically
+        if _is_youtube(text):
+            do_youtube_dl(cid, text)
+        elif any(x in text for x in ["tiktok.com", "vm.tiktok.com"]):
             do_tiktok_dl(cid, text)
         elif any(x in text for x in ["twitter.com", "x.com", "t.co"]):
             do_twitter_dl(cid, text)
         elif "instagram.com" in text:
             do_instagram_dl(cid, text)
-        elif "t.me" in text:
+        elif "t.me/" in text:
             do_tg_dl_media(cid, text)
         else:
             do_open_url(cid, text)
@@ -2413,12 +2634,8 @@ def handle_callback(cb: dict):
         "mode_scholar":   ("scholar",   "📚 عنوان یا کلمه‌کلیدی مقاله:"),
         "mode_wiki":      ("wiki",      "📖 موضوع ویکی‌پدیا:"),
         "mode_music":     ("music",     "🎵 نام آهنگ یا آرتیست:"),
-        "mode_currency":  ("currency",  "💱 مثال: 100 USD to IRR"),
         "mode_iplookup":  ("iplookup",  "🌐 آدرس IP یا دامنه:"),
-        "mode_shorten":   ("shorten",   "🔗 لینک بلند:"),
-        "mode_expand":    ("expand",    "🔍 لینک کوتاه:"),
-        "mode_paste":     ("paste",     "📋 متن مورد نظر را ارسال کنید:"),
-        "mode_qr":        ("qr",        "📱 متن یا لینک برای QR کد:"),
+        "mode_rss":       ("rss",       "📰 آدرس فید RSS یا سایت خبری را وارد کنید:"),
     }
     if data in mode_prompts:
         mode, prompt = mode_prompts[data]
@@ -2456,6 +2673,23 @@ def handle_callback(cb: dict):
         if not results or idx >= len(results):
             send_message(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید."); return
         vid = results[idx]
+
+        # Send thumbnail first
+        thumb_url = vid.get("thumbnail") or \
+                    f"https://i.ytimg.com/vi/{vid.get('id','')}/hqdefault.jpg"
+        if thumb_url:
+            try:
+                thumb = download_bytes(thumb_url, MAX_IMAGE_SIZE)
+                if thumb:
+                    uploader = vid.get("uploader","")
+                    dur = vid.get("duration","")
+                    caption = f"📺 {vid['title']}"
+                    if uploader: caption += f"\n🎬 {uploader}"
+                    if dur:      caption += f"\n⏱ {dur}"
+                    send_photo(cid, thumb, caption=caption)
+            except Exception as e:
+                log.warning("yt thumb: %s", e)
+
         send_message(cid, f"⏳ دانلود: _{vid['title']}_…", parse_mode="Markdown")
         chat_action(cid, "upload_video")
         result = youtube_download(vid["url"], audio_only=False)
@@ -2582,6 +2816,45 @@ def handle_callback(cb: dict):
         source, key, page = m.group(1), m.group(2), int(m.group(3))
         query = st.get("last_query","")
         do_images(cid, query, source, page); return
+
+    # ── RSS callbacks ─────────────────────────────────────────────────────
+    if data == "mode_rss" or data.startswith("rss_"):
+        if data == "mode_rss":
+            set_state(cid, mode="rss")
+            send_message(cid,
+                "📰 آدرس فید RSS یا سایت خبری را وارد کنید:\n\n"
+                "مثال‌ها:\n"
+                "• `https://www.bbc.com/persian/index.xml`\n"
+                "• `https://www.isna.ir` ← کشف خودکار",
+                parse_mode="Markdown", reply_markup=cancel_kb())
+            return
+
+        # rss_url_{url_key}  — user picked a discovered feed
+        m = re.match(r"rss_url_(\w+)$", data)
+        if m:
+            url_key = m.group(1)
+            url = get_url(url_key)
+            if not url:
+                send_message(cid, "❌ لینک منقضی."); return
+            send_message(cid, "⏳ دریافت فید…")
+            items = rss_fetch(url, 15)
+            if not items:
+                send_message(cid, "❌ فید خالی یا نامعتبر.", reply_markup=home_kb()); return
+            key = make_cache_key("rss", url, 0)
+            cache_set(key, items)
+            set_state(cid, mode="rss", last_query=url, cache_key=key)
+            _display_rss_list(cid, items, key)
+            return
+
+        # rss_item_{cache_key}_{idx}
+        m = re.match(r"rss_item_(\w+)_(\d+)$", data)
+        if m:
+            key, idx = m.group(1), int(m.group(2))
+            items = cache_get(key)
+            if not items or idx >= len(items):
+                send_message(cid, "❌ خبر منقضی."); return
+            _show_rss_item(cid, items[idx])
+            return
 
     # ── Site view buttons ─────────────────────────────────────────────────
     m = re.match(r"site_(text|html|zip|pdf)_(\w+)$", data)
@@ -2775,27 +3048,60 @@ def handle_callback(cb: dict):
         elif platform == "tw":
             do_twitter_show(cid, item)
         elif platform == "ig":
-            # Show post info + download button
             url = item.get("url", "")
-            text = item.get("text", "")[:300]
+            text = item.get("text", "")       # full caption
             date = item.get("date", "")
             is_vid = item.get("is_video", False)
             likes = item.get("likes", 0)
-            lines = [f"📸 {'🎬 ریل' if is_vid else '🖼 پست'}",
-                     f"❤️ {likes:,}" if likes else "",
-                     f"🕐 {date}" if date else "",
-                     f"\n{text}" if text else "",
-                     f"\n[🔗 لینک]({url})" if url else ""]
+            display_url = item.get("display_url", "")
+
+            # Build caption
+            lines = [f"📸 {'🎬 ریل/ویدیو' if is_vid else '🖼 پست'}"]
+            if likes:
+                lines.append(f"❤️ {likes:,}")
+            if date:
+                lines.append(f"🕐 {date}")
+            if text:
+                lines.append(f"\n{text}")
+            if url:
+                lines.append(f"\n[🔗 لینک]({url})")
+            send_message(cid, "\n".join(l for l in lines if l), parse_mode="Markdown")
+
+            # Auto-download thumbnail/image
+            if display_url and not is_vid:
+                try:
+                    img_bytes = download_bytes(display_url, MAX_IMAGE_SIZE)
+                    if img_bytes and len(img_bytes) > 500:
+                        send_photo(cid, img_bytes, caption="📸")
+                except Exception as e:
+                    log.warning("ig thumb dl: %s", e)
+
+            # Download button for video or full quality
             kb = social_post_kb(url, "ig", True) if url else home_kb()
-            send_message(cid, "\n".join(l for l in lines if l),
-                         parse_mode="Markdown", reply_markup=kb)
+            send_message(cid,
+                         "📥 دانلود ویدیو?" if is_vid else "📥 دانلود نسخه کامل؟",
+                         reply_markup=kb)
         elif platform == "tt":
-            url = item.get("url", "")
-            title = item.get("title", "")
-            dur = item.get("duration", "")
-            text = f"🎵 *{title}*\n⏱ {dur}\n[🔗 لینک]({url})"
+            url       = item.get("url", "")
+            title     = item.get("title", "")
+            dur       = item.get("duration", "")
+            thumbnail = item.get("thumbnail", "")
+            text = f"🎵 *{title}*"
+            if dur:
+                text += f"\n⏱ {dur}"
+            if url:
+                text += f"\n[🔗 لینک]({url})"
+            send_message(cid, text, parse_mode="Markdown")
+            # Auto-download thumbnail
+            if thumbnail:
+                try:
+                    thumb_bytes = download_bytes(thumbnail, MAX_IMAGE_SIZE)
+                    if thumb_bytes and len(thumb_bytes) > 500:
+                        send_photo(cid, thumb_bytes, caption="🎵")
+                except Exception as e:
+                    log.warning("tt thumb dl: %s", e)
             kb = social_post_kb(url, "tt", True) if url else home_kb()
-            send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
+            send_message(cid, "📥 دانلود ویدیو؟", reply_markup=kb)
         return
 
     # ── Social media download button: soc_dl_{platform}_{url_key} ────────
