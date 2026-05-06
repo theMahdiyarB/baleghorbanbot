@@ -11,6 +11,7 @@ yt-dlp>=2024.1.0
 fpdf2>=2.7.9
 qrcode[pil]>=8.0
 playwright>=1.40.0
+shot-scraper>=1.5.0
 telethon>=1.43.0
 instaloader>=4.10.0
 pytubefix>=6.0.0
@@ -19,3 +20,4 @@ pytubefix>=6.0.0
 # sudo apt-get install -y tesseract-ocr tesseract-ocr-fas ffmpeg wkhtmltopdf
 # python -m playwright install chromium
 # python -m playwright install-deps chromium
+# shot-scraper install     ← installs its own Chromium browser

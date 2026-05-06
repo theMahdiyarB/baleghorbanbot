@@ -609,68 +609,114 @@ def fetch_page(url: str) -> Optional[bytes]:
     except Exception as e:
         log.error("fetch_page: %s", e, exc_info=True); return None
 
+
+# JS injected before every screenshot/PDF to remove popups, banners, paywalls
+_CLEANUP_JS = """
+(function() {
+  // ── Remove popup/overlay/cookie/chat elements ────────────────────────────
+  const badSelectors = [
+    '[class*="cookie"]','[id*="cookie"]',
+    '[class*="consent"]','[id*="consent"]',
+    '[class*="gdpr"]','[id*="gdpr"]',
+    '[class*="banner"]','[id*="banner"]',
+    '[class*="popup"]','[id*="popup"]',
+    '[class*="modal"]','[id*="modal"]',
+    '[class*="overlay"]','[id*="overlay"]',
+    '[class*="paywall"]','[id*="paywall"]',
+    '[class*="subscribe"]','[id*="subscribe"]',
+    '[class*="newsletter"]','[id*="newsletter"]',
+    '[class*="chat"]','[id*="chat"]',
+    '[class*="tawk"]','[id*="tawk"]',
+    '[class*="intercom"]','[id*="intercom"]',
+    '[class*="zendesk"]','[id*="zendesk"]',
+    '[class*="drift"]','[id*="drift"]',
+    '[class*="crisp"]','[id*="crisp"]',
+    '[class*="freshchat"]',
+    '.fc-dialog-container','.qc-cmp2-container',
+    '#onetrust-banner-sdk','#onetrust-accept-btn-handler',
+    '.cc-banner','.cc-window',
+    '.pum-overlay','.pum-container',
+    '[id*="sp_message"]','[class*="sp_message"]',
+  ];
+  badSelectors.forEach(sel => {
+    try { document.querySelectorAll(sel).forEach(el => el.remove()); } catch(e) {}
+  });
+  // ── Remove fixed/sticky elements (nav bars, floating buttons, bars) ──────
+  document.querySelectorAll('*').forEach(el => {
+    const s = window.getComputedStyle(el);
+    if ((s.position === 'fixed' || s.position === 'sticky') &&
+        (parseInt(s.zIndex) > 100 || s.zIndex === 'auto')) {
+      const rect = el.getBoundingClientRect();
+      // Only remove elements that cover more than 30% width (real banners)
+      if (rect.width > window.innerWidth * 0.3 &&
+          (rect.top < 100 || rect.bottom > window.innerHeight - 100)) {
+        el.remove();
+      }
+    }
+  });
+  // ── Restore scroll, remove overflow:hidden on body/html ─────────────────
+  document.body.style.overflow = 'auto';
+  document.documentElement.style.overflow = 'auto';
+  document.body.style.position = '';
+  // ── Fix font rendering ───────────────────────────────────────────────────
+  document.body.style.webkitFontSmoothing = 'antialiased';
+  document.body.style.textRendering = 'optimizeLegibility';
+})();
+"""
+
 def screenshot_page(url: str) -> Optional[bytes]:
     """
-    Full-page scrolling screenshot using Playwright.
-    Takes viewport-height screenshots while scrolling, stitches them vertically.
-    Returns JPEG bytes.
+    1920×1080 screenshot via shot-scraper with popup/banner removal.
+    Falls back to playwright if shot-scraper unavailable.
     """
     log.info("screenshot_page: %s", url)
     try:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
+            out = tf.name
+        cmd = [
+            "shot-scraper", "shot", url,
+            "-o", out,
+            "--width", "1920",
+            "--height", "1080",
+            "--quality", "85",
+            "--wait", "2000",
+            "--javascript", _CLEANUP_JS,
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=45)
+        if result.returncode == 0 and Path(out).exists() and Path(out).stat().st_size > 1000:
+            data = Path(out).read_bytes()
+            Path(out).unlink(missing_ok=True)
+            log.info("screenshot_page (shot-scraper): %dKB", len(data)//1024)
+            return data
+        log.warning("shot-scraper rc=%d: %s", result.returncode,
+                    result.stderr.decode(errors="replace")[:200])
+        Path(out).unlink(missing_ok=True)
+    except FileNotFoundError:
+        log.warning("shot-scraper not found, falling back to playwright")
+    except subprocess.TimeoutExpired:
+        log.warning("screenshot_page: shot-scraper timed out")
+    except Exception as e:
+        log.error("screenshot_page shot-scraper: %s", e)
+
+    # Fallback: playwright
+    try:
         from playwright.sync_api import sync_playwright
-        VW, VH = 1280, 900
         with sync_playwright() as p:
             browser = p.chromium.launch(args=[
                 "--no-sandbox", "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage", "--disable-gpu",
             ])
-            page = browser.new_page(viewport={"width": VW, "height": VH})
+            page = browser.new_page(viewport={"width": 1920, "height": 1080})
             page.goto(url, timeout=25000, wait_until="domcontentloaded")
-            time.sleep(2)  # wait for JS
-
-            # Get full page height
-            full_h = page.evaluate("document.body.scrollHeight")
-            full_h = min(full_h, 12000)  # cap at ~12000px
-            log.debug("screenshot: page height=%dpx", full_h)
-
-            # Scroll and capture strips
-            strips: list[bytes] = []
-            y = 0
-            while y < full_h:
-                page.evaluate(f"window.scrollTo(0, {y})")
-                time.sleep(0.3)
-                strip = page.screenshot(type="jpeg", quality=75, clip={
-                    "x": 0, "y": 0, "width": VW, "height": VH,
-                })
-                strips.append(strip)
-                y += VH
-                if len(strips) >= 15:  # max 15 strips = ~13500px
-                    break
-
+            time.sleep(2)
+            page.evaluate(_CLEANUP_JS)
+            img = page.screenshot(type="jpeg", quality=85,
+                                   clip={"x":0,"y":0,"width":1920,"height":1080})
             browser.close()
-
-        if not strips:
-            return None
-
-        # Stitch strips vertically using Pillow
-        images = [Image.open(io.BytesIO(s)) for s in strips]
-        total_h = sum(im.height for im in images)
-        stitched = Image.new("RGB", (VW, total_h))
-        offset = 0
-        for im in images:
-            stitched.paste(im, (0, offset))
-            offset += im.height
-
-        # Encode final image
-        out = io.BytesIO()
-        stitched.save(out, format="JPEG", quality=75, optimize=True)
-        out.seek(0)
-        result = out.read()
-        log.info("screenshot_page: stitched %d strips → %dKB", len(strips), len(result)//1024)
-        return result
-
+        log.info("screenshot_page (playwright fallback): %dKB", len(img)//1024)
+        return img
     except Exception as e:
-        log.error("screenshot_page error: %s", e, exc_info=True)
+        log.error("screenshot_page playwright: %s", e, exc_info=True)
         return None
 
 def page_to_zip(url: str) -> Optional[bytes]:
@@ -703,36 +749,86 @@ def page_to_text(url: str) -> str:
     return "\n".join(lines[:100])
 
 def page_to_pdf(url: str) -> Optional[bytes]:
-    """Generate PDF using wkhtmltopdf if available, else return HTML."""
+    """
+    Generate a full-page PDF via shot-scraper (uses Playwright's print-to-PDF
+    internally — captures the entire scrollable page as a proper multi-page PDF).
+    Falls back to wkhtmltopdf, then raw HTML.
+    """
     log.info("page_to_pdf: %s", url)
+
+    # Strategy 1: shot-scraper pdf (best — full page, proper PDF, popup removal)
     try:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
             out = tf.name
-        result = subprocess.run(
-            ["wkhtmltopdf",
-             "--quiet",
-             "--load-error-handling", "ignore",
-             "--load-media-error-handling", "ignore",
-             "--no-stop-slow-scripts",
-             "--javascript-delay", "2000",
-             "--page-size", "A4",
-             "--encoding", "utf-8",
-             url, out],
+        cmd = [
+            "shot-scraper", "pdf", url,
+            "-o", out,
+            "--wait", "2000",
+            "--javascript", _CLEANUP_JS,
+            "--media-screen",        # use screen CSS (better fonts/colors)
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=60)
+        if result.returncode == 0 and Path(out).exists() and Path(out).stat().st_size > 500:
+            data = Path(out).read_bytes()
+            Path(out).unlink(missing_ok=True)
+            log.info("page_to_pdf (shot-scraper): %dKB", len(data)//1024)
+            return data
+        log.warning("shot-scraper pdf rc=%d: %s", result.returncode,
+                    result.stderr.decode(errors="replace")[:200])
+        Path(out).unlink(missing_ok=True)
+    except FileNotFoundError:
+        log.warning("shot-scraper not found for PDF")
+    except subprocess.TimeoutExpired:
+        log.warning("page_to_pdf: shot-scraper timed out")
+    except Exception as e:
+        log.error("page_to_pdf shot-scraper: %s", e)
+
+    # Strategy 2: Playwright print-to-PDF directly
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(args=[
+                "--no-sandbox", "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage", "--disable-gpu",
+            ])
+            page = browser.new_page(viewport={"width": 1920, "height": 1080})
+            page.goto(url, timeout=30000, wait_until="networkidle")
+            time.sleep(2)
+            page.evaluate(_CLEANUP_JS)
+            pdf_bytes = page.pdf(
+                format="A4",
+                print_background=True,
+                margin={"top":"10mm","bottom":"10mm","left":"10mm","right":"10mm"},
+            )
+            browser.close()
+        if pdf_bytes and len(pdf_bytes) > 500:
+            log.info("page_to_pdf (playwright): %dKB", len(pdf_bytes)//1024)
+            return pdf_bytes
+    except Exception as e:
+        log.warning("page_to_pdf playwright: %s", e)
+
+    # Strategy 3: wkhtmltopdf
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+            out = tf.name
+        subprocess.run(
+            ["wkhtmltopdf","--quiet",
+             "--load-error-handling","ignore","--no-stop-slow-scripts",
+             "--javascript-delay","2000","--page-size","A4",
+             "--encoding","utf-8", url, out],
             capture_output=True, timeout=60,
         )
         if Path(out).exists() and Path(out).stat().st_size > 500:
             data = Path(out).read_bytes()
             Path(out).unlink(missing_ok=True)
-            log.info("page_to_pdf: %dKB", len(data)//1024)
+            log.info("page_to_pdf (wkhtmltopdf): %dKB", len(data)//1024)
             return data
-        log.warning("wkhtmltopdf rc=%d stderr=%s", result.returncode,
-                    result.stderr.decode()[:300])
         Path(out).unlink(missing_ok=True)
-    except subprocess.TimeoutExpired:
-        log.warning("page_to_pdf: wkhtmltopdf timed out — falling back to HTML")
     except Exception as e:
-        log.error("page_to_pdf: %s", e)
-    return fetch_page(url)  # fallback: raw HTML
+        log.error("page_to_pdf wkhtmltopdf: %s", e)
+
+    log.warning("page_to_pdf: all strategies failed, returning raw HTML")
+    return fetch_page(url)
 
 # ─── Scholar ──────────────────────────────────────────────────────────────────
 def scholar_search(query: str, page=0) -> list[dict]:
@@ -1002,7 +1098,7 @@ def social_download_ytdlp(url: str, audio_only=False,
 def tg_channel_read_web(channel: str, limit: int = 20) -> list[dict]:
     """
     Read public Telegram channel via t.me/s/ preview (no auth needed).
-    Returns list of {id, text, date, has_photo, has_video, url}.
+    Extracts full text, image URLs, video info.
     """
     log.info("tg_channel_read_web: @%s limit=%d", channel, limit)
     channel = channel.lstrip("@").strip()
@@ -1022,32 +1118,61 @@ def tg_channel_read_web(channel: str, limit: int = 20) -> list[dict]:
             if not msg_div:
                 continue
             msg_id = msg_div.get("data-post", "")
-            # Text
+
+            # Full text (no truncation)
             text_el = wrap.select_one(".tgme_widget_message_text")
             text = text_el.get_text("\n", strip=True) if text_el else ""
+
             # Date
             time_el = wrap.select_one("time")
             date = time_el.get("datetime", "") if time_el else ""
+
             # Message link
             link_el = wrap.select_one("a.tgme_widget_message_date")
             msg_url = link_el.get("href", "") if link_el else ""
-            # Media
-            has_photo = bool(wrap.select(".tgme_widget_message_photo_wrap,"
-                                         ".tgme_widget_message_photo"))
-            has_video = bool(wrap.select(".tgme_widget_message_video_wrap,"
-                                         ".tgme_widget_message_video_player"))
-            has_doc   = bool(wrap.select(".tgme_widget_message_document"))
+
+            # ── Extract image URLs ────────────────────────────────────────
+            img_urls = []
+            # Photos: background-image style on photo wrap
+            for photo_el in wrap.select(".tgme_widget_message_photo_wrap"):
+                style = photo_el.get("style", "")
+                m = re.search(r"url\(['\"]?(https?://[^'\")\s]+)['\"]?\)", style)
+                if m:
+                    img_urls.append(m.group(1))
+            # Also check <img> tags inside message
+            for img_el in wrap.select("img.tgme_widget_message_photo"):
+                src = img_el.get("src", "")
+                if src and src not in img_urls:
+                    img_urls.append(src)
+
+            # ── Video info ────────────────────────────────────────────────
+            has_video = bool(wrap.select(
+                ".tgme_widget_message_video_wrap, "
+                ".tgme_widget_message_video_player, "
+                "video"))
+            video_thumb = ""
+            video_el = wrap.select_one(".tgme_widget_message_video_wrap")
+            if video_el:
+                style = video_el.get("style", "")
+                m = re.search(r"url\(['\"]?(https?://[^'\")\s]+)['\"]?\)", style)
+                if m:
+                    video_thumb = m.group(1)
+
+            has_doc = bool(wrap.select(".tgme_widget_message_document"))
+
             messages.append({
                 "id": msg_id,
-                "text": text[:500],
+                "text": text,
                 "date": date[:16].replace("T", " "),
                 "url": msg_url,
-                "has_photo": has_photo,
+                "img_urls": img_urls,
+                "has_photo": bool(img_urls),
                 "has_video": has_video,
+                "video_thumb": video_thumb,
                 "has_doc": has_doc,
             })
         log.info("tg_channel_read_web: %d messages from @%s", len(messages), channel)
-        return list(reversed(messages))   # newest last
+        return list(reversed(messages))
     except Exception as e:
         log.error("tg_channel_read_web: %s", e, exc_info=True)
         return []
@@ -1057,7 +1182,6 @@ async def tg_channel_read_mtproto(channel: str, limit: int = 20) -> list[dict]:
     """
     Read Telegram channel via MTProto (Telethon).
     Requires TG_API_ID and TG_API_HASH env vars.
-    Works for both public and private channels (if account is a member).
     """
     log.info("tg_channel_read_mtproto: @%s", channel)
     if not TG_API_ID or not TG_API_HASH:
@@ -1065,22 +1189,28 @@ async def tg_channel_read_mtproto(channel: str, limit: int = 20) -> list[dict]:
         return []
     try:
         from telethon import TelegramClient
-        from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
+        from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage
         client = TelegramClient(TG_SESSION, int(TG_API_ID), TG_API_HASH)
         await client.start()
         messages = []
         async for msg in client.iter_messages(channel, limit=limit):
-            has_photo = isinstance(getattr(msg, "media", None), MessageMediaPhoto)
-            has_doc   = isinstance(getattr(msg, "media", None), MessageMediaDocument)
+            media = getattr(msg, "media", None)
+            has_photo = isinstance(media, MessageMediaPhoto)
+            has_doc   = isinstance(media, MessageMediaDocument)
+            has_video = has_doc and getattr(getattr(media, "document", None),
+                                            "mime_type", "").startswith("video/")
             messages.append({
                 "id": str(msg.id),
-                "text": (msg.text or "")[:500],
+                "text": (msg.text or ""),
                 "date": str(msg.date)[:16],
                 "url": f"https://t.me/{channel.lstrip('@')}/{msg.id}",
+                "img_urls": [],
                 "has_photo": has_photo,
-                "has_video": False,
-                "has_doc": has_doc,
-                "_msg_obj": msg,
+                "has_video": has_video,
+                "video_thumb": "",
+                "has_doc": has_doc and not has_video,
+                "_msg_obj": msg,      # kept for media download
+                "_client": None,      # filled by caller
             })
         await client.disconnect()
         log.info("tg_mtproto: %d messages", len(messages))
@@ -1091,9 +1221,61 @@ async def tg_channel_read_mtproto(channel: str, limit: int = 20) -> list[dict]:
 
 
 def tg_download_media_web(msg_url: str) -> Optional[tuple[bytes, str]]:
-    """Download media from a public Telegram message URL via yt-dlp."""
+    """
+    Download media from a public Telegram message URL.
+    Strategy 1: scrape t.me/s/ for image/video URLs and download directly.
+    Strategy 2: yt-dlp (for videos embedded in telegram previews).
+    """
     log.info("tg_download_media: %s", msg_url)
-    return social_download_ytdlp(msg_url)
+
+    # Parse channel + message_id from URL
+    # Formats: https://t.me/channel/123  or  https://t.me/s/channel/123
+    m = re.search(r"t\.me/(?:s/)?([^/]+)/(\d+)", msg_url)
+    if m:
+        channel, msg_id = m.group(1), m.group(2)
+        # Fetch the single message preview
+        preview_url = f"https://t.me/s/{channel}?before={int(msg_id)+1}"
+        try:
+            r = WEB.get(preview_url,
+                        headers={"User-Agent": UA_DESK}, timeout=20)
+            log.debug("tg_single_msg: status=%d len=%d", r.status_code, len(r.text))
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, "html.parser")
+                # Find our specific message
+                for wrap in soup.select(".tgme_widget_message_wrap"):
+                    div = wrap.select_one(".tgme_widget_message")
+                    if not div:
+                        continue
+                    post_id = div.get("data-post", "")
+                    if not post_id.endswith(f"/{msg_id}"):
+                        continue
+                    # ── Try image ────────────────────────────────────────
+                    for photo_el in wrap.select(".tgme_widget_message_photo_wrap"):
+                        style = photo_el.get("style", "")
+                        mi = re.search(
+                            r"url\(['\"]?(https?://[^'\")\s]+)['\"]?\)", style)
+                        if mi:
+                            img_url = mi.group(1)
+                            img_bytes = download_bytes(img_url, MAX_IMAGE_SIZE)
+                            if img_bytes and len(img_bytes) > 500:
+                                ext = img_url.rsplit(".", 1)[-1].split("?")[0] or "jpg"
+                                fname = f"tg_{channel}_{msg_id}.{ext}"
+                                log.info("tg_download: image %dKB", len(img_bytes)//1024)
+                                return img_bytes, fname
+                    # ── Try video via yt-dlp ──────────────────────────────
+                    if wrap.select(".tgme_widget_message_video_wrap, video"):
+                        break  # fall through to yt-dlp below
+        except Exception as e:
+            log.warning("tg_download scrape: %s", e)
+
+    # Strategy 2: yt-dlp (works for video messages in public channels)
+    log.info("tg_download: trying yt-dlp for %s", msg_url)
+    result = social_download_ytdlp(msg_url)
+    if result:
+        return result
+
+    log.error("tg_download_media_web: all strategies failed for %s", msg_url)
+    return None
 
 
 # ─── Twitter / X ─────────────────────────────────────────────────────────────
@@ -2316,12 +2498,15 @@ def do_tg_read(cid: int, channel: str, use_mtproto: bool = False):
 
 
 def do_tg_show_message(cid: int, msg_data: dict):
-    """Display a single Telegram message with media download option."""
-    text = msg_data.get("text", "")
-    date = msg_data.get("date", "")
-    url  = msg_data.get("url", "")
-    has_media = msg_data.get("has_photo") or msg_data.get("has_video") or msg_data.get("has_doc")
+    """Display a Telegram message: text + auto-download images + video button."""
+    text      = msg_data.get("text", "")
+    date      = msg_data.get("date", "")
+    url       = msg_data.get("url", "")
+    img_urls  = msg_data.get("img_urls", [])
+    has_video = msg_data.get("has_video", False)
+    video_thumb = msg_data.get("video_thumb", "")
 
+    # Send text
     lines = []
     if date:
         lines.append(f"🕐 {date}")
@@ -2329,10 +2514,35 @@ def do_tg_show_message(cid: int, msg_data: dict):
         lines.append(f"\n{text}")
     if url:
         lines.append(f"\n[🔗 لینک پیام]({url})")
+    if lines:
+        send_message(cid, "\n".join(lines), parse_mode="Markdown")
 
-    kb = social_post_kb(url, "tg", bool(has_media)) if url else home_kb()
-    send_message(cid, "\n".join(lines) or "_(پیام بدون متن)_",
-                 parse_mode="Markdown", reply_markup=kb)
+    # Auto-download and send all images
+    for img_url in img_urls[:4]:
+        try:
+            img_bytes = download_bytes(img_url, MAX_IMAGE_SIZE)
+            if img_bytes and len(img_bytes) > 500:
+                send_photo(cid, img_bytes, caption="✈️")
+                log.info("tg_show: sent image %dKB", len(img_bytes)//1024)
+        except Exception as e:
+            log.warning("tg_show img: %s", e)
+
+    # Video thumbnail + download button
+    if has_video:
+        if video_thumb:
+            try:
+                thumb = download_bytes(video_thumb, MAX_IMAGE_SIZE)
+                if thumb:
+                    send_photo(cid, thumb, caption="🎬 ویدیو")
+            except Exception:
+                pass
+        kb = social_post_kb(url, "tg", True) if url else home_kb()
+        send_message(cid, "📥 دانلود ویدیو؟", reply_markup=kb)
+    elif not img_urls and not text:
+        send_message(cid, "_(پیام بدون محتوای قابل نمایش)_",
+                     parse_mode="Markdown", reply_markup=home_kb())
+    else:
+        send_message(cid, "✅", reply_markup=home_kb())
 
 
 def do_tg_dl_media(cid: int, msg_url: str):
