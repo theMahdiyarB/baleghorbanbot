@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v5)
+بله قربان — Bale Bot  (v8)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -666,7 +666,7 @@ _CLEANUP_JS = """
 
 def screenshot_page(url: str) -> Optional[bytes]:
     """
-    1920×1080 screenshot via shot-scraper with popup/banner removal.
+    1080×1920 screenshot via shot-scraper with popup/banner removal.
     Falls back to playwright if shot-scraper unavailable.
     """
     log.info("screenshot_page: %s", url)
@@ -676,9 +676,9 @@ def screenshot_page(url: str) -> Optional[bytes]:
         cmd = [
             "shot-scraper", "shot", url,
             "-o", out,
-            "--width", "1920",
-            "--height", "1080",
-            "--quality", "85",
+            "--width", "1080",
+            "--height", "1920",
+            "--quality", "100",
             "--wait", "2000",
             "--javascript", _CLEANUP_JS,
         ]
@@ -706,12 +706,12 @@ def screenshot_page(url: str) -> Optional[bytes]:
                 "--no-sandbox", "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage", "--disable-gpu",
             ])
-            page = browser.new_page(viewport={"width": 1920, "height": 1080})
+            page = browser.new_page(viewport={"width": 1080, "height": 1920})
             page.goto(url, timeout=25000, wait_until="domcontentloaded")
             time.sleep(2)
             page.evaluate(_CLEANUP_JS)
-            img = page.screenshot(type="jpeg", quality=85,
-                                   clip={"x":0,"y":0,"width":1920,"height":1080})
+            img = page.screenshot(type="jpeg", quality=100,
+                                   clip={"x":0,"y":0,"width":1080,"height":1920})
             browser.close()
         log.info("screenshot_page (playwright fallback): %dKB", len(img)//1024)
         return img
@@ -791,7 +791,7 @@ def page_to_pdf(url: str) -> Optional[bytes]:
                 "--no-sandbox", "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage", "--disable-gpu",
             ])
-            page = browser.new_page(viewport={"width": 1920, "height": 1080})
+            page = browser.new_page(viewport={"width": 1080, "height": 1920})
             page.goto(url, timeout=30000, wait_until="networkidle")
             time.sleep(2)
             page.evaluate(_CLEANUP_JS)
