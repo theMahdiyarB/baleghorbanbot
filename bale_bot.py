@@ -5,7 +5,7 @@ Full-featured web assistant for Bale messenger.
 """
 
 import os, re, io, json, time, zipfile, logging, tempfile, hashlib
-import requests, subprocess, urllib.parse, threading
+import requests, subprocess, urllib.parse, pytesseract, threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -13,7 +13,10 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 from PIL import Image
-import pytesseract
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIG
@@ -41,8 +44,8 @@ TWITTER_COOKIES_FILE = os.getenv("TWITTER_COOKIES_FILE", "")
 INSTAGRAM_USER = os.getenv("INSTAGRAM_USER", "")
 INSTAGRAM_PASS = os.getenv("INSTAGRAM_PASS", "")
 
-# Z-Library: ایمیل و رمز حساب از singlelogin.re
-# ثبت‌نام رایگان در: https://singlelogin.re
+# Z-Library: ایمیل و رمز حساب از z-library.sk/login
+# ثبت‌نام رایگان در: https://z-library.sk/login
 ZLIB_EMAIL    = os.getenv("ZLIB_EMAIL", "")
 ZLIB_PASSWORD = os.getenv("ZLIB_PASSWORD", "")
 _zlib_client  = None   # shared AsyncZlib instance (initialized on first use)
@@ -2581,7 +2584,7 @@ def do_zlib_search(cid: int, query: str, extensions: list = None):
     if not ZLIB_EMAIL or not ZLIB_PASSWORD:
         send_message(cid,
             "❌ Z-Library پیکربندی نشده.\n\n"
-            "۱. در https://singlelogin.re ثبت‌نام کنید\n"
+            "۱. در https://z-library.sk/login ثبت‌نام کنید\n"
             "۲. متغیرهای محیطی تنظیم کنید:\n"
             "`export ZLIB_EMAIL=your@email.com`\n"
             "`export ZLIB_PASSWORD=yourpassword`",
