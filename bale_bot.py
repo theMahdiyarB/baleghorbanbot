@@ -1924,12 +1924,16 @@ async def _zlib_get_client():
         return None
     try:
         from zlibrary import AsyncZlib
+        from zlibrary.exceptions import LoginFailed, NoDomainError
         client = AsyncZlib()
         await client.login(ZLIB_EMAIL, ZLIB_PASSWORD)
-        await client.init_profile()
         _zlib_client = client
         log.info("Z-Library: logged in as %s", ZLIB_EMAIL)
         return client
+    except (LoginFailed, NoDomainError) as e:
+        log.error("Z-Library login failed: %s (domain unreachable or credentials invalid)", e)
+        _zlib_client = None
+        return None
     except Exception as e:
         log.error("Z-Library login failed: %s", e)
         _zlib_client = None
@@ -1951,6 +1955,12 @@ def zlib_search(query: str, count: int = 10,
             return []
         try:
             from zlibrary.const import Extension
+            from zlibrary.exceptions import EmptyQueryError, NoProfileError
+            
+            if not query or not query.strip():
+                log.error("zlib_search: empty query")
+                return []
+            
             ext_objs = []
             if extensions:
                 ext_map = {e.value.upper(): e for e in Extension}
@@ -1983,6 +1993,9 @@ def zlib_search(query: str, count: int = 10,
                 })
             log.info("zlib_search: %d results", len(results))
             return results
+        except (EmptyQueryError, NoProfileError) as e:
+            log.error("zlib_search error: %s", e)
+            return []
         except Exception as e:
             log.error("zlib_search error: %s", e, exc_info=True)
             return []
@@ -2003,6 +2016,8 @@ def zlib_download(book_url: str) -> Optional[tuple[bytes, str]]:
             return None
         try:
             from zlibrary.abs import BookItem
+            from zlibrary.exceptions import NoProfileError
+            
             # Create a BookItem and fetch its details (gets download_url)
             book = BookItem(client._r, client.mirror)
             book["url"] = book_url
@@ -2022,6 +2037,9 @@ def zlib_download(book_url: str) -> Optional[tuple[bytes, str]]:
             fname = f"{name}.{ext}"
             log.info("zlib_download: %s  %.1fMB", fname, len(data)/1024/1024)
             return data, fname
+        except NoProfileError as e:
+            log.error("zlib_download: not authenticated - %s", e)
+            return None
         except Exception as e:
             log.error("zlib_download: %s", e, exc_info=True)
             return None
