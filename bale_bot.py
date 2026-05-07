@@ -1958,7 +1958,7 @@ def zlib_search(query: str, count: int = 10,
             return []
         try:
             from zlibrary.const import Extension
-            from zlibrary.exception import EmptyQueryError, NoProfileError
+            from zlibrary.exception import EmptyQueryError, NoProfileError, ParseError
             
             if not query or not query.strip():
                 log.error("zlib_search: empty query")
@@ -1999,6 +1999,9 @@ def zlib_search(query: str, count: int = 10,
         except (EmptyQueryError, NoProfileError) as e:
             log.error("zlib_search error: %s", e)
             return []
+        except ParseError as e:
+            log.error("zlib_search error: Could not parse results from Z-Library (website may have changed): %s", e)
+            return []
         except Exception as e:
             log.error("zlib_search error: %s", e, exc_info=True)
             return []
@@ -2019,7 +2022,7 @@ def zlib_download(book_url: str) -> Optional[tuple[bytes, str]]:
             return None
         try:
             from zlibrary.abs import BookItem
-            from zlibrary.exception import NoProfileError
+            from zlibrary.exception import NoProfileError, ParseError
             
             # Create a BookItem and fetch its details (gets download_url)
             book = BookItem(client._r, client.mirror)
@@ -2042,6 +2045,9 @@ def zlib_download(book_url: str) -> Optional[tuple[bytes, str]]:
             return data, fname
         except NoProfileError as e:
             log.error("zlib_download: not authenticated - %s", e)
+            return None
+        except ParseError as e:
+            log.error("zlib_download: Could not parse book details from Z-Library: %s", e)
             return None
         except Exception as e:
             log.error("zlib_download: %s", e, exc_info=True)
