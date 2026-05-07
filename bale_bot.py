@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v8)
+بله قربان — Bale Bot  (v9)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -41,8 +41,13 @@ TWITTER_COOKIES_FILE = os.getenv("TWITTER_COOKIES_FILE", "")
 INSTAGRAM_USER = os.getenv("INSTAGRAM_USER", "")
 INSTAGRAM_PASS = os.getenv("INSTAGRAM_PASS", "")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# LOGGING
+# Z-Library: ایمیل و رمز حساب از singlelogin.re
+# ثبت‌نام رایگان در: https://singlelogin.re
+ZLIB_EMAIL    = os.getenv("ZLIB_EMAIL", "")
+ZLIB_PASSWORD = os.getenv("ZLIB_PASSWORD", "")
+_zlib_client  = None   # shared AsyncZlib instance (initialized on first use)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 logging.basicConfig(
     level=logging.DEBUG,
@@ -343,7 +348,7 @@ def main_menu_kb():
         [{"text": "📸 اینستاگرام",        "callback_data": "mode_instagram"},
          {"text": "🎵 تیک‌تاک",           "callback_data": "mode_tiktok"}],
         [{"text": "📰 اخبار RSS",         "callback_data": "mode_rss"},
-         {"text": "🌐 ترجمه",             "callback_data": "mode_translate"}],
+         {"text": "📚 Z-Library کتاب",   "callback_data": "mode_zlib"}],
         [{"text": "🖼 OCR متن از عکس",   "callback_data": "mode_ocr"},
          {"text": "🌐 IP / دامنه",        "callback_data": "mode_iplookup"}],
         [{"text": "📊 آمار کاربری",       "callback_data": "stats"},
@@ -422,7 +427,43 @@ def tiktok_kb():
         [{"text": "❌ انصراف",            "callback_data": "cancel"}],
     ]}
 
-def social_results_kb(results: list, cache_key: str, platform: str) -> dict:
+def zlib_kb():
+    """منوی اصلی Z-Library."""
+    return {"inline_keyboard": [
+        [{"text": "🔍 جستجوی کتاب",   "callback_data": "zlib_search"},
+         {"text": "🔍 جستجوی مقاله",  "callback_data": "zlib_search_art"}],
+        [{"text": "📄 فقط PDF",        "callback_data": "zlib_filter_pdf"},
+         {"text": "📖 فقط EPUB",       "callback_data": "zlib_filter_epub"}],
+        [{"text": "📝 فقط FB2/MOBI",   "callback_data": "zlib_filter_other"}],
+        [{"text": "❌ انصراف",          "callback_data": "cancel"}],
+    ]}
+
+
+def zlib_results_kb(results: list, cache_key: str) -> dict:
+    """نتایج Z-Library به‌صورت دکمه."""
+    rows = []
+    for i, book in enumerate(results[:10]):
+        name    = book.get("name", f"کتاب {i+1}")[:38]
+        ext     = book.get("extension", "").upper()
+        size    = book.get("size", "")
+        label   = f"📚 {name}"
+        if ext:  label += f" [{ext}]"
+        if size: label += f" {size}"
+        rows.append([{"text": label[:60],
+                       "callback_data": f"zlib_item_{cache_key}_{i}"}])
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+    return {"inline_keyboard": rows}
+
+
+def zlib_book_kb(book_url_key: str) -> dict:
+    """دکمه دانلود کتاب."""
+    return {"inline_keyboard": [
+        [{"text": "📥 دانلود کتاب",  "callback_data": f"zlib_dl_{book_url_key}"}],
+        [{"text": "🔙 برگشت",        "callback_data": "zlib_back"},
+         {"text": "🏠 منوی اصلی",   "callback_data": "home"}],
+    ]}
+
+
     """Generic results keyboard for social media posts."""
     rows = []
     for i, r in enumerate(results[:10]):
@@ -666,7 +707,7 @@ _CLEANUP_JS = """
 
 def screenshot_page(url: str) -> Optional[bytes]:
     """
-    1080×1920 screenshot via shot-scraper with popup/banner removal.
+    1920×1080 screenshot via shot-scraper with popup/banner removal.
     Falls back to playwright if shot-scraper unavailable.
     """
     log.info("screenshot_page: %s", url)
@@ -676,9 +717,9 @@ def screenshot_page(url: str) -> Optional[bytes]:
         cmd = [
             "shot-scraper", "shot", url,
             "-o", out,
-            "--width", "1080",
-            "--height", "1920",
-            "--quality", "100",
+            "--width", "1920",
+            "--height", "1080",
+            "--quality", "85",
             "--wait", "2000",
             "--javascript", _CLEANUP_JS,
         ]
@@ -706,12 +747,12 @@ def screenshot_page(url: str) -> Optional[bytes]:
                 "--no-sandbox", "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage", "--disable-gpu",
             ])
-            page = browser.new_page(viewport={"width": 1080, "height": 1920})
+            page = browser.new_page(viewport={"width": 1920, "height": 1080})
             page.goto(url, timeout=25000, wait_until="domcontentloaded")
             time.sleep(2)
             page.evaluate(_CLEANUP_JS)
-            img = page.screenshot(type="jpeg", quality=100,
-                                   clip={"x":0,"y":0,"width":1080,"height":1920})
+            img = page.screenshot(type="jpeg", quality=85,
+                                   clip={"x":0,"y":0,"width":1920,"height":1080})
             browser.close()
         log.info("screenshot_page (playwright fallback): %dKB", len(img)//1024)
         return img
@@ -791,7 +832,7 @@ def page_to_pdf(url: str) -> Optional[bytes]:
                 "--no-sandbox", "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage", "--disable-gpu",
             ])
-            page = browser.new_page(viewport={"width": 1080, "height": 1920})
+            page = browser.new_page(viewport={"width": 1920, "height": 1080})
             page.goto(url, timeout=30000, wait_until="networkidle")
             time.sleep(2)
             page.evaluate(_CLEANUP_JS)
@@ -1856,7 +1897,157 @@ def generate_qr(text: str) -> Optional[bytes]:
         return None
 
 
-# ─── RSS ──────────────────────────────────────────────────────────────────────
+# ─── Z-Library ────────────────────────────────────────────────────────────────
+
+def _zlib_run(coro):
+    """Run an async coroutine synchronously (for use from sync bot handlers)."""
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, coro)
+                return future.result()
+        return loop.run_until_complete(coro)
+    except RuntimeError:
+        return asyncio.run(coro)
+
+
+async def _zlib_get_client():
+    """Get or create a logged-in AsyncZlib client."""
+    global _zlib_client
+    if _zlib_client is not None:
+        return _zlib_client
+    if not ZLIB_EMAIL or not ZLIB_PASSWORD:
+        log.error("ZLIB_EMAIL / ZLIB_PASSWORD not set")
+        return None
+    try:
+        from zlibrary import AsyncZlib
+        client = AsyncZlib()
+        await client.login(ZLIB_EMAIL, ZLIB_PASSWORD)
+        await client.init_profile()
+        _zlib_client = client
+        log.info("Z-Library: logged in as %s", ZLIB_EMAIL)
+        return client
+    except Exception as e:
+        log.error("Z-Library login failed: %s", e)
+        _zlib_client = None
+        return None
+
+
+def zlib_search(query: str, count: int = 10,
+                extensions: list = None, exact: bool = False) -> list[dict]:
+    """
+    جستجو در Z-Library.
+    بازمی‌گرداند: list of {name, authors, year, publisher, language,
+                           extension, size, cover, url, id}
+    """
+    log.info("zlib_search: %r  ext=%s", query, extensions)
+
+    async def _search():
+        client = await _zlib_get_client()
+        if not client:
+            return []
+        try:
+            from zlibrary.const import Extension
+            ext_objs = []
+            if extensions:
+                ext_map = {e.value.upper(): e for e in Extension}
+                for ext in extensions:
+                    obj = ext_map.get(ext.upper())
+                    if obj:
+                        ext_objs.append(obj)
+
+            paginator = await client.search(
+                q=query,
+                count=count,
+                exact=exact,
+                extensions=ext_objs,
+            )
+            await paginator.next()
+            results = []
+            for book in paginator.result:
+                results.append({
+                    "id":        book.get("id", ""),
+                    "name":      book.get("name", "نامشخص"),
+                    "authors":   book.get("authors", []),
+                    "year":      book.get("year", ""),
+                    "publisher": book.get("publisher", ""),
+                    "language":  book.get("language", ""),
+                    "extension": book.get("extension", ""),
+                    "size":      book.get("size", ""),
+                    "cover":     book.get("cover", ""),
+                    "url":       book.get("url", ""),
+                    "rating":    book.get("rating", ""),
+                })
+            log.info("zlib_search: %d results", len(results))
+            return results
+        except Exception as e:
+            log.error("zlib_search error: %s", e, exc_info=True)
+            return []
+
+    return _zlib_run(_search())
+
+
+def zlib_download(book_url: str) -> Optional[tuple[bytes, str]]:
+    """
+    دانلود فایل کتاب از Z-Library.
+    بازمی‌گرداند: (file_bytes, filename) یا None
+    """
+    log.info("zlib_download: %s", book_url)
+
+    async def _dl():
+        client = await _zlib_get_client()
+        if not client:
+            return None
+        try:
+            from zlibrary.abs import BookItem
+            # Create a BookItem and fetch its details (gets download_url)
+            book = BookItem(client._r, client.mirror)
+            book["url"] = book_url
+            parsed = await book.fetch()
+            dl_url = parsed.get("download_url", "")
+            if not dl_url or "Unavailable" in dl_url:
+                log.error("zlib_download: no download_url in parsed: %s", parsed)
+                return None
+            log.info("zlib_download: dl_url=%s", dl_url)
+            # Download the file
+            data = await _async_download(dl_url, client)
+            if not data:
+                return None
+            # Determine filename
+            name = parsed.get("name", "book").replace("/", "_")[:60]
+            ext  = parsed.get("extension", "pdf").lower()
+            fname = f"{name}.{ext}"
+            log.info("zlib_download: %s  %.1fMB", fname, len(data)/1024/1024)
+            return data, fname
+        except Exception as e:
+            log.error("zlib_download: %s", e, exc_info=True)
+            return None
+
+    async def _async_download(url: str, client) -> Optional[bytes]:
+        """Download file using the same session as zlibrary client."""
+        from zlibrary.util import GET_request
+        try:
+            data = await GET_request(url, cookies=client.cookies)
+            if data:
+                return data if isinstance(data, bytes) else data.encode()
+            return None
+        except Exception as e:
+            log.error("_async_download: %s", e)
+            # Fallback: use requests
+            r = WEB.get(url, cookies=client.cookies,
+                        headers={"User-Agent": UA_DESK}, timeout=120)
+            if r.status_code == 200:
+                return r.content
+            return None
+
+    return _zlib_run(_dl())
+
+
+# ─── RSS ───────────────────────────────────────────────────────────────────────
+
 def rss_fetch(url: str, limit: int = 15) -> list[dict]:
     """
     Fetch and parse an RSS/Atom feed. Returns list of items with:
@@ -1992,6 +2183,7 @@ HELP_TEXT = """❓ *راهنمای بله قربان*
 📸 *اینستاگرام* — پست‌های پروفایل + دانلود ریل/عکس خودکار
 🎵 *تیک‌تاک* — لیست ویدیوها + دانلود (لینک مستقیم هم کار می‌کند)
 📰 *اخبار RSS* — دریافت فید + کشف خودکار فید سایت
+📚 *Z-Library* — جستجو و دانلود کتاب/مقاله (PDF، EPUB، MOBI، FB2)
 🌐 *ترجمه* — ۶ زبان، متن طولانی
 🖼 *OCR* — استخراج متن از عکس + PDF
 🌐 *IP/دامنه* — اطلاعات موقعیت و اپراتور
@@ -2364,6 +2556,114 @@ def do_qr(cid: int, text: str):
 # ═══════════════════════════════════════════════════════════════════════════════
 # SOCIAL MEDIA HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def do_zlib_search(cid: int, query: str, extensions: list = None):
+    """جستجوی کتاب در Z-Library و نمایش نتایج به‌صورت دکمه."""
+    bump(cid, "searches")
+    if not ZLIB_EMAIL or not ZLIB_PASSWORD:
+        send_message(cid,
+            "❌ Z-Library پیکربندی نشده.\n\n"
+            "۱. در https://singlelogin.re ثبت‌نام کنید\n"
+            "۲. متغیرهای محیطی تنظیم کنید:\n"
+            "`export ZLIB_EMAIL=your@email.com`\n"
+            "`export ZLIB_PASSWORD=yourpassword`",
+            parse_mode="Markdown", reply_markup=home_kb())
+        return
+
+    send_message(cid, f"⏳ در حال جستجو در Z-Library: _{query}_…",
+                 parse_mode="Markdown")
+    chat_action(cid)
+    results = zlib_search(query, count=10, extensions=extensions)
+
+    if not results:
+        send_message(cid,
+            "❌ نتیجه‌ای یافت نشد.\n"
+            "• کلمات دیگری امتحان کنید\n"
+            "• اگر خطای لاگین است، مطمئن شوید ZLIB_EMAIL/PASSWORD درست است",
+            reply_markup=home_kb())
+        return
+
+    key = make_cache_key("zl", query, 0)
+    cache_set(key, results)
+    set_state(cid, mode="zlib", last_query=query, cache_key=key,
+              zlib_ext=extensions)
+
+    ext_str = f" [{', '.join(extensions)}]" if extensions else ""
+    text = f"📚 *نتایج Z-Library{ext_str}:* _{query}_\nروی کتاب کلیک کنید:"
+    kb = zlib_results_kb(results, key)
+    send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
+
+
+def do_zlib_show_book(cid: int, book: dict):
+    """نمایش اطلاعات کامل کتاب + دکمه دانلود."""
+    name      = book.get("name", "نامشخص")
+    authors   = book.get("authors", [])
+    year      = book.get("year", "")
+    publisher = book.get("publisher", "")
+    language  = book.get("language", "")
+    extension = book.get("extension", "").upper()
+    size      = book.get("size", "")
+    cover     = book.get("cover", "")
+    rating    = book.get("rating", "")
+    url       = book.get("url", "")
+
+    # ارسال کاور کتاب
+    if cover:
+        try:
+            img_bytes = download_bytes(cover, MAX_IMAGE_SIZE)
+            if img_bytes and len(img_bytes) > 500:
+                send_photo(cid, img_bytes, caption=name[:80])
+        except Exception as e:
+            log.warning("zlib cover: %s", e)
+
+    # متن اطلاعات
+    lines = [f"📚 *{name}*"]
+    if authors:
+        auth_str = ", ".join(
+            a["author"] if isinstance(a, dict) else str(a)
+            for a in authors[:3]
+        )
+        lines.append(f"✍️ {auth_str}")
+    if year:      lines.append(f"📅 سال: {year}")
+    if publisher: lines.append(f"🏢 ناشر: {publisher}")
+    if language:  lines.append(f"🌐 زبان: {language}")
+    if extension: lines.append(f"📄 فرمت: {extension}")
+    if size:      lines.append(f"💾 حجم: {size}")
+    if rating:    lines.append(f"⭐ امتیاز: {rating}")
+
+    # کلید دانلود با URL کتاب
+    url_key = hashlib.md5(url.encode()).hexdigest()[:10] if url else ""
+    if url_key:
+        url_cache[url_key] = url
+
+    send_message(cid, "\n".join(lines), parse_mode="Markdown",
+                 reply_markup=zlib_book_kb(url_key) if url_key else home_kb())
+
+
+def do_zlib_download(cid: int, book_url: str):
+    """دانلود فایل کتاب از Z-Library و ارسال به کاربر."""
+    bump(cid, "downloads")
+    send_message(cid, "⏳ در حال دانلود کتاب از Z-Library…\n_(ممکن است چند ثانیه طول بکشد)_",
+                 parse_mode="Markdown")
+    chat_action(cid, "upload_document")
+
+    result = zlib_download(book_url)
+    if not result:
+        send_message(cid,
+            "❌ دانلود ناموفق بود.\n"
+            "• ممکن است این کتاب نیاز به اشتراک ویژه داشته باشد\n"
+            "• یا لاگین منقضی شده — ربات را ری‌استارت کنید",
+            reply_markup=home_kb())
+        return
+
+    data, fname = result
+    log.info("zlib: sending %s  %.1fMB", fname, len(data)/1024/1024)
+    if smart_send(cid, data, fname, caption=f"📚 {fname[:80]}"):
+        send_message(cid, "✅ کتاب ارسال شد.", reply_markup=home_kb())
+    else:
+        send_message(cid, "❌ ارسال فایل ناموفق بود.", reply_markup=home_kb())
+    clear_state(cid)
+
 
 def do_rss(cid: int, query: str):
     """Handle RSS input: URL → fetch feed; non-URL → search for feeds on site."""
@@ -2782,6 +3082,9 @@ def handle_message(msg: dict):
         "tt_dl":        lambda: do_tiktok_dl(cid, text),
         # RSS
         "rss":          lambda: do_rss(cid, text),
+        # Z-Library
+        "zlib":         lambda: do_zlib_search(cid, text,
+                                               st.get("zlib_ext")),
     }
     if mode in dispatch:
         dispatch[mode]()
@@ -3026,6 +3329,60 @@ def handle_callback(cb: dict):
         source, key, page = m.group(1), m.group(2), int(m.group(3))
         query = st.get("last_query","")
         do_images(cid, query, source, page); return
+
+    # ── Z-Library callbacks ───────────────────────────────────────────────
+    if data == "mode_zlib":
+        send_message(cid, "📚 Z-Library:", reply_markup=zlib_kb()); return
+
+    if data in ("zlib_search", "zlib_search_art"):
+        prompt = ("🔍 عنوان کتاب یا نام نویسنده را بنویسید:"
+                  if data == "zlib_search" else
+                  "🔍 عنوان مقاله یا نام نویسنده را بنویسید:")
+        set_state(cid, mode="zlib", zlib_ext=None)
+        send_message(cid, prompt, reply_markup=cancel_kb()); return
+
+    if data == "zlib_filter_pdf":
+        set_state(cid, mode="zlib", zlib_ext=["PDF"])
+        send_message(cid, "🔍 عنوان کتاب (فقط PDF):", reply_markup=cancel_kb()); return
+
+    if data == "zlib_filter_epub":
+        set_state(cid, mode="zlib", zlib_ext=["EPUB"])
+        send_message(cid, "🔍 عنوان کتاب (فقط EPUB):", reply_markup=cancel_kb()); return
+
+    if data == "zlib_filter_other":
+        set_state(cid, mode="zlib", zlib_ext=["FB2", "MOBI", "AZW3"])
+        send_message(cid, "🔍 عنوان کتاب (FB2/MOBI/AZW3):",
+                     reply_markup=cancel_kb()); return
+
+    if data == "zlib_back":
+        query   = st.get("last_query", "")
+        key     = st.get("cache_key", "")
+        results = cache_get(key) if key else []
+        if results:
+            kb = zlib_results_kb(results, key)
+            send_message(cid, f"📚 نتایج: _{query}_",
+                         parse_mode="Markdown", reply_markup=kb)
+        else:
+            send_message(cid, "🏠", reply_markup=main_menu_kb())
+        return
+
+    # zlib_item_{cache_key}_{idx}  — کلیک روی کتاب
+    m = re.match(r"zlib_item_(\w+)_(\d+)$", data)
+    if m:
+        key, idx = m.group(1), int(m.group(2))
+        results = cache_get(key)
+        if not results or idx >= len(results):
+            send_message(cid, "❌ نتیجه منقضی."); return
+        do_zlib_show_book(cid, results[idx]); return
+
+    # zlib_dl_{url_key}  — دانلود کتاب
+    m = re.match(r"zlib_dl_(\w+)$", data)
+    if m:
+        url_key  = m.group(1)
+        book_url = url_cache.get(url_key, "")
+        if not book_url:
+            send_message(cid, "❌ لینک منقضی."); return
+        do_zlib_download(cid, book_url); return
 
     # ── RSS callbacks ─────────────────────────────────────────────────────
     if data == "mode_rss" or data.startswith("rss_"):
