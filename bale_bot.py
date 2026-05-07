@@ -1927,7 +1927,7 @@ async def _zlib_get_client():
         return None
     try:
         from zlibrary import AsyncZlib
-        from zlibrary.exceptions import LoginFailed, NoDomainError
+        from zlibrary.exception import LoginFailed, NoDomainError
         client = AsyncZlib()
         await client.login(ZLIB_EMAIL, ZLIB_PASSWORD)
         _zlib_client = client
@@ -1958,7 +1958,7 @@ def zlib_search(query: str, count: int = 10,
             return []
         try:
             from zlibrary.const import Extension
-            from zlibrary.exceptions import EmptyQueryError, NoProfileError
+            from zlibrary.exception import EmptyQueryError, NoProfileError
             
             if not query or not query.strip():
                 log.error("zlib_search: empty query")
@@ -2019,7 +2019,7 @@ def zlib_download(book_url: str) -> Optional[tuple[bytes, str]]:
             return None
         try:
             from zlibrary.abs import BookItem
-            from zlibrary.exceptions import NoProfileError
+            from zlibrary.exception import NoProfileError
             
             # Create a BookItem and fetch its details (gets download_url)
             book = BookItem(client._r, client.mirror)
