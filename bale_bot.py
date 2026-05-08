@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v9)
+بله قربان — Bale Bot  (v1.0)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -343,7 +343,9 @@ def main_menu_kb():
         [{"text": "📚 مقاله علمی",        "callback_data": "mode_scholar"},
          {"text": "📖 ویکی‌پدیا",         "callback_data": "mode_wiki"}],
         [{"text": "📺 یوتیوب",            "callback_data": "mode_youtube"},
-         {"text": "🎵 دانلود موسیقی MP3", "callback_data": "mode_music"}],
+         {"text": "🎵 موسیقی / دانلود",  "callback_data": "mode_music"}],
+        [{"text": "🟢 Spotify",           "callback_data": "mode_spotify"},
+         {"text": "☁️ SoundCloud",        "callback_data": "mode_soundcloud"}],
         [{"text": "🖼 دانلود عکس",        "callback_data": "mode_images"},
          {"text": "🐙 GitHub",            "callback_data": "mode_github"}],
         [{"text": "✈️ کانال تلگرام",      "callback_data": "mode_tg_channel"},
@@ -1089,8 +1091,152 @@ def _trim_video(src: Path, tmp: str, ffmpeg_dir="/usr/bin") -> Optional[tuple[by
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SOCIAL MEDIA
+# MUSIC PLATFORMS  (Spotify · SoundCloud · YouTube Music)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def music_search_ytdlp(query: str, max_results: int = 6,
+                        source: str = "youtube") -> list[dict]:
+    """Search for tracks via yt-dlp (YouTube or SoundCloud)."""
+    log.info("music_search_ytdlp: %r source=%s", query, source)
+    import shutil
+    ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
+    search_url = (f"scsearch{max_results}:{query}" if source == "soundcloud"
+                  else f"ytsearch{max_results}:{query}")
+    try:
+        cmd = [
+            "yt-dlp", "--flat-playlist", "--no-warnings", "--no-check-certificate",
+            "--ffmpeg-location", ffmpeg_dir,
+            "--print",
+            "%(id)s|||%(title)s|||%(uploader)s|||%(duration_string)s|||%(url)s|||%(thumbnail)s",
+            search_url,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        items = []
+        for line in result.stdout.strip().split("\n"):
+            parts = line.split("|||")
+            if len(parts) >= 2 and parts[0].strip():
+                items.append({
+                    "id":        parts[0].strip(),
+                    "title":     parts[1].strip(),
+                    "uploader":  parts[2].strip() if len(parts) > 2 else "",
+                    "duration":  parts[3].strip() if len(parts) > 3 else "",
+                    "url":       parts[4].strip() if len(parts) > 4 else "",
+                    "thumbnail": parts[5].strip() if len(parts) > 5 else "",
+                    "source":    source,
+                })
+            if len(items) >= max_results:
+                break
+        log.info("music_search_ytdlp (%s): %d results", source, len(items))
+        return items
+    except Exception as e:
+        log.error("music_search_ytdlp: %s", e)
+        return []
+
+
+def music_search_multi(query: str) -> list[dict]:
+    """Search YouTube + SoundCloud simultaneously, interleave results."""
+    import threading
+    results: dict[str, list] = {}
+
+    def _s(src): results[src] = music_search_ytdlp(query, 5, src)
+
+    threads = [threading.Thread(target=_s, args=(s,))
+               for s in ("youtube", "soundcloud")]
+    for t in threads: t.start()
+    for t in threads: t.join(timeout=20)
+
+    merged = []
+    yt = results.get("youtube", [])
+    sc = results.get("soundcloud", [])
+    for i in range(max(len(yt), len(sc))):
+        if i < len(yt): merged.append(yt[i])
+        if i < len(sc): merged.append(sc[i])
+    return merged[:10]
+
+
+def music_download_ytdlp(url: str, source: str = "auto") -> Optional[tuple[bytes, str]]:
+    """Download audio via yt-dlp (YouTube/SoundCloud/etc.) → MP3."""
+    log.info("music_download_ytdlp: %s source=%s", url, source)
+    import shutil
+    ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
+    with tempfile.TemporaryDirectory() as tmp:
+        cmd = [
+            "yt-dlp", "--no-playlist", "--no-warnings", "--no-check-certificate",
+            "--ffmpeg-location", ffmpeg_dir,
+            "--socket-timeout", "30", "--retries", "3",
+            "-o", os.path.join(tmp, "%(title).60s.%(ext)s"),
+            "-x", "--audio-format", "mp3", "--audio-quality", "0",
+            "--embed-thumbnail", "--add-metadata",
+        ]
+        if "youtube.com" in url or "youtu.be" in url:
+            cmd += ["--extractor-args", "youtube:player_client=tv_embedded,ios,web"]
+        cmd.append(url)
+        log.debug("music dl: %s", " ".join(cmd))
+        proc = subprocess.run(cmd, capture_output=True, timeout=300)
+        if proc.returncode != 0:
+            log.error("music dl rc=%d: %s", proc.returncode,
+                      proc.stderr.decode(errors="replace")[:400])
+            return None
+        files = [f for f in Path(tmp).glob("*")
+                 if f.suffix.lower() in {".mp3",".m4a",".ogg",".opus",".flac"}
+                 and f.stat().st_size > 1000]
+        if not files:
+            log.error("music dl: no output files")
+            return None
+        f = files[0]
+        data = f.read_bytes()
+        log.info("music dl OK: %s  %.1fMB", f.name, len(data)/1024/1024)
+        return data, f.name
+
+
+def spotify_download(url: str) -> Optional[tuple[bytes, str]]:
+    """Download Spotify track/album/playlist via spotdl → MP3."""
+    log.info("spotify_download: %s", url)
+    import shutil
+    ffmpeg_path = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+    spotdl_path = shutil.which("spotdl") or "spotdl"
+    with tempfile.TemporaryDirectory() as tmp:
+        cmd = [spotdl_path, "download", url,
+               "--format", "mp3", "--bitrate", "192k",
+               "--output", tmp, "--ffmpeg", ffmpeg_path,
+               "--log-level", "ERROR"]
+        if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
+            cmd += ["--client-id", SPOTIFY_CLIENT_ID,
+                    "--client-secret", SPOTIFY_CLIENT_SECRET]
+        log.debug("spotdl: %s", " ".join(cmd))
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=300)
+            if proc.returncode != 0:
+                log.error("spotdl rc=%d: %s", proc.returncode,
+                          proc.stderr.decode(errors="replace")[:400])
+                return None
+            files = sorted(Path(tmp).glob("*.mp3"), key=lambda f: f.stat().st_size)
+            if not files:
+                return None
+            if len(files) == 1:
+                return files[0].read_bytes(), files[0].name
+            # Multiple files (album/playlist) → zip
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in files:
+                    zf.writestr(f.name, f.read_bytes())
+            buf.seek(0)
+            album_name = url.split("/")[-1][:40] or "album"
+            return buf.read(), f"{album_name}.zip"
+        except subprocess.TimeoutExpired:
+            log.error("spotdl: timed out")
+            return None
+        except Exception as e:
+            log.error("spotdl: %s", e)
+            return None
+
+
+def soundcloud_download(url: str) -> Optional[tuple[bytes, str]]:
+    """Download SoundCloud track via yt-dlp."""
+    return music_download_ytdlp(url, source="soundcloud")
+
+
+
 
 # ─── Generic yt-dlp social downloader ────────────────────────────────────────
 def social_download_ytdlp(url: str, audio_only=False,
@@ -1383,35 +1529,103 @@ def twitter_get_channel(username: str, limit: int = 20) -> list[dict]:
 
 
 def twitter_download_media(tweet_url: str) -> Optional[tuple[bytes, str]]:
-    """Download video/image from a tweet via yt-dlp + Nitter fallback."""
+    """
+    Download video/image from a tweet.
+    1. vxtwitter/fxtwitter API (direct media URL, no auth)
+    2. yt-dlp with twitter cookies
+    3. yt-dlp via Nitter instances
+    4. Direct image scrape from Nitter HTML
+    """
     log.info("twitter_download_media: %s", tweet_url)
-    # Try yt-dlp with twitter cookies first
+    tweet_url = tweet_url.replace("x.com/", "twitter.com/")
+    m = re.search(r"twitter\.com/([^/]+)/status/(\d+)", tweet_url)
+    username = m.group(1) if m else ""
+    tweet_id = m.group(2) if m else ""
+
+    # Strategy 1: vxtwitter / fxtwitter API
+    if username and tweet_id:
+        for api_url in [
+            f"https://api.vxtwitter.com/{username}/status/{tweet_id}",
+            f"https://api.fxtwitter.com/{username}/status/{tweet_id}",
+        ]:
+            try:
+                r = WEB.get(api_url, headers={"User-Agent": UA_DESK}, timeout=15)
+                log.debug("vxtwitter %s: status=%d", api_url, r.status_code)
+                if r.status_code != 200:
+                    continue
+                jdata = r.json()
+                tweet = jdata.get("tweet") or jdata
+                media_list = (tweet.get("media", {}).get("all", []) or
+                              tweet.get("media_extended", []) or
+                              tweet.get("media", []))
+                for media in media_list:
+                    murl  = (media.get("url") or media.get("media_url_https") or "")
+                    mtype = media.get("type", "")
+                    if not murl:
+                        continue
+                    log.info("vxtwitter: type=%s url=%s", mtype, murl[:80])
+                    content = download_bytes(murl)
+                    if content and len(content) > 1000:
+                        ext = "mp4" if mtype == "video" else \
+                              murl.rsplit(".", 1)[-1].split("?")[0] or "jpg"
+                        fname = f"tweet_{tweet_id}.{ext}"
+                        log.info("vxtwitter OK: %.1fMB", len(content)/1024/1024)
+                        return content, fname
+            except Exception as e:
+                log.warning("vxtwitter %s: %s", api_url, e)
+
+    # Strategy 2: yt-dlp with twitter cookies
     cookies = TWITTER_COOKIES_FILE if TWITTER_COOKIES_FILE else ""
     result = social_download_ytdlp(tweet_url, cookies_file=cookies)
     if result:
         return result
-    # Convert to Nitter URL and try again
-    m = re.search(r"(?:twitter\.com|x\.com)/([^/]+)/status/(\d+)", tweet_url)
-    if m:
-        username, tweet_id = m.groups()
+
+    # Strategy 3: yt-dlp via Nitter
+    if username and tweet_id:
         for instance in NITTER_INSTANCES:
             nitter_url = f"{instance}/{username}/status/{tweet_id}"
-            log.debug("Trying nitter: %s", nitter_url)
-            r = social_download_ytdlp(nitter_url)
-            if r:
-                return r
+            log.debug("Nitter yt-dlp: %s", nitter_url)
+            r2 = social_download_ytdlp(nitter_url)
+            if r2:
+                return r2
+
+    # Strategy 4: scrape images from Nitter HTML
+    if username and tweet_id:
+        for instance in NITTER_INSTANCES:
+            try:
+                page = WEB.get(f"{instance}/{username}/status/{tweet_id}",
+                               headers={"User-Agent": UA_DESK}, timeout=15)
+                if page.status_code != 200:
+                    continue
+                soup = BeautifulSoup(page.text, "html.parser")
+                for img in soup.select(".still-image img, .attachment img"):
+                    src = img.get("src", "")
+                    if not src:
+                        continue
+                    full = f"{instance}{src}" if src.startswith("/") else src
+                    content = download_bytes(full, MAX_IMAGE_SIZE)
+                    if content and len(content) > 1000:
+                        fname = f"tweet_{tweet_id}.jpg"
+                        log.info("Nitter img scrape OK: %dKB", len(content)//1024)
+                        return content, fname
+            except Exception as e:
+                log.warning("Nitter scrape %s: %s", instance, e)
+
+    log.error("twitter_download_media: all strategies failed for %s", tweet_url)
     return None
 
 
+
 # ─── Instagram ───────────────────────────────────────────────────────────────
-def instagram_download(url: str) -> Optional[tuple[bytes, str]]:
-    """Download Instagram post/reel via yt-dlp, with instaloader fallback."""
-    log.info("instagram_download: %s", url)
-    # Strategy 1: yt-dlp
-    result = social_download_ytdlp(url)
-    if result:
-        return result
-    # Strategy 2: instaloader
+def instagram_download_all(url: str) -> list[dict]:
+    """
+    Download ALL media from an Instagram post (single/carousel/reel).
+    Returns list of {data, fname, caption, is_video}.
+    """
+    log.info("instagram_download_all: %s", url)
+    results = []
+
+    # Strategy 1: instaloader (handles GraphSidecar carousels natively)
     try:
         import instaloader
         L = instaloader.Instaloader(
@@ -1429,27 +1643,64 @@ def instagram_download(url: str) -> Optional[tuple[bytes, str]]:
                 log.info("instaloader: logged in as %s", INSTAGRAM_USER)
             except Exception as e:
                 log.warning("instaloader login failed: %s", e)
-        # Extract shortcode from URL
+
         m = re.search(r"instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)", url)
         if not m:
-            return None
+            raise ValueError("Cannot extract shortcode from URL")
         shortcode = m.group(1)
         post = instaloader.Post.from_shortcode(L.context, shortcode)
+
+        caption = post.caption or ""
+        log.info("instagram: typename=%s caption_len=%d", post.typename, len(caption))
+
         with tempfile.TemporaryDirectory() as tmp:
             L.dirname_pattern = tmp
+            L.filename_pattern = "{shortcode}_{media_id}"
             L.download_post(post, target=tmp)
-            # Find largest video or image
-            files = list(Path(tmp).rglob("*.mp4"))
-            if not files:
-                files = list(Path(tmp).rglob("*.jpg")) + list(Path(tmp).rglob("*.png"))
-            if files:
-                f = sorted(files, key=lambda x: x.stat().st_size, reverse=True)[0]
-                data = f.read_bytes()
-                log.info("instaloader OK: %s  %.1fMB", f.name, len(data)/1024/1024)
-                return data, f.name
+
+            # Collect all media files sorted by name (preserves carousel order)
+            all_files = sorted(Path(tmp).rglob("*"), key=lambda f: f.name)
+            media_files = [
+                f for f in all_files
+                if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"}
+                and f.stat().st_size > 1000
+            ]
+            log.info("instaloader: %d media files for %s", len(media_files), shortcode)
+
+            for f in media_files:
+                is_video = f.suffix.lower() in {".mp4", ".mov"}
+                results.append({
+                    "data":     f.read_bytes(),
+                    "fname":    f.name,
+                    "caption":  caption,
+                    "is_video": is_video,
+                })
+
+        if results:
+            log.info("instagram_download_all: %d items via instaloader", len(results))
+            return results
     except Exception as e:
         log.error("instaloader: %s", e)
+
+    # Strategy 2: yt-dlp (single video/reel, no carousel support)
+    try:
+        result = social_download_ytdlp(url)
+        if result:
+            data, fname = result
+            return [{"data": data, "fname": fname, "caption": "", "is_video": True}]
+    except Exception as e:
+        log.error("yt-dlp instagram: %s", e)
+
+    return []
+
+
+def instagram_download(url: str) -> Optional[tuple[bytes, str]]:
+    """Backward-compat single-item wrapper."""
+    items = instagram_download_all(url)
+    if items:
+        return items[0]["data"], items[0]["fname"]
     return None
+
 
 
 def instagram_get_profile(username: str) -> list[dict]:
@@ -2201,8 +2452,9 @@ HELP_TEXT = """❓ *راهنمای بله قربان*
 🌐 *مشاهده سایت* — اسکرین‌شات ۱۹۲۰×۱۰۸۰ + دکمه‌های متن / HTML / ZIP / PDF
 📚 *مقاله علمی* — Google Scholar با صفحه‌بندی
 📖 *ویکی‌پدیا* — جستجو + خواندن مقاله کامل
-📺 *یوتیوب* — جستجو (تامبنیل + دانلود)، ارسال لینک مستقیم هم کار می‌کند
-🎵 *موسیقی MP3* — دانلود صوتی از یوتیوب
+🎵 *موسیقی* — جستجو در YouTube Music + SoundCloud، لینک Spotify/SoundCloud هم کار می‌کند
+🟢 *Spotify* — دانلود ترک/آلبوم/پلی‌لیست با spotdl
+☁️ *SoundCloud* — دانلود ترک یا پلی‌لیست
 🖼 *دانلود عکس* — Bing / Pinterest / Pixabay / Wikimedia با دانلود بیشتر
 🐙 *GitHub* — جستجوی مخازن / ZIP / دانلود Release
 ✈️ *کانال تلگرام* — پیام‌های کانال عمومی یا با MTProto
@@ -2382,24 +2634,131 @@ def _finish_video(cid: int, result):
     clear_state(cid)
 
 def do_music(cid: int, query: str):
+    """
+    Music search — shows results from YouTube Music + SoundCloud as clickable buttons.
+    If query is a Spotify/SoundCloud/YouTube URL, downloads directly.
+    """
     bump(cid, "downloads")
-    send_message(cid, f"⏳ در حال جستجو و دانلود MP3: _{query}_…", parse_mode="Markdown")
-    chat_action(cid, "record_voice")
-    result = youtube_download(f"ytsearch1:{query}", audio_only=True)
-    if not result:
-        send_message(cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb())
+
+    # Direct URL — download immediately
+    if query.startswith("http"):
+        if "spotify.com" in query:
+            do_spotify_dl(cid, query); return
+        elif "soundcloud.com" in query:
+            do_soundcloud_dl(cid, query); return
+        elif _is_youtube(query):
+            _do_audio_download(cid, query, source="youtube"); return
+        else:
+            _do_audio_download(cid, query, source="auto"); return
+
+    # Search query — show results as buttons
+    send_message(cid, f"🔍 Searching for: _{query}_…", parse_mode="Markdown")
+    chat_action(cid)
+    results = music_search_multi(query)
+
+    if not results:
+        send_message(cid, "❌ No results found. Try a different search.", reply_markup=home_kb())
         return
+
+    key = make_cache_key("mu", query, 0)
+    cache_set(key, results)
+    set_state(cid, mode="music", last_query=query, cache_key=key)
+
+    rows = []
+    for i, r in enumerate(results):
+        title    = r.get("title", f"Track {i+1}")[:38]
+        uploader = r.get("uploader", "")[:20]
+        dur      = r.get("duration", "")
+        source   = r.get("source", "")
+        src_icon = {"youtube": "▶️", "soundcloud": "☁️", "ytmusic": "🎵"}.get(source, "🎵")
+        parts = [f"{src_icon} {title}"]
+        if uploader: parts.append(f"— {uploader}")
+        if dur:      parts.append(f"({dur})")
+        label = " ".join(parts)[:60]
+        rows.append([{"text": label, "callback_data": f"mu_dl_{key}_{i}"}])
+
+    rows.append([{"text": "🏠 Main menu", "callback_data": "home"}])
+    send_message(cid,
+        f"🎵 *Music results for:* _{query}_\nTap a track to download:",
+        parse_mode="Markdown",
+        reply_markup={"inline_keyboard": rows})
+
+
+def _do_audio_download(cid: int, url: str, source: str = "auto",
+                        title: str = ""):
+    """Download audio from a URL and send to user."""
+    bump(cid, "downloads")
+    send_message(cid, f"⏳ Downloading audio…")
+    chat_action(cid, "record_voice")
+
+    result = music_download_ytdlp(url, source=source)
+    if not result:
+        send_message(cid,
+            "❌ Download failed.\n"
+            "• Try running: `yt-dlp -U`\n"
+            "• Or paste the URL directly from your browser.",
+            parse_mode="Markdown", reply_markup=home_kb())
+        return
+
     data, fname = result
     fname = Path(fname).name
-    if len(data) > MAX_FILE_SIZE:
-        send_message(cid, "❌ حجم فایل زیاد است.", reply_markup=home_kb())
-        return
-    if not fname.lower().endswith(".mp3"):
-        fname = re.sub(r"\.[^.]+$", ".mp3", fname)
-    if send_audio(cid, data, fname, caption=f"🎵 {query}"):
-        send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
+    caption = f"🎵 {title or fname[:60]}"
+    if smart_send(cid, data, fname, caption=caption, media_type="audio"):
+        send_message(cid, "✅ Sent!", reply_markup=home_kb())
     else:
-        send_message(cid, "❌ ارسال ناموفق.", reply_markup=home_kb())
+        send_message(cid, "❌ Send failed.", reply_markup=home_kb())
+    clear_state(cid)
+
+
+def do_spotify_dl(cid: int, url: str):
+    """Download Spotify track/album/playlist via spotdl."""
+    bump(cid, "downloads")
+    is_track    = "/track/" in url
+    is_album    = "/album/" in url
+    is_playlist = "/playlist/" in url
+
+    kind = "track" if is_track else "album" if is_album else "playlist" if is_playlist else "item"
+    send_message(cid, f"⏳ Downloading Spotify {kind}… (may take a while for albums)")
+    chat_action(cid, "record_voice")
+
+    result = spotify_download(url)
+    if not result:
+        send_message(cid,
+            "❌ Spotify download failed.\n\n"
+            "Make sure `spotdl` is installed:\n"
+            "`pip install spotdl`\n\n"
+            "For playlists, set Spotify credentials:\n"
+            "`export SPOTIFY_CLIENT_ID=...`\n"
+            "`export SPOTIFY_CLIENT_SECRET=...`",
+            parse_mode="Markdown", reply_markup=home_kb())
+        return
+
+    data, fname = result
+    caption = f"🟢 Spotify — {fname[:60]}"
+    if smart_send(cid, data, fname, caption=caption):
+        send_message(cid, "✅ Sent!", reply_markup=home_kb())
+    else:
+        send_message(cid, "❌ Send failed.", reply_markup=home_kb())
+    clear_state(cid)
+
+
+def do_soundcloud_dl(cid: int, url: str):
+    """Download SoundCloud track/playlist."""
+    bump(cid, "downloads")
+    send_message(cid, "⏳ Downloading from SoundCloud…")
+    chat_action(cid, "record_voice")
+
+    result = soundcloud_download(url)
+    if not result:
+        send_message(cid, "❌ SoundCloud download failed.", reply_markup=home_kb())
+        return
+
+    data, fname = result
+    caption = f"☁️ SoundCloud — {fname[:60]}"
+    if smart_send(cid, data, fname, caption=caption, media_type="audio"):
+        send_message(cid, "✅ Sent!", reply_markup=home_kb())
+    else:
+        send_message(cid, "❌ Send failed.", reply_markup=home_kb())
     clear_state(cid)
 
 def do_images(cid: int, query: str, source: str, page=0):
@@ -2982,22 +3341,43 @@ def do_instagram_profile(cid: int, username: str):
 
 
 def do_instagram_dl(cid: int, url: str):
-    """Download Instagram post/reel."""
+    """Download ALL media from an Instagram post (single/carousel/reel) with full caption."""
     bump(cid, "downloads")
-    send_message(cid, f"⏳ در حال دانلود از اینستاگرام…")
+    send_message(cid, "⏳ Downloading from Instagram…")
     chat_action(cid, "upload_video")
-    result = instagram_download(url)
-    if not result:
+
+    items = instagram_download_all(url)
+    if not items:
         send_message(cid,
-            "❌ دانلود ناموفق.\n"
-            "• پست باید عمومی باشد\n"
-            "• یا INSTAGRAM_USER/PASS تنظیم کنید",
+            "❌ Download failed.\n"
+            "• Post must be public\n"
+            "• Set INSTAGRAM_USER/PASS for private posts",
             reply_markup=home_kb())
         return
-    data, fname = result
-    smart_send(cid, data, fname, caption=f"📸 {fname[:60]}")
-    send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
+
+    caption = items[0].get("caption", "")
+    total   = len(items)
+    log.info("do_instagram_dl: sending %d items, caption_len=%d", total, len(caption))
+
+    if total > 1:
+        send_message(cid, f"📸 Found {total} items in carousel — sending all…")
+
+    sent = 0
+    for i, item in enumerate(items):
+        # Caption only on first item
+        item_caption = caption[:1024] if i == 0 and caption else ""
+        try:
+            ok = smart_send(cid, item["data"], item["fname"],
+                            caption=item_caption,
+                            media_type="video" if item["is_video"] else "document")
+            if ok:
+                sent += 1
+        except Exception as e:
+            log.error("do_instagram_dl item %d: %s", i, e)
+
+    send_message(cid, f"✅ Sent {sent}/{total} items.", reply_markup=home_kb())
     clear_state(cid)
+
 
 
 def do_tiktok_user(cid: int, username: str):
@@ -3119,6 +3499,10 @@ def handle_message(msg: dict):
         # Smart URL detection — route to correct handler automatically
         if _is_youtube(text):
             do_youtube_dl(cid, text)
+        elif "spotify.com" in text:
+            do_spotify_dl(cid, text)
+        elif "soundcloud.com" in text:
+            do_soundcloud_dl(cid, text)
         elif any(x in text for x in ["tiktok.com", "vm.tiktok.com"]):
             do_tiktok_dl(cid, text)
         elif any(x in text for x in ["twitter.com", "x.com", "t.co"]):
@@ -3173,7 +3557,9 @@ def handle_callback(cb: dict):
         "mode_open":      ("open",      "🌐 آدرس سایت را وارد کنید (https://…):"),
         "mode_scholar":   ("scholar",   "📚 عنوان یا کلمه‌کلیدی مقاله:"),
         "mode_wiki":      ("wiki",      "📖 موضوع ویکی‌پدیا:"),
-        "mode_music":     ("music",     "🎵 نام آهنگ یا آرتیست:"),
+        "mode_music":     ("music",     "🎵 Track/artist name or paste a URL (Spotify/SoundCloud/YouTube):"),
+        "mode_spotify":   ("music",     "🟢 Paste a Spotify track, album, or playlist URL:"),
+        "mode_soundcloud":("music",     "☁️ Paste a SoundCloud URL or search: artist name - song:"),
         "mode_iplookup":  ("iplookup",  "🌐 آدرس IP یا دامنه:"),
         "mode_rss":       ("rss",       "📰 آدرس فید RSS یا سایت خبری را وارد کنید:"),
     }
@@ -3713,6 +4099,36 @@ def handle_callback(cb: dict):
             do_instagram_dl(cid, url)
         elif platform == "tt":
             do_tiktok_dl(cid, url)
+        return
+
+    # ── Music track click: mu_dl_{cache_key}_{idx} ───────────────────────
+    m = re.match(r"mu_dl_(\w+)_(\d+)$", data)
+    if m:
+        key, idx = m.group(1), int(m.group(2))
+        results = cache_get(key)
+        if not results or idx >= len(results):
+            send_message(cid, "❌ Result expired. Search again."); return
+        track = results[idx]
+        url   = track.get("url", "")
+        title = track.get("title", "")
+        thumb = track.get("thumbnail", "")
+
+        # Send thumbnail first
+        if thumb:
+            try:
+                tb = download_bytes(thumb, MAX_IMAGE_SIZE)
+                if tb:
+                    uploader = track.get("uploader", "")
+                    dur      = track.get("duration", "")
+                    cap = title
+                    if uploader: cap += f"\n🎤 {uploader}"
+                    if dur:      cap += f"\n⏱ {dur}"
+                    send_photo(cid, tb, caption=cap[:1024])
+            except Exception as e:
+                log.warning("music thumb: %s", e)
+
+        source = track.get("source", "youtube")
+        _do_audio_download(cid, url, source=source, title=title)
         return
 
     # ── Images query entry ────────────────────────────────────────────────
