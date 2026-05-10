@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.0)
+بله قربان — Bale Bot  (v1.1)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -469,15 +469,22 @@ def zlib_book_kb(book_url_key: str) -> dict:
     ]}
 
 
-    """Generic results keyboard for social media posts."""
+def social_results_kb(results: list, cache_key: str, platform: str) -> dict:
+    """Generic results keyboard for social media posts (tg/tw/ig/tt)."""
+    icon_map = {"tg": "✈️", "tw": "🐦", "ig": "📸", "tt": "🎵"}
+    icon = icon_map.get(platform, "📌")
     rows = []
-    for i, r in enumerate(results[:10]):
-        text = r.get("text", r.get("title", ""))[:35] or f"پیام {i+1}"
-        icons = ("📷" if r.get("has_photo") else "") + ("🎬" if r.get("has_video") or r.get("is_video") else "")
-        label = f"{icons} {text}".strip()[:48]
+    for i, r in enumerate(results[:15]):
+        text = r.get("text", r.get("title", ""))
+        first_line = text.split("\n")[0].strip()[:38] if text else f"پیام {i+1}"
+        media_icons = ""
+        if r.get("has_photo") or r.get("img_urls"): media_icons += "🖼"
+        if r.get("has_video") or r.get("is_video"): media_icons += "🎬"
+        label = f"{icon}{media_icons} {first_line}".strip()[:52]
         rows.append([{"text": label, "callback_data": f"soc_{platform}_{cache_key}_{i}"}])
     rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
     return {"inline_keyboard": rows}
+
 
 def social_post_kb(url: str, platform: str, has_media: bool) -> dict:
     """Buttons under a displayed post."""
@@ -491,6 +498,7 @@ def social_post_kb(url: str, platform: str, has_media: bool) -> dict:
     return {"inline_keyboard": rows}
 
 
+def translate_kb():
     langs = [("🇮🇷 فارسی","fa"),("🇬🇧 انگلیسی","en"),
              ("🇸🇦 عربی","ar"),("🇩🇪 آلمانی","de"),
              ("🇫🇷 فرانسوی","fr"),("🇷🇺 روسی","ru")]
@@ -1003,6 +1011,7 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
     log.info("youtube_download: url=%r audio=%s", url, audio_only)
     import shutil
     ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
+    cookies_file = YOUTUBE_COOKIES_FILE
 
     base_cmd = [
         "yt-dlp",
@@ -1013,8 +1022,14 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
         "--geo-bypass",
         "--socket-timeout", "30",
         "--retries", "5",
-        "--extractor-args", "youtube:player_client=ios,tv_embedded,web",
     ]
+    # Always add cookies if available — this is the primary bot-detection bypass
+    if cookies_file and Path(cookies_file).exists():
+        base_cmd += ["--cookies", cookies_file]
+        log.info("youtube_download: using cookies from %s", cookies_file)
+    else:
+        log.warning("youtube_download: no cookies file — bot detection likely")
+        base_cmd += ["--extractor-args", "youtube:player_client=tv_embedded,ios,web"]
 
     def _run(extra_args, target_url) -> Optional[tuple[bytes,str]]:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1027,29 +1042,26 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
             if proc.returncode != 0:
                 log.error("yt-dlp rc=%d stderr=%s", proc.returncode, stderr[:800])
                 return None
-            log.debug("yt-dlp stdout: %s", stdout[:300])
-            files = list(Path(tmp).glob("*"))
+            files = [f for f in Path(tmp).glob("*") if f.stat().st_size > 100]
             if not files:
-                log.error("yt-dlp: no output files in %s", tmp)
+                log.error("yt-dlp: no output files. stdout=%s", stdout[:200])
                 return None
-            f = files[0]
+            f = sorted(files, key=lambda x: x.stat().st_size, reverse=True)[0]
             data = f.read_bytes()
-            log.info("yt-dlp: %s  %.1fMB", f.name, len(data)/1024/1024)
+            log.info("yt-dlp OK: %s  %.1fMB", f.name, len(data)/1024/1024)
             return data, f.name
 
     if audio_only:
-        # Try mp3 first, fallback to best audio then convert
         for args in [
-            ["-x", "--audio-format", "mp3", "--audio-quality", "5", "-f", "bestaudio/best"],
             ["-x", "--audio-format", "mp3", "--audio-quality", "5"],
-            ["-f", "bestaudio", "--audio-format", "mp3", "-x"],
+            ["-x", "--audio-format", "mp3", "--audio-quality", "5", "-f", "bestaudio"],
+            ["-x", "--audio-format", "mp3"],
         ]:
             result = _run(args, url)
             if result:
                 return result
         return None
     else:
-        # Try progressive quality steps — no strict codec filter
         for fmt in [
             "bestvideo[height<=720]+bestaudio/best[height<=720]",
             "bestvideo+bestaudio/best",
@@ -1058,7 +1070,6 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
         ]:
             result = _run(["-f", fmt, "--merge-output-format", "mp4"], url)
             if result:
-                # Trim if too large
                 if len(result[0]) > MAX_FILE_SIZE - 1*1024*1024:
                     log.info("Video %.1fMB too large, trimming…", len(result[0])/1024/1024)
                     with tempfile.TemporaryDirectory() as tmp2:
@@ -1102,28 +1113,38 @@ def music_search_ytdlp(query: str, max_results: int = 6,
     ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
     search_url = (f"scsearch{max_results}:{query}" if source == "soundcloud"
                   else f"ytsearch{max_results}:{query}")
+    extra = []
+    if source != "soundcloud" and YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).exists():
+        extra = ["--cookies", YOUTUBE_COOKIES_FILE]
     try:
-        cmd = [
-            "yt-dlp", "--flat-playlist", "--no-warnings", "--no-check-certificate",
-            "--ffmpeg-location", ffmpeg_dir,
-            "--print",
-            "%(id)s|||%(title)s|||%(uploader)s|||%(duration_string)s|||%(url)s|||%(thumbnail)s",
-            search_url,
-        ]
+        cmd = (["yt-dlp", "--flat-playlist", "--no-warnings", "--no-check-certificate",
+                "--ffmpeg-location", ffmpeg_dir]
+               + extra
+               + ["--print",
+                  "%(id)s|||%(title)s|||%(uploader)s|||%(duration_string)s|||%(url)s|||%(thumbnail)s",
+                  search_url])
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         items = []
         for line in result.stdout.strip().split("\n"):
             parts = line.split("|||")
-            if len(parts) >= 2 and parts[0].strip():
-                items.append({
-                    "id":        parts[0].strip(),
-                    "title":     parts[1].strip(),
-                    "uploader":  parts[2].strip() if len(parts) > 2 else "",
-                    "duration":  parts[3].strip() if len(parts) > 3 else "",
-                    "url":       parts[4].strip() if len(parts) > 4 else "",
-                    "thumbnail": parts[5].strip() if len(parts) > 5 else "",
-                    "source":    source,
-                })
+            if len(parts) < 2 or not parts[0].strip():
+                continue
+            vid_id   = parts[0].strip()
+            title    = parts[1].strip()
+            uploader = parts[2].strip() if len(parts) > 2 else ""
+            duration = parts[3].strip() if len(parts) > 3 else ""
+            url      = parts[4].strip() if len(parts) > 4 else ""
+            thumb    = parts[5].strip() if len(parts) > 5 else ""
+            # Fix NA values — build fallback URLs from video ID
+            if not url or url in ("NA", "none", "None"):
+                url = f"https://www.youtube.com/watch?v={vid_id}" if source == "youtube" and vid_id else ""
+            if not thumb or thumb in ("NA", "none", "None"):
+                thumb = f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg" if source == "youtube" and vid_id else ""
+            if not url:
+                continue
+            items.append({"id": vid_id, "title": title, "uploader": uploader,
+                          "duration": duration, "url": url, "thumbnail": thumb,
+                          "source": source})
             if len(items) >= max_results:
                 break
         log.info("music_search_ytdlp (%s): %d results", source, len(items))
@@ -1168,8 +1189,13 @@ def music_download_ytdlp(url: str, source: str = "auto") -> Optional[tuple[bytes
             "-x", "--audio-format", "mp3", "--audio-quality", "0",
             "--embed-thumbnail", "--add-metadata",
         ]
-        if "youtube.com" in url or "youtu.be" in url:
-            cmd += ["--extractor-args", "youtube:player_client=tv_embedded,ios,web"]
+        is_yt = "youtube.com" in url or "youtu.be" in url
+        if is_yt:
+            if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).exists():
+                cmd += ["--cookies", YOUTUBE_COOKIES_FILE]
+                log.info("music_download: using YT cookies")
+            else:
+                cmd += ["--extractor-args", "youtube:player_client=tv_embedded,ios,web"]
         cmd.append(url)
         log.debug("music dl: %s", " ".join(cmd))
         proc = subprocess.run(cmd, capture_output=True, timeout=300)
@@ -1413,52 +1439,104 @@ async def tg_channel_read_mtproto(channel: str, limit: int = 20) -> list[dict]:
 def tg_download_media_web(msg_url: str) -> Optional[tuple[bytes, str]]:
     """
     Download media from a public Telegram message URL.
-    Strategy 1: scrape t.me/s/ for image/video URLs and download directly.
-    Strategy 2: yt-dlp (for videos embedded in telegram previews).
+    Strategy 1: Telegram embed widget API (gets higher-res images)
+    Strategy 2: t.me/s/ HTML scrape
+    Strategy 3: yt-dlp for videos
     """
     log.info("tg_download_media: %s", msg_url)
-
-    # Parse channel + message_id from URL
-    # Formats: https://t.me/channel/123  or  https://t.me/s/channel/123
     m = re.search(r"t\.me/(?:s/)?([^/]+)/(\d+)", msg_url)
-    if m:
-        channel, msg_id = m.group(1), m.group(2)
-        # Fetch the single message preview
-        preview_url = f"https://t.me/s/{channel}?before={int(msg_id)+1}"
-        try:
-            r = WEB.get(preview_url,
-                        headers={"User-Agent": UA_DESK}, timeout=20)
-            log.debug("tg_single_msg: status=%d len=%d", r.status_code, len(r.text))
-            if r.status_code == 200:
-                soup = BeautifulSoup(r.text, "html.parser")
-                # Find our specific message
-                for wrap in soup.select(".tgme_widget_message_wrap"):
-                    div = wrap.select_one(".tgme_widget_message")
-                    if not div:
-                        continue
-                    post_id = div.get("data-post", "")
-                    if not post_id.endswith(f"/{msg_id}"):
-                        continue
-                    # ── Try image ────────────────────────────────────────
-                    for photo_el in wrap.select(".tgme_widget_message_photo_wrap"):
-                        style = photo_el.get("style", "")
-                        mi = re.search(
-                            r"url\(['\"]?(https?://[^'\")\s]+)['\"]?\)", style)
-                        if mi:
-                            img_url = mi.group(1)
-                            img_bytes = download_bytes(img_url, MAX_IMAGE_SIZE)
-                            if img_bytes and len(img_bytes) > 500:
-                                ext = img_url.rsplit(".", 1)[-1].split("?")[0] or "jpg"
-                                fname = f"tg_{channel}_{msg_id}.{ext}"
-                                log.info("tg_download: image %dKB", len(img_bytes)//1024)
-                                return img_bytes, fname
-                    # ── Try video via yt-dlp ──────────────────────────────
-                    if wrap.select(".tgme_widget_message_video_wrap, video"):
-                        break  # fall through to yt-dlp below
-        except Exception as e:
-            log.warning("tg_download scrape: %s", e)
+    if not m:
+        log.error("tg_download: cannot parse URL %s", msg_url)
+        return None
+    channel, msg_id = m.group(1), m.group(2)
 
-    # Strategy 2: yt-dlp (works for video messages in public channels)
+    # Strategy 1: Telegram embed widget (teleFeed-inspired)
+    # The embed endpoint returns a page with full-size image URLs
+    for embed_url in [
+        f"https://t.me/{channel}/{msg_id}?embed=1&mode=tme",
+        f"https://t.me/{channel}/{msg_id}?embed=1",
+    ]:
+        try:
+            r = WEB.get(embed_url,
+                        headers={"User-Agent": UA_DESK,
+                                 "Accept": "text/html",
+                                 "Referer": "https://t.me/"},
+                        timeout=20)
+            log.debug("tg_embed: status=%d len=%d url=%s", r.status_code, len(r.text), embed_url)
+            if r.status_code != 200:
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            # Extract all images from background-image CSS
+            img_urls = []
+            for el in soup.select("[style]"):
+                style = el.get("style","")
+                for img_m in re.finditer(
+                    r"url\(['\"]?(https?://[^'\")\s]+\.(?:jpg|jpeg|png|webp))['\"]?\)",
+                    style, re.I):
+                    img_urls.append(img_m.group(1))
+
+            # Also check <img> tags
+            for img in soup.select("img"):
+                src = img.get("src","")
+                if src and src.startswith("http") and not any(
+                    x in src for x in ["emoji","thumb_small"]):
+                    img_urls.append(src)
+
+            if img_urls:
+                # Download the best (largest) image
+                best_url = img_urls[0]
+                img_bytes = download_bytes(best_url, MAX_IMAGE_SIZE)
+                if img_bytes and len(img_bytes) > 1000:
+                    ext = best_url.rsplit(".",1)[-1].split("?")[0].lower() or "jpg"
+                    if ext not in {"jpg","jpeg","png","webp"}:
+                        ext = "jpg"
+                    fname = f"tg_{channel}_{msg_id}.{ext}"
+                    log.info("tg_embed: image %dKB from %s", len(img_bytes)//1024, best_url)
+                    return img_bytes, fname
+
+            # Check for video in embed
+            video_el = soup.select_one("video source, video[src]")
+            if video_el:
+                vurl = video_el.get("src","")
+                if vurl and vurl.startswith("http"):
+                    vbytes = download_bytes(vurl, 200*1024*1024)
+                    if vbytes and len(vbytes) > 1000:
+                        fname = f"tg_{channel}_{msg_id}.mp4"
+                        log.info("tg_embed: video %.1fMB", len(vbytes)/1024/1024)
+                        return vbytes, fname
+        except Exception as e:
+            log.warning("tg_embed %s: %s", embed_url, e)
+
+    # Strategy 2: t.me/s/ HTML scrape (before=msg_id+1 to get exact message)
+    try:
+        preview_url = f"https://t.me/s/{channel}?before={int(msg_id)+1}"
+        r2 = WEB.get(preview_url, headers={"User-Agent": UA_DESK}, timeout=20)
+        log.debug("tg_scrape: status=%d len=%d", r2.status_code, len(r2.text))
+        if r2.status_code == 200:
+            soup2 = BeautifulSoup(r2.text, "html.parser")
+            for wrap in soup2.select(".tgme_widget_message_wrap"):
+                div = wrap.select_one(".tgme_widget_message")
+                if not div:
+                    continue
+                post_id = div.get("data-post","")
+                if not post_id.endswith(f"/{msg_id}"):
+                    continue
+                # Images via background-image
+                for photo_el in wrap.select(".tgme_widget_message_photo_wrap"):
+                    style = photo_el.get("style","")
+                    mi = re.search(r"url\(['\"]?(https?://[^'\")\s]+)['\"]?\)", style)
+                    if mi:
+                        img_bytes = download_bytes(mi.group(1), MAX_IMAGE_SIZE)
+                        if img_bytes and len(img_bytes) > 500:
+                            ext = mi.group(1).rsplit(".",1)[-1].split("?")[0] or "jpg"
+                            fname = f"tg_{channel}_{msg_id}.{ext}"
+                            log.info("tg_scrape: image %dKB", len(img_bytes)//1024)
+                            return img_bytes, fname
+    except Exception as e:
+        log.warning("tg_scrape: %s", e)
+
+    # Strategy 3: yt-dlp for video content
     log.info("tg_download: trying yt-dlp for %s", msg_url)
     result = social_download_ytdlp(msg_url)
     if result:
@@ -1470,24 +1548,65 @@ def tg_download_media_web(msg_url: str) -> Optional[tuple[bytes, str]]:
 
 # ─── Twitter / X ─────────────────────────────────────────────────────────────
 # Public Nitter instances (Twitter frontend, no auth needed)
+# Nitter instances — auto-tested on startup, sorted by availability
+# Updated list from https://github.com/zedeus/nitter/wiki/Instances (May 2026)
 NITTER_INSTANCES = [
-    "https://nitter.privacydev.net",
+    "https://nitter.net",
+    "https://nitter.it",
+    "https://nitter.nl",
+    "https://nitter.42l.fr",
+    "https://nitter.moomoo.me",
+    "https://nitter.cz",
+    "https://nitter.unixfox.eu",
     "https://nitter.poast.org",
-    "https://nitter.1d4.us",
-    "https://nitter.kavin.rocks",
+    "https://nitter.privacydev.net",
     "https://twiiit.com",
 ]
+_nitter_cache: list[str] = []   # working instances cached after first check
+
+
+def _get_working_nitter() -> list[str]:
+    """Return list of currently working Nitter instances (cached for 1 hour)."""
+    global _nitter_cache
+    if _nitter_cache:
+        return _nitter_cache
+    working = []
+    for inst in NITTER_INSTANCES:
+        try:
+            r = WEB.get(f"{inst}/jack", timeout=6,
+                        headers={"User-Agent": UA_MOB}, allow_redirects=True)
+            if r.status_code == 200 and "timeline" in r.text.lower():
+                working.append(inst)
+                log.debug("nitter OK: %s", inst)
+                if len(working) >= 3:
+                    break
+        except Exception:
+            pass
+    if not working:
+        log.warning("No working Nitter instances found, using all")
+        working = NITTER_INSTANCES
+    _nitter_cache = working
+    log.info("Working Nitter instances: %s", working)
+    return working
+
 
 def twitter_get_channel(username: str, limit: int = 20) -> list[dict]:
-    """Read Twitter/X user timeline via Nitter (no auth needed)."""
+    """
+    Read Twitter/X user timeline.
+    Strategy 1: Nitter HTML scrape (working instances)
+    Strategy 2: Twitter Syndication API
+    Strategy 3: xcancel RSS
+    """
     log.info("twitter_get_channel: @%s", username)
     username = username.lstrip("@").strip()
-    for instance in NITTER_INSTANCES:
+
+    # Strategy 1: Nitter working instances
+    for instance in _get_working_nitter():
         url = f"{instance}/{username}"
         try:
-            r = WEB.get(url, headers={"User-Agent": UA_DESK,
+            r = WEB.get(url, headers={"User-Agent": UA_MOB,
                                        "Accept-Language": "en-US,en;q=0.9"},
-                        timeout=20)
+                        timeout=15)
             log.debug("nitter %s: status=%d len=%d", instance, r.status_code, len(r.text))
             if r.status_code != 200:
                 continue
@@ -1497,26 +1616,23 @@ def twitter_get_channel(username: str, limit: int = 20) -> list[dict]:
                 tweet_content = item.select_one(".tweet-content")
                 if not tweet_content:
                     continue
-                # Full text — no truncation
                 text = tweet_content.get_text("\n", strip=True)
                 date_el = item.select_one(".tweet-date a")
                 date = date_el.get("title", "") if date_el else ""
                 tweet_path = date_el.get("href", "") if date_el else ""
-                tweet_url = f"https://twitter.com{tweet_path}" if tweet_path.startswith("/") else tweet_path
+                tweet_url = (f"https://twitter.com{tweet_path}"
+                             if tweet_path.startswith("/") else tweet_path)
                 nitter_url = f"{instance}{tweet_path}" if tweet_path else ""
                 has_video = bool(item.select(".attachment.video-container, .gif"))
-                # Collect all image URLs
-                img_tags = item.select(".still-image img, .attachment.image img")
-                img_urls = [img.get("src","") for img in img_tags if img.get("src")]
-                # Make absolute
-                img_urls = [f"{instance}{u}" if u.startswith("/") else u for u in img_urls]
+                img_tags  = item.select(".still-image img, .attachment.image img")
+                img_urls  = [f"{instance}{img.get('src','')}"
+                             if img.get("src","").startswith("/")
+                             else img.get("src","")
+                             for img in img_tags if img.get("src")]
                 tweets.append({
-                    "text": text,
-                    "date": date[:19].replace("T", " "),
-                    "url": tweet_url,
-                    "nitter_url": nitter_url,
-                    "has_video": has_video,
-                    "has_photo": bool(img_urls),
+                    "text": text, "date": date[:19].replace("T"," "),
+                    "url": tweet_url, "nitter_url": nitter_url,
+                    "has_video": has_video, "has_photo": bool(img_urls),
                     "img_urls": img_urls,
                 })
             if tweets:
@@ -1524,7 +1640,69 @@ def twitter_get_channel(username: str, limit: int = 20) -> list[dict]:
                 return tweets
         except Exception as e:
             log.warning("nitter %s: %s", instance, e)
-    log.error("twitter_get_channel: all Nitter instances failed")
+
+    # Strategy 2: Twitter Syndication API (no auth, public timelines)
+    try:
+        r2 = WEB.get(
+            f"https://syndication.twitter.com/srv/timeline-profile/screen-name/"
+            f"{username}?showReplies=false",
+            headers={"User-Agent": UA_DESK}, timeout=15)
+        log.debug("twitter syndication: status=%d", r2.status_code)
+        if r2.status_code == 200:
+            m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+                          r2.text, re.S)
+            if m:
+                jdata = json.loads(m.group(1))
+                entries = (jdata.get("props",{}).get("pageProps",{})
+                               .get("timeline",{}).get("entries",[]))
+                tweets = []
+                for entry in entries[:limit]:
+                    tw = entry.get("content",{}).get("tweet",{})
+                    if not tw: continue
+                    tw_id  = tw.get("id_str","")
+                    media  = tw.get("extended_entities",{}).get("media",[]) or []
+                    img_urls = [md.get("media_url_https","") for md in media
+                                if md.get("type") == "photo"]
+                    tweets.append({
+                        "text": tw.get("full_text") or tw.get("text",""),
+                        "date": tw.get("created_at","")[:19],
+                        "url": f"https://twitter.com/{username}/status/{tw_id}",
+                        "nitter_url": "", "has_video": False,
+                        "has_photo": bool(img_urls), "img_urls": img_urls,
+                    })
+                if tweets:
+                    log.info("twitter syndication: %d tweets", len(tweets))
+                    return tweets
+    except Exception as e:
+        log.warning("twitter syndication: %s", e)
+
+    # Strategy 3: xcancel RSS
+    try:
+        r3 = WEB.get(f"https://xcancel.com/{username}/rss",
+                     headers={"User-Agent": UA_DESK}, timeout=15)
+        log.debug("xcancel rss: status=%d", r3.status_code)
+        if r3.status_code == 200:
+            soup = BeautifulSoup(r3.content, "xml")
+            tweets = []
+            for item in soup.select("item")[:limit]:
+                title   = (item.find("title") or {}).get_text(strip=True)
+                link    = (item.find("link") or {}).get_text(strip=True)
+                desc    = BeautifulSoup(
+                    (item.find("description") or {}).get_text(strip=True),
+                    "html.parser").get_text(" ", strip=True)
+                pubdate = (item.find("pubDate") or {}).get_text(strip=True)
+                tweets.append({
+                    "text": f"{title}\n{desc}".strip(),
+                    "date": pubdate[:19], "url": link, "nitter_url": "",
+                    "has_video": False, "has_photo": False, "img_urls": [],
+                })
+            if tweets:
+                log.info("xcancel RSS: %d tweets", len(tweets))
+                return tweets
+    except Exception as e:
+        log.warning("xcancel rss: %s", e)
+
+    log.error("twitter_get_channel: all strategies failed for @%s", username)
     return []
 
 

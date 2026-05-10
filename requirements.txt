@@ -15,11 +15,12 @@ shot-scraper>=1.5.0
 telethon>=1.43.0
 instaloader>=4.10.0
 pytubefix>=6.0.0
-zlibrary>=2.0.0
+zlibrary>=1.0.0
 spotdl>=4.2.0
+python-dotenv>=1.0.0
 
-# System packages:
+# System packages (install with apt):
 # sudo apt-get install -y tesseract-ocr tesseract-ocr-fas ffmpeg wkhtmltopdf
 # python -m playwright install chromium
 # python -m playwright install-deps chromium
-# shot-scraper install     ← installs its own Chromium browser
+# shot-scraper install
