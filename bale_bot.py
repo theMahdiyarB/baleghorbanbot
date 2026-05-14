@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.1)
+بله قربان — Bale Bot  (v9)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -348,12 +348,14 @@ def main_menu_kb():
          {"text": "☁️ SoundCloud",        "callback_data": "mode_soundcloud"}],
         [{"text": "🖼 دانلود عکس",        "callback_data": "mode_images"},
          {"text": "🐙 GitHub",            "callback_data": "mode_github"}],
+        [{"text": "📱 دانلود APK",        "callback_data": "mode_apk"},
+         {"text": "📚 Z-Library کتاب",   "callback_data": "mode_zlib"}],
         [{"text": "✈️ کانال تلگرام",      "callback_data": "mode_tg_channel"},
          {"text": "🐦 توییتر / X",        "callback_data": "mode_twitter"}],
         [{"text": "📸 اینستاگرام",        "callback_data": "mode_instagram"},
          {"text": "🎵 تیک‌تاک",           "callback_data": "mode_tiktok"}],
         [{"text": "📰 اخبار RSS",         "callback_data": "mode_rss"},
-         {"text": "📚 Z-Library کتاب",   "callback_data": "mode_zlib"}],
+         {"text": "🌐 ترجمه",             "callback_data": "mode_translate"}],
         [{"text": "🖼 OCR متن از عکس",   "callback_data": "mode_ocr"},
          {"text": "🌐 IP / دامنه",        "callback_data": "mode_iplookup"}],
         [{"text": "📊 آمار کاربری",       "callback_data": "stats"},
@@ -467,6 +469,42 @@ def zlib_book_kb(book_url_key: str) -> dict:
         [{"text": "🔙 برگشت",        "callback_data": "zlib_back"},
          {"text": "🏠 منوی اصلی",   "callback_data": "home"}],
     ]}
+
+
+def apk_kb():
+    """منوی APK Downloader."""
+    return {"inline_keyboard": [
+        [{"text": "🔍 جستجوی اپ",    "callback_data": "apk_search"},
+         {"text": "📦 دانلود مستقیم","callback_data": "apk_direct"}],
+        [{"text": "❌ انصراف",         "callback_data": "cancel"}],
+    ]}
+
+
+def apk_results_kb(results: list, cache_key: str) -> dict:
+    """نتایج جستجوی Google Play به‌صورت دکمه."""
+    rows = []
+    for i, app in enumerate(results[:8]):
+        title = app.get("title", f"App {i+1}")[:30]
+        score = app.get("score", 0)
+        stars = f"⭐{score:.1f}" if score else ""
+        price = "" if app.get("free", True) else f" 💰{app.get('price','')}"
+        label = f"📱 {title} {stars}{price}".strip()[:55]
+        rows.append([{"text": label, "callback_data": f"apk_item_{cache_key}_{i}"}])
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+    return {"inline_keyboard": rows}
+
+
+def apk_item_kb(app_id: str) -> dict:
+    """دکمه‌های اقدام برای یک اپ."""
+    safe_id = app_id.replace(".", "_")
+    return {"inline_keyboard": [
+        [{"text": "📥 دانلود APK",      "callback_data": f"apk_dl_{safe_id}"},
+         {"text": "🌐 صفحه Play Store", "callback_data": f"apk_store_{safe_id}"}],
+        [{"text": "🔙 برگشت به نتایج",  "callback_data": "apk_back"},
+         {"text": "🏠 منوی اصلی",       "callback_data": "home"}],
+    ]}
+
+
 
 
 def social_results_kb(results: list, cache_key: str, platform: str) -> dict:
@@ -2329,7 +2367,371 @@ def generate_qr(text: str) -> Optional[bytes]:
         return None
 
 
+# ─── Google Play / APK Download ───────────────────────────────────────────────
+
+def gplay_search(query: str, n_hits: int = 8, country: str = "us") -> list[dict]:
+    """
+    Search Google Play Store for apps.
+    Uses google-play-scraper (reads official Play Store HTML, no auth needed).
+    """
+    log.info("gplay_search: %r", query)
+    try:
+        from google_play_scraper import search as gps_search
+        results = gps_search(query, n_hits=n_hits, lang="en", country=country)
+        apps = []
+        for r in results:
+            apps.append({
+                "app_id":    r.get("appId",""),
+                "title":     r.get("title",""),
+                "developer": r.get("developer",""),
+                "score":     round(r.get("score") or 0, 1),
+                "installs":  r.get("installs",""),
+                "icon":      r.get("icon",""),
+                "free":      r.get("free", True),
+                "price":     r.get("price", 0),
+                "summary":   r.get("summary","")[:150],
+                "genre":     r.get("genre",""),
+                "url":       f"https://play.google.com/store/apps/details?id={r.get('appId','')}",
+            })
+        log.info("gplay_search: %d results", len(apps))
+        return apps
+    except Exception as e:
+        log.error("gplay_search: %s", e, exc_info=True)
+        return []
+
+
+def gplay_app_info(app_id: str) -> Optional[dict]:
+    """Get detailed info for a specific app from Google Play."""
+    log.info("gplay_app_info: %s", app_id)
+    try:
+        from google_play_scraper import app as gps_app
+        r = gps_app(app_id, lang="en", country="us")
+        return {
+            "app_id":        r.get("appId",""),
+            "title":         r.get("title",""),
+            "developer":     r.get("developer",""),
+            "score":         round(r.get("score") or 0, 1),
+            "ratings":       r.get("ratings", 0),
+            "installs":      r.get("installs",""),
+            "size":          r.get("size",""),
+            "updated":       r.get("updated",""),
+            "android_ver":   r.get("androidVersion",""),
+            "version":       r.get("version",""),
+            "free":          r.get("free", True),
+            "price":         r.get("price", 0),
+            "icon":          r.get("icon",""),
+            "summary":       r.get("summary","")[:200],
+            "description":   (r.get("description","") or "")[:600],
+            "genre":         r.get("genre",""),
+            "content_rating":r.get("contentRating",""),
+            "url":           f"https://play.google.com/store/apps/details?id={r.get('appId','')}",
+        }
+    except Exception as e:
+        log.error("gplay_app_info: %s", e)
+        return None
+
+
+def apk_download(app_id: str) -> Optional[tuple[bytes, str]]:
+    """
+    Download APK for a given package name.
+    Multi-source strategy:
+    1. APKCombo (fast CDN, no auth)
+    2. APKPure download API
+    3. APKMirror (scrape)
+    4. Aptoide public API
+    """
+    log.info("apk_download: %s", app_id)
+
+    # Strategy 1: APKCombo direct download
+    # APKCombo has direct CDN links accessible without login
+    try:
+        # First get the app page to find the download link
+        app_url = f"https://apkcombo.com/app/{app_id}/"
+        r = WEB.get(app_url, headers={"User-Agent": UA_DESK,
+                                       "Accept-Language": "en-US,en;q=0.9"},
+                    timeout=20)
+        log.debug("apkcombo app page: status=%d", r.status_code)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "html.parser")
+            # Find download link — APKCombo uses data-url or href attributes
+            for sel in ["a.download[href*='.apk']",
+                        "a[href*='/download/apk']",
+                        "a.variant-item[href*='.apk']",
+                        "a[href*='apkcombo']"]:
+                link = soup.select_one(sel)
+                if link:
+                    dl_url = link.get("href","")
+                    if not dl_url.startswith("http"):
+                        dl_url = f"https://apkcombo.com{dl_url}"
+                    log.info("apkcombo: found link %s", dl_url[:80])
+                    apk_bytes = download_bytes(dl_url, 500*1024*1024)
+                    if apk_bytes and len(apk_bytes) > 10000:
+                        fname = f"{app_id}.apk"
+                        log.info("apkcombo OK: %.1fMB", len(apk_bytes)/1024/1024)
+                        return apk_bytes, fname
+    except Exception as e:
+        log.warning("apkcombo: %s", e)
+
+    # Strategy 2: APKPure download endpoint
+    try:
+        # APKPure uses a specific URL pattern for downloads
+        dl_page_url = f"https://d.apkpure.com/b/APK/{app_id}?version=latest"
+        r2 = WEB.get(dl_page_url,
+                     headers={"User-Agent": UA_MOB,
+                              "Referer": f"https://apkpure.com/{app_id}/{app_id}"},
+                     allow_redirects=True, timeout=30)
+        log.debug("apkpure dl: status=%d content-type=%s",
+                  r2.status_code, r2.headers.get("content-type",""))
+        ct = r2.headers.get("content-type","")
+        if r2.status_code == 200 and ("octet-stream" in ct or "zip" in ct or
+                                       "android" in ct or len(r2.content) > 100_000):
+            fname = f"{app_id}.apk"
+            log.info("apkpure OK: %.1fMB", len(r2.content)/1024/1024)
+            return r2.content, fname
+    except Exception as e:
+        log.warning("apkpure: %s", e)
+
+    # Strategy 3: APKMirror scrape
+    try:
+        # APKMirror search to find the app's download page
+        search_url = f"https://www.apkmirror.com/?post_type=app_release&searchtype=app&s={urllib.parse.quote(app_id)}"
+        r3 = WEB.get(search_url, headers={"User-Agent": UA_DESK}, timeout=20)
+        log.debug("apkmirror search: status=%d", r3.status_code)
+        if r3.status_code == 200:
+            soup3 = BeautifulSoup(r3.text, "html.parser")
+            # Find first result
+            first = soup3.select_one(".appRowTitle a, .widget-header a")
+            if first:
+                app_page = "https://www.apkmirror.com" + first.get("href","")
+                r4 = WEB.get(app_page, headers={"User-Agent": UA_DESK}, timeout=15)
+                soup4 = BeautifulSoup(r4.text, "html.parser")
+                # Find APK download link
+                dl_link = soup4.select_one("a[href*='/wp-content/themes/APKMirror']")
+                if not dl_link:
+                    dl_link = soup4.select_one(".downloadButton a, a.accent_bg[href*='download']")
+                if dl_link:
+                    dl_url = dl_link.get("href","")
+                    if not dl_url.startswith("http"):
+                        dl_url = "https://www.apkmirror.com" + dl_url
+                    apk_bytes = download_bytes(dl_url, 500*1024*1024)
+                    if apk_bytes and len(apk_bytes) > 10000:
+                        fname = f"{app_id}.apk"
+                        log.info("apkmirror OK: %.1fMB", len(apk_bytes)/1024/1024)
+                        return apk_bytes, fname
+    except Exception as e:
+        log.warning("apkmirror: %s", e)
+
+    # Strategy 4: Aptoide public API
+    try:
+        api_url = f"https://ws75.aptoide.com/api/7/app/get/package_name={app_id}/limit=1"
+        r5 = WEB.get(api_url, headers={"User-Agent": "BaleBot/1.0"}, timeout=15)
+        log.debug("aptoide: status=%d", r5.status_code)
+        if r5.status_code == 200:
+            jdata = r5.json()
+            dl_url = (jdata.get("nodes",{}).get("primary",{})
+                          .get("data",{}).get("file",{}).get("path",""))
+            if dl_url:
+                apk_bytes = download_bytes(dl_url, 500*1024*1024)
+                if apk_bytes and len(apk_bytes) > 10000:
+                    fname = f"{app_id}.apk"
+                    log.info("aptoide OK: %.1fMB", len(apk_bytes)/1024/1024)
+                    return apk_bytes, fname
+    except Exception as e:
+        log.warning("aptoide: %s", e)
+
+    log.error("apk_download: all sources failed for %s", app_id)
+    return None
+
+
+# ─── Google Play / APK Download ───────────────────────────────────────────────
+
+def gplay_search(query: str, n_hits: int = 8, country: str = "us") -> list[dict]:
+    """
+    Search Google Play Store using google-play-scraper.
+    Returns app metadata (no APK download — that's done separately).
+    """
+    log.info("gplay_search: %r", query)
+    try:
+        from google_play_scraper import search
+        results = search(query, n_hits=n_hits, lang="en", country=country)
+        apps = []
+        for r in results:
+            apps.append({
+                "app_id":    r.get("appId",""),
+                "title":     r.get("title",""),
+                "developer": r.get("developer",""),
+                "score":     r.get("score", 0),
+                "installs":  r.get("installs",""),
+                "size":      r.get("size",""),
+                "icon":      r.get("icon",""),
+                "free":      r.get("free", True),
+                "price":     r.get("price","Free"),
+                "summary":   r.get("summary","")[:200],
+                "version":   r.get("version",""),
+                "url":       f"https://play.google.com/store/apps/details?id={r.get('appId','')}",
+            })
+        log.info("gplay_search: %d results", len(apps))
+        return apps
+    except Exception as e:
+        log.error("gplay_search: %s", e)
+        return []
+
+
+def gplay_app_info(app_id: str) -> Optional[dict]:
+    """Get full app metadata from Google Play."""
+    log.info("gplay_app_info: %s", app_id)
+    try:
+        from google_play_scraper import app as gp_app
+        r = gp_app(app_id, lang="en", country="us")
+        return {
+            "app_id":      r.get("appId",""),
+            "title":       r.get("title",""),
+            "developer":   r.get("developer",""),
+            "score":       r.get("score",0),
+            "ratings":     r.get("ratings",0),
+            "installs":    r.get("realInstalls","") or r.get("installs",""),
+            "size":        r.get("size",""),
+            "icon":        r.get("icon",""),
+            "free":        r.get("free", True),
+            "price":       r.get("price","Free"),
+            "description": (r.get("description","")[:500]),
+            "version":     r.get("version",""),
+            "updated":     r.get("updated",""),
+            "android":     r.get("androidVersionText",""),
+            "category":    r.get("genre",""),
+            "url":         f"https://play.google.com/store/apps/details?id={r.get('appId','')}",
+        }
+    except Exception as e:
+        log.error("gplay_app_info: %s", e)
+        return None
+
+
+def apk_download(app_id: str) -> Optional[tuple[bytes, str]]:
+    """
+    Download APK from multiple free sources.
+    Strategy 1: APKPure CDN (direct download link extraction)
+    Strategy 2: APKMirror scraping
+    Strategy 3: Aptoide API
+    Strategy 4: F-Droid (open-source apps only)
+    """
+    log.info("apk_download: %s", app_id)
+
+    # Strategy 1: APKPure — largest free APK mirror, structured URLs
+    try:
+        # APKPure download page follows predictable URL pattern
+        app_name_slug = app_id.replace(".", "-").lower()
+        apkpure_url = f"https://apkpure.com/{app_name_slug}/{app_id}/downloading"
+        r = WEB.get(apkpure_url,
+                    headers={"User-Agent": UA_DESK, "Referer": "https://apkpure.com/"},
+                    timeout=20)
+        log.debug("apkpure page: status=%d", r.status_code)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "html.parser")
+            # Find direct download link
+            dl_link = None
+            for a in soup.select("a[href*='.apk'], a[id='download_link'], "
+                                  "a.download_apk_btn, a[data-dt-url]"):
+                href = a.get("href","") or a.get("data-dt-url","")
+                if href and ".apk" in href.lower():
+                    dl_link = href
+                    break
+            # Also check meta refresh / JS redirect
+            if not dl_link:
+                m = re.search(r'href=["\']([^"\']+\.apk[^"\']*)["\']', r.text)
+                if m:
+                    dl_link = m.group(1)
+            if dl_link:
+                log.info("apkpure: downloading from %s", dl_link[:80])
+                apk_data = download_bytes(dl_link, 200*1024*1024)
+                if apk_data and len(apk_data) > 10000:
+                    fname = f"{app_id}.apk"
+                    log.info("apkpure OK: %.1fMB", len(apk_data)/1024/1024)
+                    return apk_data, fname
+    except Exception as e:
+        log.error("apkpure: %s", e)
+
+    # Strategy 2: APKPure API endpoint (alternative)
+    try:
+        api_url = f"https://d.apkpure.com/b/APK/{app_id}?version=latest"
+        r2 = WEB.get(api_url,
+                     headers={"User-Agent": UA_MOB,
+                              "Referer": f"https://apkpure.com/{app_id}/{app_id}"},
+                     allow_redirects=True, timeout=30)
+        log.debug("apkpure api: status=%d final_url=%s", r2.status_code, r2.url[:80])
+        ct = r2.headers.get("content-type","")
+        if r2.status_code == 200 and ("apk" in ct.lower() or "zip" in ct.lower()
+                                       or "octet" in ct.lower()
+                                       or len(r2.content) > 100000):
+            fname = f"{app_id}.apk"
+            log.info("apkpure api OK: %.1fMB", len(r2.content)/1024/1024)
+            return r2.content, fname
+    except Exception as e:
+        log.error("apkpure api: %s", e)
+
+    # Strategy 3: APKMirror — premium source, rate-limited
+    try:
+        # Convert package name to APKMirror URL pattern
+        slug = app_id.replace(".", "-")
+        am_search_url = f"https://www.apkmirror.com/?post_type=app_release&searchtype=apk&s={app_id}"
+        r3 = WEB.get(am_search_url,
+                     headers={"User-Agent": UA_DESK,
+                              "Accept": "text/html,application/xhtml+xml"},
+                     timeout=20)
+        log.debug("apkmirror search: status=%d", r3.status_code)
+        if r3.status_code == 200:
+            soup3 = BeautifulSoup(r3.text, "html.parser")
+            # Find first app result
+            first = soup3.select_one(".appRowVariantTag a, .widget-header a")
+            if first:
+                app_path = first.get("href","")
+                if app_path:
+                    app_full = f"https://www.apkmirror.com{app_path}" if app_path.startswith("/") else app_path
+                    # Get app page to find download button
+                    rapp = WEB.get(app_full,
+                                   headers={"User-Agent": UA_DESK}, timeout=20)
+                    soup_app = BeautifulSoup(rapp.text, "html.parser")
+                    dl_btn = soup_app.select_one("a.downloadButton, a[class*='download']")
+                    if dl_btn:
+                        dl_href = dl_btn.get("href","")
+                        if dl_href:
+                            dl_full = f"https://www.apkmirror.com{dl_href}" if dl_href.startswith("/") else dl_href
+                            apk_data = download_bytes(dl_full, 200*1024*1024)
+                            if apk_data and len(apk_data) > 10000:
+                                fname = f"{app_id}.apk"
+                                log.info("apkmirror OK: %.1fMB", len(apk_data)/1024/1024)
+                                return apk_data, fname
+    except Exception as e:
+        log.error("apkmirror: %s", e)
+
+    # Strategy 4: F-Droid (open-source apps only)
+    try:
+        fdroid_url = f"https://f-droid.org/repo/{app_id}_999999.apk"
+        # F-Droid has structured filenames: {packageName}_{versionCode}.apk
+        # Try latest via API first
+        api_r = WEB.get(f"https://f-droid.org/api/v1/packages/{app_id}",
+                        headers={"User-Agent": "BaleBot/1.0"}, timeout=10)
+        log.debug("fdroid api: status=%d", api_r.status_code)
+        if api_r.status_code == 200:
+            pkg_data = api_r.json()
+            versions = pkg_data.get("packages",[])
+            if versions:
+                latest_ver = versions[0].get("versionCode",0)
+                apk_url = f"https://f-droid.org/repo/{app_id}_{latest_ver}.apk"
+                apk_data = download_bytes(apk_url, 200*1024*1024)
+                if apk_data and len(apk_data) > 10000:
+                    fname = f"{app_id}.apk"
+                    log.info("fdroid OK: %.1fMB", len(apk_data)/1024/1024)
+                    return apk_data, fname
+    except Exception as e:
+        log.error("fdroid: %s", e)
+
+    log.error("apk_download: all strategies failed for %s", app_id)
+    return None
+
+
 # ─── Z-Library ────────────────────────────────────────────────────────────────
+
+
 
 def _zlib_run(coro):
     """Run an async coroutine synchronously (for use from sync bot handlers)."""
@@ -2641,6 +3043,7 @@ HELP_TEXT = """❓ *راهنمای بله قربان*
 🎵 *تیک‌تاک* — لیست ویدیوها + دانلود (لینک مستقیم هم کار می‌کند)
 📰 *اخبار RSS* — دریافت فید + کشف خودکار فید سایت
 📚 *Z-Library* — جستجو و دانلود کتاب/مقاله (PDF، EPUB، MOBI، FB2)
+📱 *دانلود APK* — جستجوی Google Play + دانلود APK (APKPure / APKMirror / F-Droid)
 🌐 *ترجمه* — ۶ زبان، متن طولانی
 🖼 *OCR* — استخراج متن از عکس + PDF
 🌐 *IP/دامنه* — اطلاعات موقعیت و اپراتور
@@ -3229,6 +3632,111 @@ def do_zlib_download(cid: int, book_url: str):
     clear_state(cid)
 
 
+def do_apk_search(cid: int, query: str):
+    """Search Google Play and show results as clickable buttons."""
+    bump(cid, "searches")
+    send_message(cid, f"🔍 Searching Google Play for: _{query}_…", parse_mode="Markdown")
+    chat_action(cid)
+    results = gplay_search(query, n_hits=8)
+    if not results:
+        send_message(cid,
+            "❌ No apps found.\n"
+            "• Try the package name (e.g. `org.telegram.messenger`)\n"
+            "• Or use: `pip install google-play-scraper`",
+            parse_mode="Markdown", reply_markup=home_kb())
+        return
+    key = make_cache_key("apk", query, 0)
+    cache_set(key, results)
+    set_state(cid, mode="apk", last_query=query, cache_key=key)
+    kb = apk_results_kb(results, key)
+    send_message(cid, f"📱 *Google Play results for:* _{query}_\nTap an app for details:",
+                 parse_mode="Markdown", reply_markup=kb)
+
+
+def do_apk_show(cid: int, app: dict):
+    """Show full app info with icon, then download button."""
+    app_id  = app.get("app_id", "")
+    title   = app.get("title", "Unknown")
+    dev     = app.get("developer", "")
+    score   = app.get("score", 0)
+    inst    = app.get("installs", "")
+    size    = app.get("size", "")
+    version = app.get("version", "")
+    android = app.get("android", "")
+    cat     = app.get("category", "")
+    summary = app.get("summary", "") or app.get("description", "")
+    free    = app.get("free", True)
+    price   = app.get("price", "Free")
+    icon    = app.get("icon", "")
+
+    # Send app icon
+    if icon:
+        try:
+            icon_bytes = download_bytes(icon, MAX_IMAGE_SIZE)
+            if icon_bytes and len(icon_bytes) > 500:
+                send_photo(cid, icon_bytes, caption=f"📱 {title}")
+        except Exception as e:
+            log.warning("apk icon: %s", e)
+
+    # App info text
+    lines = [f"📱 *{title}*"]
+    if dev:     lines.append(f"👤 Developer: {dev}")
+    if score:   lines.append(f"⭐ Rating: {score:.1f}/5")
+    if inst:    lines.append(f"📊 Installs: {inst}")
+    if version: lines.append(f"🔢 Version: {version}")
+    if size:    lines.append(f"💾 Size: {size}")
+    if android: lines.append(f"🤖 Android: {android}")
+    if cat:     lines.append(f"🏷 Category: {cat}")
+    lines.append(f"💳 Price: {'Free' if free else price}")
+    if summary: lines.append(f"\n_{summary[:300]}_")
+    lines.append(f"\n`{app_id}`")
+
+    send_message(cid, "\n".join(lines), parse_mode="Markdown",
+                 reply_markup=apk_item_kb(app_id))
+
+
+def do_apk_download(cid: int, app_id: str):
+    """Download APK and send to user."""
+    bump(cid, "downloads")
+    # Get fresh info
+    info = gplay_app_info(app_id)
+    name = info.get("title", app_id) if info else app_id
+    size = info.get("size", "") if info else ""
+    size_hint = f" (~{size})" if size else ""
+
+    send_message(cid,
+        f"⏳ Downloading APK: *{name}*{size_hint}\n"
+        f"`{app_id}`\n\n"
+        "Trying multiple sources (APKPure → APKMirror → F-Droid)…",
+        parse_mode="Markdown")
+    chat_action(cid, "upload_document")
+
+    result = apk_download(app_id)
+    if not result:
+        send_message(cid,
+            "❌ APK download failed.\n\n"
+            "Possible reasons:\n"
+            "• App is not available on free mirrors\n"
+            "• App requires specific device/region\n"
+            "• Paid app (only free apps supported)\n\n"
+            f"Try manually: https://apkpure.com/{app_id}/{app_id}",
+            parse_mode="Markdown", reply_markup=home_kb())
+        return
+
+    data, fname = result
+    size_mb = len(data) / 1024 / 1024
+    log.info("APK: sending %s %.1fMB", fname, size_mb)
+
+    if smart_send(cid, data, fname, caption=f"📱 {name} — {fname}"):
+        send_message(cid,
+            f"✅ APK sent! ({size_mb:.1f}MB)\n\n"
+            "⚠️ *Install tip:* Enable 'Install unknown apps' in Android settings.",
+            parse_mode="Markdown", reply_markup=home_kb())
+    else:
+        send_message(cid, "❌ Send failed.", reply_markup=home_kb())
+    clear_state(cid)
+
+
 def do_rss(cid: int, query: str):
     """Handle RSS input: URL → fetch feed; non-URL → search for feeds on site."""
     bump(cid, "searches")
@@ -3668,8 +4176,9 @@ def handle_message(msg: dict):
         # RSS
         "rss":          lambda: do_rss(cid, text),
         # Z-Library
-        "zlib":         lambda: do_zlib_search(cid, text,
-                                               st.get("zlib_ext")),
+        "zlib":         lambda: do_zlib_search(cid, text, st.get("zlib_ext")),
+        # APK
+        "apk":          lambda: do_apk_search(cid, text),
     }
     if mode in dispatch:
         dispatch[mode]()
@@ -3735,9 +4244,10 @@ def handle_callback(cb: dict):
         "mode_open":      ("open",      "🌐 آدرس سایت را وارد کنید (https://…):"),
         "mode_scholar":   ("scholar",   "📚 عنوان یا کلمه‌کلیدی مقاله:"),
         "mode_wiki":      ("wiki",      "📖 موضوع ویکی‌پدیا:"),
-        "mode_music":     ("music",     "🎵 Track/artist name or paste a URL (Spotify/SoundCloud/YouTube):"),
-        "mode_spotify":   ("music",     "🟢 Paste a Spotify track, album, or playlist URL:"),
-        "mode_soundcloud":("music",     "☁️ Paste a SoundCloud URL or search: artist name - song:"),
+        "mode_music":      ("music",     "🎵 Track/artist name or paste a URL (Spotify/SoundCloud/YouTube):"),
+        "mode_spotify":    ("music",     "🟢 Paste a Spotify track, album, or playlist URL:"),
+        "mode_soundcloud": ("music",     "☁️ Paste a SoundCloud URL or search: artist name - song:"),
+        "mode_apk":        ("apk",       "📱 Enter app name or package ID (e.g. org.telegram.messenger):"),
         "mode_iplookup":  ("iplookup",  "🌐 آدرس IP یا دامنه:"),
         "mode_rss":       ("rss",       "📰 آدرس فید RSS یا سایت خبری را وارد کنید:"),
     }
@@ -3920,6 +4430,61 @@ def handle_callback(cb: dict):
         source, key, page = m.group(1), m.group(2), int(m.group(3))
         query = st.get("last_query","")
         do_images(cid, query, source, page); return
+
+    # ── APK callbacks ─────────────────────────────────────────────────────
+    if data == "mode_apk":
+        set_state(cid, mode="apk")
+        send_message(cid,
+            "📱 *Google Play APK Downloader*\n\n"
+            "Enter an app name or package ID:\n"
+            "• `telegram` ← search by name\n"
+            "• `org.telegram.messenger` ← direct package ID",
+            parse_mode="Markdown", reply_markup=cancel_kb())
+        return
+
+    # apk_item_{cache_key}_{idx} — user clicked an app in results
+    m = re.match(r"apk_item_(\w+)_(\d+)$", data)
+    if m:
+        key, idx = m.group(1), int(m.group(2))
+        results = cache_get(key)
+        if not results or idx >= len(results):
+            send_message(cid, "❌ Result expired. Search again."); return
+        app = results[idx]
+        # Fetch full info
+        chat_action(cid)
+        full_info = gplay_app_info(app["app_id"])
+        do_apk_show(cid, full_info or app)
+        return
+
+    # apk_dl_{safe_app_id} — download APK
+    m = re.match(r"apk_dl_(.+)$", data)
+    if m:
+        safe_id = m.group(1)
+        app_id  = safe_id.replace("_", ".")
+        do_apk_download(cid, app_id)
+        return
+
+    # apk_gplay_{safe_app_id} — open Google Play page (screenshot)
+    m = re.match(r"apk_gplay_(.+)$", data)
+    if m:
+        safe_id = m.group(1)
+        app_id  = safe_id.replace("_", ".")
+        gplay_url = f"https://play.google.com/store/apps/details?id={app_id}"
+        do_open_url(cid, gplay_url)
+        return
+
+    # apk_back — go back to last APK search results
+    if data == "apk_back":
+        query   = st.get("last_query","")
+        key     = st.get("cache_key","")
+        results = cache_get(key) if key else []
+        if results:
+            kb = apk_results_kb(results, key)
+            send_message(cid, f"📱 Results for: _{query}_",
+                         parse_mode="Markdown", reply_markup=kb)
+        else:
+            send_message(cid, "Search expired.", reply_markup=main_menu_kb())
+        return
 
     # ── Z-Library callbacks ───────────────────────────────────────────────
     if data == "mode_zlib":

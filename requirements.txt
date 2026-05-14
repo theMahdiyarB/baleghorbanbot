@@ -18,9 +18,16 @@ pytubefix>=6.0.0
 zlibrary>=1.0.0
 spotdl>=4.2.0
 python-dotenv>=1.0.0
+google-play-scraper>=1.2.0
 
 # System packages (install with apt):
-# sudo apt-get install -y tesseract-ocr tesseract-ocr-fas ffmpeg wkhtmltopdf
-# python -m playwright install chromium
-# python -m playwright install-deps chromium
-# shot-scraper install
+#   sudo apt-get install -y tesseract-ocr tesseract-ocr-fas ffmpeg wkhtmltopdf
+#   python -m playwright install chromium
+#   python -m playwright install-deps chromium
+#   shot-scraper install
+
+# Getting YouTube cookies (fixes bot detection on datacenter IPs):
+#   In Chrome: install "Get cookies.txt LOCALLY" extension
+#   Visit youtube.com while logged in → Export cookies → upload to server
+#   export YOUTUBE_COOKIES_FILE=/home/user/yt_cookies.txt
+#   or paste the "yt_cookies.txt" address in .env file
