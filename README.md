@@ -12,19 +12,26 @@
 | 🌐 **مشاهده سایت** | اسکرین‌شات ۱۹۲۰×۱۰۸۰ + دکمه‌های متن / HTML / ZIP / PDF |
 | 📚 **مقاله علمی** | جستجوی Google Scholar با صفحه‌بندی و نتایج قابل کلیک |
 | 📖 **ویکی‌پدیا** | جستجو + خواندن مقاله کامل (فارسی و انگلیسی) |
-| 📺 **یوتیوب** | جستجو با تامبنیل، دانلود ویدیو/صوت، ارسال لینک مستقیم |
-| 🎵 **موسیقی MP3** | دانلود صوتی از یوتیوب |
+| 📺 **یوتیوب** | جستجو با تامبنیل، دانلود ویدیو/صوت، ۵ استراتژی bypass + RapidAPI fallback |
+| 🎵 **موسیقی MP3** | دانلود صوتی از YouTube Music / SoundCloud / Spotify |
 | 🖼 **دانلود عکس** | Bing / Pinterest / Pixabay / Wikimedia با «دانلود بیشتر» |
 | 🐙 **GitHub** | جستجوی مخازن + دانلود ZIP + دانلود Release |
 | ✈️ **کانال تلگرام** | خواندن پیام‌های کانال عمومی (scrape) یا MTProto |
 | 🐦 **توییتر / X** | تایم‌لاین کاربر + دانلود عکس خودکار + دانلود ویدیو |
-| 📸 **اینستاگرام** | پست‌های پروفایل + دانلود عکس خودکار + دانلود ریل |
+| 📸 **اینستاگرام** | پست‌های پروفایل + دانلود عکس خودکار + دانلود ریل (۳ استراتژی: instaloader → yt-dlp → Cobalt API) |
 | 🎵 **تیک‌تاک** | لیست ویدیوها با تامبنیل + دانلود مستقیم |
+| 📱 **APK دانلود** | جستجو در Google Play + دانلود APK از APKPure / APKMirror / F-Droid / Aptoide |
 | 📰 **اخبار RSS** | دریافت فید + کشف خودکار فید از سایت |
+| 📚 **Z-Library** | جستجو و دانلود کتاب الکترونیکی |
 | 🌐 **ترجمه** | ترجمه به فارسی، انگلیسی، عربی، آلمانی، فرانسوی، روسی |
 | 🖼 **OCR** | استخراج متن از عکس + خروجی PDF |
 | 🌐 **IP / دامنه** | موقعیت، اپراتور، منطقه زمانی |
 | 🔒 **حریم خصوصی** | توضیح کامل نحوه عدم ذخیره داده |
+| 🔗 **کوتاه‌سازی لینک** | کوتاه کردن URL با TinyURL |
+| 📋 **Paste** | آپلود متن به paste.rs و دریافت لینک |
+| 🔍 **Expand URL** | باز کردن ریدایرکت‌های پنهان |
+| 🔐 **QR Code** | ساخت QR Code از هر متن یا لینک |
+| 💱 **تبدیل ارز** | نرخ لحظه‌ای ارز (مثل `100 USD to IRR`) |
 
 ### 🔗 تشخیص خودکار لینک
 فقط لینک بفرستید — ربات خودکار تشخیص می‌دهد:
@@ -75,6 +82,10 @@ export BALE_TOKEN="توکن_ربات_شما"
 yt-dlp --cookies-from-browser chrome --cookies /path/yt_cookies.txt https://youtube.com
 export YOUTUBE_COOKIES_FILE=/path/yt_cookies.txt
 
+# RapidAPI — fallback دانلود یوتیوب وقتی yt-dlp با 403 fail می‌شود
+# ثبت‌نام رایگان: https://rapidapi.com → جستجوی "youtube-search-download3"
+export RAPIDAPI_KEY=your_rapidapi_key_here
+
 # GitHub — افزایش rate limit API
 export GITHUB_TOKEN=your_github_personal_token
 
@@ -89,6 +100,17 @@ export TWITTER_COOKIES_FILE=/path/twitter_cookies.txt
 # Instagram — برای پروفایل‌های خصوصی
 export INSTAGRAM_USER=your_username
 export INSTAGRAM_PASS=your_password
+# کوکی فایل برای yt-dlp (جایگزین user/pass)
+export INSTAGRAM_COOKIES_FILE=/path/instagram_cookies.txt
+
+# Spotify — اختیاری، برای پلیلیست‌ها مفید است
+# از https://developer.spotify.com/dashboard بگیرید
+export SPOTIFY_CLIENT_ID=your_client_id
+export SPOTIFY_CLIENT_SECRET=your_client_secret
+
+# Z-Library: ایمیل و رمز حساب از z-library.sk/login
+export ZLIB_EMAIL=your@email.com
+export ZLIB_PASSWORD=your_password
 ```
 
 ### ۵. اجرا
@@ -168,8 +190,11 @@ tg_session.session ← نشست Telethon (ایجاد می‌شود)
 - **url_cache** — ذخیره URL برای دکمه‌های site-view
 - **smart_send** — ارسال هوشمند با chunking 19MB (مطابق index.js)
 - **127+ log statement** — لاگ DEBUG کامل در stdout + فایل
-- **۵ استراتژی YouTube** — cookies، Invidious، pytubefix، cobalt، yt-dlp clients
+- **۵ استراتژی YouTube** — cookies، player_client bypass، yt-dlp formats، RapidAPI fallback
+- **Instagram ۳ استراتژی** — instaloader → yt-dlp (با کوکی) → Cobalt API
+- **APK ۴ استراتژی** — APKPure → APKMirror → Aptoide → F-Droid
+- **همه پیام‌ها فارسی** — تمام متن‌های ارسالی به کاربر به زبان فارسی است
 
 ---
 
-**© 1404 — بله قربان**
+**© ۱۴۰۵ — بله قربان**

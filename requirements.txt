@@ -20,14 +20,30 @@ spotdl>=4.2.0
 python-dotenv>=1.0.0
 google-play-scraper>=1.2.0
 
-# System packages (install with apt):
-#   sudo apt-get install -y tesseract-ocr tesseract-ocr-fas ffmpeg wkhtmltopdf
+# ─── System packages (install with apt) ───────────────────────────────────────
+#   sudo apt-get install -y tesseract-ocr tesseract-ocr-fas tesseract-ocr-eng \
+#                           ffmpeg wkhtmltopdf python3-pip python3-dev
 #   python -m playwright install chromium
 #   python -m playwright install-deps chromium
 #   shot-scraper install
 
-# Getting YouTube cookies (fixes bot detection on datacenter IPs):
-#   In Chrome: install "Get cookies.txt LOCALLY" extension
-#   Visit youtube.com while logged in → Export cookies → upload to server
-#   export YOUTUBE_COOKIES_FILE=/home/user/yt_cookies.txt
-#   or paste the "yt_cookies.txt" address in .env file
+# ─── YouTube: cookie export (strongly recommended on datacenter servers) ───────
+#   Install "Get cookies.txt LOCALLY" extension in Chrome
+#   Visit youtube.com while logged in → Export cookies → save as yt_cookies.txt
+#   Set in .env: YOUTUBE_COOKIES_FILE=/path/to/yt_cookies.txt
+#
+#   Alternative (headless server):
+#   yt-dlp --cookies-from-browser chrome --cookies /path/yt_cookies.txt https://youtube.com
+
+# ─── RapidAPI fallback for YouTube (when yt-dlp gets 403) ────────────────────
+#   Sign up free at https://rapidapi.com
+#   Subscribe to "youtube-search-download3" (boztek-technology) — free tier available
+#   Set in .env: RAPIDAPI_KEY=your_key_here
+
+# ─── Instagram cookie export ──────────────────────────────────────────────────
+#   Same method as YouTube — export cookies from instagram.com session
+#   Set in .env: INSTAGRAM_COOKIES_FILE=/path/to/instagram_cookies.txt
+
+# ─── Spotify credentials (optional, needed for playlist downloads) ────────────
+#   Register at https://developer.spotify.com/dashboard → Create App
+#   Set in .env: SPOTIFY_CLIENT_ID=... and SPOTIFY_CLIENT_SECRET=...

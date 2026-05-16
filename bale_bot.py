@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v9)
+بله قربان — Bale Bot  (v1.2)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -41,8 +41,18 @@ TG_SESSION  = os.getenv("TG_SESSION_FILE", "tg_session")  # session file path
 TWITTER_COOKIES_FILE = os.getenv("TWITTER_COOKIES_FILE", "")
 
 # Instagram: optional login credentials
-INSTAGRAM_USER = os.getenv("INSTAGRAM_USER", "")
-INSTAGRAM_PASS = os.getenv("INSTAGRAM_PASS", "")
+INSTAGRAM_USER         = os.getenv("INSTAGRAM_USER", "")
+INSTAGRAM_PASS         = os.getenv("INSTAGRAM_PASS", "")
+INSTAGRAM_COOKIES_FILE = os.getenv("INSTAGRAM_COOKIES_FILE", "")
+
+# Spotify: optional client credentials for spotdl (helps with playlists/albums)
+# Get from: https://developer.spotify.com/dashboard
+SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+
+# RapidAPI: fallback YouTube downloader when yt-dlp fails (bot detection / 403)
+# Sign up free at https://rapidapi.com → subscribe to "youtube-search-download3"
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
 
 # Z-Library: ایمیل و رمز حساب از z-library.sk/login
 # ثبت‌نام رایگان در: https://z-library.sk/login
@@ -1098,7 +1108,8 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
             result = _run(args, url)
             if result:
                 return result
-        return None
+        # RapidAPI fallback for audio
+        return _youtube_rapidapi(url, audio_only=True)
     else:
         for fmt in [
             "bestvideo[height<=720]+bestaudio/best[height<=720]",
@@ -1117,6 +1128,70 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
                         if trimmed:
                             result = trimmed
                 return result
+        # RapidAPI fallback for video
+        return _youtube_rapidapi(url, audio_only=False)
+
+def _youtube_rapidapi(url: str, audio_only: bool = False) -> Optional[tuple[bytes, str]]:
+    """Fallback YouTube downloader via RapidAPI (youtube-search-download3).
+    Used when yt-dlp fails due to bot detection / HTTP 403.
+    Requires RAPIDAPI_KEY env var (free tier available at rapidapi.com).
+    """
+    if not RAPIDAPI_KEY:
+        log.warning("_youtube_rapidapi: RAPIDAPI_KEY not set, skipping")
+        return None
+    log.info("_youtube_rapidapi: trying RapidAPI fallback for %s", url)
+    m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", url)
+    if not m:
+        log.warning("_youtube_rapidapi: cannot extract video ID from %s", url)
+        return None
+    vid_id = m.group(1)
+    try:
+        resp = WEB.get(
+            "https://youtube-search-download3.p.rapidapi.com/download",
+            params={"video": vid_id},
+            headers={
+                "x-rapidapi-key":  RAPIDAPI_KEY,
+                "x-rapidapi-host": "youtube-search-download3.p.rapidapi.com",
+            },
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            log.warning("_youtube_rapidapi: status=%d", resp.status_code)
+            return None
+        data_j = resp.json()
+        links = data_j.get("links", {})
+        chosen_url = None
+        chosen_ext = "mp4"
+        if audio_only:
+            for key in ["mp3", "m4a", "audio"]:
+                if key in links:
+                    chosen_url = links[key]
+                    chosen_ext = "mp3"
+                    break
+        else:
+            for key in ["720", "480", "360", "240", "mp4"]:
+                if key in links:
+                    chosen_url = links[key]
+                    break
+        if not chosen_url:
+            for k, v in links.items():
+                if isinstance(v, str) and v.startswith("http"):
+                    chosen_url = v
+                    break
+        if not chosen_url:
+            log.warning("_youtube_rapidapi: no usable link. keys=%s", list(links.keys()))
+            return None
+        log.info("_youtube_rapidapi: downloading from %s", chosen_url[:80])
+        vid_bytes = download_bytes(chosen_url, MAX_FILE_SIZE * 2)
+        if not vid_bytes or len(vid_bytes) < 10000:
+            log.warning("_youtube_rapidapi: download too small or failed")
+            return None
+        title = data_j.get("title", vid_id)[:60].replace("/", "_").replace("\\", "_")
+        fname = f"{title}.{chosen_ext}"
+        log.info("_youtube_rapidapi OK: %.1fMB  %s", len(vid_bytes)/1024/1024, fname)
+        return vid_bytes, fname
+    except Exception as e:
+        log.error("_youtube_rapidapi: %s", e)
         return None
 
 def _trim_video(src: Path, tmp: str, ffmpeg_dir="/usr/bin") -> Optional[tuple[bytes,Path]]:
@@ -1900,12 +1975,37 @@ def instagram_download_all(url: str) -> list[dict]:
 
     # Strategy 2: yt-dlp (single video/reel, no carousel support)
     try:
-        result = social_download_ytdlp(url)
+        ig_cookies = INSTAGRAM_COOKIES_FILE
+        result = social_download_ytdlp(url, cookies_file=ig_cookies)
         if result:
             data, fname = result
             return [{"data": data, "fname": fname, "caption": "", "is_video": True}]
     except Exception as e:
         log.error("yt-dlp instagram: %s", e)
+
+    # Strategy 3: Cobalt API (cobalt.tools) — no auth needed, handles reels well
+    try:
+        resp = WEB.post(
+            "https://api.cobalt.tools/",
+            json={"url": url, "videoQuality": "720", "filenameStyle": "basic"},
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            j = resp.json()
+            status = j.get("status", "")
+            dl_url = j.get("url") or (j.get("picker", [{}])[0].get("url") if j.get("picker") else None)
+            if dl_url and status in ("tunnel", "redirect", "stream"):
+                log.info("cobalt instagram: downloading from %s", dl_url[:80])
+                vid_bytes = download_bytes(dl_url, MAX_FILE_SIZE * 2)
+                if vid_bytes and len(vid_bytes) > 10000:
+                    fname = f"instagram_reel.mp4"
+                    log.info("cobalt instagram OK: %.1fMB", len(vid_bytes)/1024/1024)
+                    return [{"data": vid_bytes, "fname": fname, "caption": "", "is_video": True}]
+            else:
+                log.warning("cobalt instagram: status=%s j=%s", status, str(j)[:200])
+    except Exception as e:
+        log.error("cobalt instagram: %s", e)
 
     return []
 
@@ -2365,182 +2465,6 @@ def generate_qr(text: str) -> Optional[bytes]:
     except Exception as e:
         log.error("generate_qr: %s", e)
         return None
-
-
-# ─── Google Play / APK Download ───────────────────────────────────────────────
-
-def gplay_search(query: str, n_hits: int = 8, country: str = "us") -> list[dict]:
-    """
-    Search Google Play Store for apps.
-    Uses google-play-scraper (reads official Play Store HTML, no auth needed).
-    """
-    log.info("gplay_search: %r", query)
-    try:
-        from google_play_scraper import search as gps_search
-        results = gps_search(query, n_hits=n_hits, lang="en", country=country)
-        apps = []
-        for r in results:
-            apps.append({
-                "app_id":    r.get("appId",""),
-                "title":     r.get("title",""),
-                "developer": r.get("developer",""),
-                "score":     round(r.get("score") or 0, 1),
-                "installs":  r.get("installs",""),
-                "icon":      r.get("icon",""),
-                "free":      r.get("free", True),
-                "price":     r.get("price", 0),
-                "summary":   r.get("summary","")[:150],
-                "genre":     r.get("genre",""),
-                "url":       f"https://play.google.com/store/apps/details?id={r.get('appId','')}",
-            })
-        log.info("gplay_search: %d results", len(apps))
-        return apps
-    except Exception as e:
-        log.error("gplay_search: %s", e, exc_info=True)
-        return []
-
-
-def gplay_app_info(app_id: str) -> Optional[dict]:
-    """Get detailed info for a specific app from Google Play."""
-    log.info("gplay_app_info: %s", app_id)
-    try:
-        from google_play_scraper import app as gps_app
-        r = gps_app(app_id, lang="en", country="us")
-        return {
-            "app_id":        r.get("appId",""),
-            "title":         r.get("title",""),
-            "developer":     r.get("developer",""),
-            "score":         round(r.get("score") or 0, 1),
-            "ratings":       r.get("ratings", 0),
-            "installs":      r.get("installs",""),
-            "size":          r.get("size",""),
-            "updated":       r.get("updated",""),
-            "android_ver":   r.get("androidVersion",""),
-            "version":       r.get("version",""),
-            "free":          r.get("free", True),
-            "price":         r.get("price", 0),
-            "icon":          r.get("icon",""),
-            "summary":       r.get("summary","")[:200],
-            "description":   (r.get("description","") or "")[:600],
-            "genre":         r.get("genre",""),
-            "content_rating":r.get("contentRating",""),
-            "url":           f"https://play.google.com/store/apps/details?id={r.get('appId','')}",
-        }
-    except Exception as e:
-        log.error("gplay_app_info: %s", e)
-        return None
-
-
-def apk_download(app_id: str) -> Optional[tuple[bytes, str]]:
-    """
-    Download APK for a given package name.
-    Multi-source strategy:
-    1. APKCombo (fast CDN, no auth)
-    2. APKPure download API
-    3. APKMirror (scrape)
-    4. Aptoide public API
-    """
-    log.info("apk_download: %s", app_id)
-
-    # Strategy 1: APKCombo direct download
-    # APKCombo has direct CDN links accessible without login
-    try:
-        # First get the app page to find the download link
-        app_url = f"https://apkcombo.com/app/{app_id}/"
-        r = WEB.get(app_url, headers={"User-Agent": UA_DESK,
-                                       "Accept-Language": "en-US,en;q=0.9"},
-                    timeout=20)
-        log.debug("apkcombo app page: status=%d", r.status_code)
-        if r.status_code == 200:
-            soup = BeautifulSoup(r.text, "html.parser")
-            # Find download link — APKCombo uses data-url or href attributes
-            for sel in ["a.download[href*='.apk']",
-                        "a[href*='/download/apk']",
-                        "a.variant-item[href*='.apk']",
-                        "a[href*='apkcombo']"]:
-                link = soup.select_one(sel)
-                if link:
-                    dl_url = link.get("href","")
-                    if not dl_url.startswith("http"):
-                        dl_url = f"https://apkcombo.com{dl_url}"
-                    log.info("apkcombo: found link %s", dl_url[:80])
-                    apk_bytes = download_bytes(dl_url, 500*1024*1024)
-                    if apk_bytes and len(apk_bytes) > 10000:
-                        fname = f"{app_id}.apk"
-                        log.info("apkcombo OK: %.1fMB", len(apk_bytes)/1024/1024)
-                        return apk_bytes, fname
-    except Exception as e:
-        log.warning("apkcombo: %s", e)
-
-    # Strategy 2: APKPure download endpoint
-    try:
-        # APKPure uses a specific URL pattern for downloads
-        dl_page_url = f"https://d.apkpure.com/b/APK/{app_id}?version=latest"
-        r2 = WEB.get(dl_page_url,
-                     headers={"User-Agent": UA_MOB,
-                              "Referer": f"https://apkpure.com/{app_id}/{app_id}"},
-                     allow_redirects=True, timeout=30)
-        log.debug("apkpure dl: status=%d content-type=%s",
-                  r2.status_code, r2.headers.get("content-type",""))
-        ct = r2.headers.get("content-type","")
-        if r2.status_code == 200 and ("octet-stream" in ct or "zip" in ct or
-                                       "android" in ct or len(r2.content) > 100_000):
-            fname = f"{app_id}.apk"
-            log.info("apkpure OK: %.1fMB", len(r2.content)/1024/1024)
-            return r2.content, fname
-    except Exception as e:
-        log.warning("apkpure: %s", e)
-
-    # Strategy 3: APKMirror scrape
-    try:
-        # APKMirror search to find the app's download page
-        search_url = f"https://www.apkmirror.com/?post_type=app_release&searchtype=app&s={urllib.parse.quote(app_id)}"
-        r3 = WEB.get(search_url, headers={"User-Agent": UA_DESK}, timeout=20)
-        log.debug("apkmirror search: status=%d", r3.status_code)
-        if r3.status_code == 200:
-            soup3 = BeautifulSoup(r3.text, "html.parser")
-            # Find first result
-            first = soup3.select_one(".appRowTitle a, .widget-header a")
-            if first:
-                app_page = "https://www.apkmirror.com" + first.get("href","")
-                r4 = WEB.get(app_page, headers={"User-Agent": UA_DESK}, timeout=15)
-                soup4 = BeautifulSoup(r4.text, "html.parser")
-                # Find APK download link
-                dl_link = soup4.select_one("a[href*='/wp-content/themes/APKMirror']")
-                if not dl_link:
-                    dl_link = soup4.select_one(".downloadButton a, a.accent_bg[href*='download']")
-                if dl_link:
-                    dl_url = dl_link.get("href","")
-                    if not dl_url.startswith("http"):
-                        dl_url = "https://www.apkmirror.com" + dl_url
-                    apk_bytes = download_bytes(dl_url, 500*1024*1024)
-                    if apk_bytes and len(apk_bytes) > 10000:
-                        fname = f"{app_id}.apk"
-                        log.info("apkmirror OK: %.1fMB", len(apk_bytes)/1024/1024)
-                        return apk_bytes, fname
-    except Exception as e:
-        log.warning("apkmirror: %s", e)
-
-    # Strategy 4: Aptoide public API
-    try:
-        api_url = f"https://ws75.aptoide.com/api/7/app/get/package_name={app_id}/limit=1"
-        r5 = WEB.get(api_url, headers={"User-Agent": "BaleBot/1.0"}, timeout=15)
-        log.debug("aptoide: status=%d", r5.status_code)
-        if r5.status_code == 200:
-            jdata = r5.json()
-            dl_url = (jdata.get("nodes",{}).get("primary",{})
-                          .get("data",{}).get("file",{}).get("path",""))
-            if dl_url:
-                apk_bytes = download_bytes(dl_url, 500*1024*1024)
-                if apk_bytes and len(apk_bytes) > 10000:
-                    fname = f"{app_id}.apk"
-                    log.info("aptoide OK: %.1fMB", len(apk_bytes)/1024/1024)
-                    return apk_bytes, fname
-    except Exception as e:
-        log.warning("aptoide: %s", e)
-
-    log.error("apk_download: all sources failed for %s", app_id)
-    return None
 
 
 # ─── Google Play / APK Download ───────────────────────────────────────────────
@@ -3233,12 +3157,12 @@ def do_music(cid: int, query: str):
             _do_audio_download(cid, query, source="auto"); return
 
     # Search query — show results as buttons
-    send_message(cid, f"🔍 Searching for: _{query}_…", parse_mode="Markdown")
+    send_message(cid, f"🔍 در حال جستجو: _{query}_…", parse_mode="Markdown")
     chat_action(cid)
     results = music_search_multi(query)
 
     if not results:
-        send_message(cid, "❌ No results found. Try a different search.", reply_markup=home_kb())
+        send_message(cid, "❌ نتیجه‌ای یافت نشد. عبارت دیگری امتحان کنید.", reply_markup=home_kb())
         return
 
     key = make_cache_key("mu", query, 0)
@@ -3269,15 +3193,15 @@ def _do_audio_download(cid: int, url: str, source: str = "auto",
                         title: str = ""):
     """Download audio from a URL and send to user."""
     bump(cid, "downloads")
-    send_message(cid, f"⏳ Downloading audio…")
+    send_message(cid, f"⏳ در حال دانلود صدا…")
     chat_action(cid, "record_voice")
 
     result = music_download_ytdlp(url, source=source)
     if not result:
         send_message(cid,
-            "❌ Download failed.\n"
-            "• Try running: `yt-dlp -U`\n"
-            "• Or paste the URL directly from your browser.",
+            "❌ دانلود ناموفق بود.\n"
+            "• دستور `yt-dlp -U` را اجرا کنید تا yt-dlp آپدیت شود.\n"
+            "• یا لینک را مستقیم از مرورگر کپی کنید.",
             parse_mode="Markdown", reply_markup=home_kb())
         return
 
@@ -3285,9 +3209,9 @@ def _do_audio_download(cid: int, url: str, source: str = "auto",
     fname = Path(fname).name
     caption = f"🎵 {title or fname[:60]}"
     if smart_send(cid, data, fname, caption=caption, media_type="audio"):
-        send_message(cid, "✅ Sent!", reply_markup=home_kb())
+        send_message(cid, "✅ ارسال شد!", reply_markup=home_kb())
     else:
-        send_message(cid, "❌ Send failed.", reply_markup=home_kb())
+        send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
     clear_state(cid)
 
 
@@ -3299,16 +3223,16 @@ def do_spotify_dl(cid: int, url: str):
     is_playlist = "/playlist/" in url
 
     kind = "track" if is_track else "album" if is_album else "playlist" if is_playlist else "item"
-    send_message(cid, f"⏳ Downloading Spotify {kind}… (may take a while for albums)")
+    send_message(cid, f"⏳ در حال دانلود Spotify {kind}… (ممکن است کمی طول بکشد)")
     chat_action(cid, "record_voice")
 
     result = spotify_download(url)
     if not result:
         send_message(cid,
-            "❌ Spotify download failed.\n\n"
-            "Make sure `spotdl` is installed:\n"
+            "❌ دانلود Spotify ناموفق بود.\n\n"
+            "مطمئن شوید `spotdl` نصب است:\n"
             "`pip install spotdl`\n\n"
-            "For playlists, set Spotify credentials:\n"
+            "برای پلیلیست، توکن Spotify لازم است:\n"
             "`export SPOTIFY_CLIENT_ID=...`\n"
             "`export SPOTIFY_CLIENT_SECRET=...`",
             parse_mode="Markdown", reply_markup=home_kb())
@@ -3317,29 +3241,29 @@ def do_spotify_dl(cid: int, url: str):
     data, fname = result
     caption = f"🟢 Spotify — {fname[:60]}"
     if smart_send(cid, data, fname, caption=caption):
-        send_message(cid, "✅ Sent!", reply_markup=home_kb())
+        send_message(cid, "✅ ارسال شد!", reply_markup=home_kb())
     else:
-        send_message(cid, "❌ Send failed.", reply_markup=home_kb())
+        send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
     clear_state(cid)
 
 
 def do_soundcloud_dl(cid: int, url: str):
     """Download SoundCloud track/playlist."""
     bump(cid, "downloads")
-    send_message(cid, "⏳ Downloading from SoundCloud…")
+    send_message(cid, "⏳ در حال دانلود از SoundCloud…")
     chat_action(cid, "record_voice")
 
     result = soundcloud_download(url)
     if not result:
-        send_message(cid, "❌ SoundCloud download failed.", reply_markup=home_kb())
+        send_message(cid, "❌ دانلود SoundCloud ناموفق بود.", reply_markup=home_kb())
         return
 
     data, fname = result
     caption = f"☁️ SoundCloud — {fname[:60]}"
     if smart_send(cid, data, fname, caption=caption, media_type="audio"):
-        send_message(cid, "✅ Sent!", reply_markup=home_kb())
+        send_message(cid, "✅ ارسال شد!", reply_markup=home_kb())
     else:
-        send_message(cid, "❌ Send failed.", reply_markup=home_kb())
+        send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
     clear_state(cid)
 
 def do_images(cid: int, query: str, source: str, page=0):
@@ -3635,21 +3559,21 @@ def do_zlib_download(cid: int, book_url: str):
 def do_apk_search(cid: int, query: str):
     """Search Google Play and show results as clickable buttons."""
     bump(cid, "searches")
-    send_message(cid, f"🔍 Searching Google Play for: _{query}_…", parse_mode="Markdown")
+    send_message(cid, f"🔍 در حال جستجو در Google Play: _{query}_…", parse_mode="Markdown")
     chat_action(cid)
     results = gplay_search(query, n_hits=8)
     if not results:
         send_message(cid,
-            "❌ No apps found.\n"
-            "• Try the package name (e.g. `org.telegram.messenger`)\n"
-            "• Or use: `pip install google-play-scraper`",
+            "❌ اپلیکیشنی یافت نشد.\n"
+            "• نام پکیج را امتحان کنید (مثل `org.telegram.messenger`)\n"
+            "• یا دستور `pip install google-play-scraper` را اجرا کنید",
             parse_mode="Markdown", reply_markup=home_kb())
         return
     key = make_cache_key("apk", query, 0)
     cache_set(key, results)
     set_state(cid, mode="apk", last_query=query, cache_key=key)
     kb = apk_results_kb(results, key)
-    send_message(cid, f"📱 *Google Play results for:* _{query}_\nTap an app for details:",
+    send_message(cid, f"📱 *نتایج Google Play برای:* _{query}_\nبرای جزئیات روی اپ کلیک کنید:",
                  parse_mode="Markdown", reply_markup=kb)
 
 
@@ -3705,21 +3629,21 @@ def do_apk_download(cid: int, app_id: str):
     size_hint = f" (~{size})" if size else ""
 
     send_message(cid,
-        f"⏳ Downloading APK: *{name}*{size_hint}\n"
+        f"⏳ در حال دانلود APK: *{name}*{size_hint}\n"
         f"`{app_id}`\n\n"
-        "Trying multiple sources (APKPure → APKMirror → F-Droid)…",
+        "در حال امتحان منابع مختلف (APKPure → APKMirror → F-Droid)…",
         parse_mode="Markdown")
     chat_action(cid, "upload_document")
 
     result = apk_download(app_id)
     if not result:
         send_message(cid,
-            "❌ APK download failed.\n\n"
-            "Possible reasons:\n"
-            "• App is not available on free mirrors\n"
-            "• App requires specific device/region\n"
-            "• Paid app (only free apps supported)\n\n"
-            f"Try manually: https://apkpure.com/{app_id}/{app_id}",
+            "❌ دانلود APK ناموفق بود.\n\n"
+            "دلایل احتمالی:\n"
+            "• اپ در میرورهای رایگان موجود نیست\n"
+            "• اپ نیاز به دستگاه یا منطقه خاص دارد\n"
+            "• اپ پولی است (فقط اپ‌های رایگان پشتیبانی می‌شوند)\n\n"
+            f"دانلود دستی: https://apkpure.com/{app_id}/{app_id}",
             parse_mode="Markdown", reply_markup=home_kb())
         return
 
@@ -3729,11 +3653,11 @@ def do_apk_download(cid: int, app_id: str):
 
     if smart_send(cid, data, fname, caption=f"📱 {name} — {fname}"):
         send_message(cid,
-            f"✅ APK sent! ({size_mb:.1f}MB)\n\n"
-            "⚠️ *Install tip:* Enable 'Install unknown apps' in Android settings.",
+            f"✅ APK ارسال شد! ({size_mb:.1f}MB)\n\n"
+            "⚠️ *نکته:* گزینه «نصب از منابع ناشناس» را در تنظیمات اندروید فعال کنید.",
             parse_mode="Markdown", reply_markup=home_kb())
     else:
-        send_message(cid, "❌ Send failed.", reply_markup=home_kb())
+        send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
     clear_state(cid)
 
 
@@ -4480,10 +4404,10 @@ def handle_callback(cb: dict):
         results = cache_get(key) if key else []
         if results:
             kb = apk_results_kb(results, key)
-            send_message(cid, f"📱 Results for: _{query}_",
+            send_message(cid, f"📱 نتایج برای: _{query}_",
                          parse_mode="Markdown", reply_markup=kb)
         else:
-            send_message(cid, "Search expired.", reply_markup=main_menu_kb())
+            send_message(cid, "❌ جستجو منقضی شده. دوباره جستجو کنید.", reply_markup=main_menu_kb())
         return
 
     # ── Z-Library callbacks ───────────────────────────────────────────────
