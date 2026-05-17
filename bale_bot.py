@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.2)
+بله قربان — Bale Bot  (v1.3)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -1132,67 +1132,164 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
         return _youtube_rapidapi(url, audio_only=False)
 
 def _youtube_rapidapi(url: str, audio_only: bool = False) -> Optional[tuple[bytes, str]]:
-    """Fallback YouTube downloader via RapidAPI (youtube-search-download3).
-    Used when yt-dlp fails due to bot detection / HTTP 403.
-    Requires RAPIDAPI_KEY env var (free tier available at rapidapi.com).
+    """Fallback YouTube downloader via RapidAPI (youtube-video-fast-downloader-24-7).
+    Fetches quality options list, picks best fit, then downloads the stream URL.
+    Requires RAPIDAPI_KEY env var (free tier at rapidapi.com).
+    Falls back to Cobalt API if RapidAPI fails or key is missing.
     """
-    if not RAPIDAPI_KEY:
-        log.warning("_youtube_rapidapi: RAPIDAPI_KEY not set, skipping")
-        return None
-    log.info("_youtube_rapidapi: trying RapidAPI fallback for %s", url)
     m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", url)
     if not m:
         log.warning("_youtube_rapidapi: cannot extract video ID from %s", url)
-        return None
+        return _youtube_cobalt(url, audio_only)
     vid_id = m.group(1)
-    try:
-        resp = WEB.get(
-            "https://youtube-search-download3.p.rapidapi.com/download",
-            params={"video": vid_id},
-            headers={
+
+    if RAPIDAPI_KEY:
+        log.info("_youtube_rapidapi: trying RapidAPI for %s", vid_id)
+        try:
+            host = "youtube-video-fast-downloader-24-7.p.rapidapi.com"
+            headers = {
                 "x-rapidapi-key":  RAPIDAPI_KEY,
-                "x-rapidapi-host": "youtube-search-download3.p.rapidapi.com",
-            },
+                "x-rapidapi-host": host,
+                "Content-Type":    "application/json",
+            }
+            # Step 1: get available quality options
+            opts_resp = WEB.get(
+                f"https://{host}/video_quality_options/{vid_id}",
+                headers=headers, timeout=20,
+            )
+            log.debug("_youtube_rapidapi quality_options: status=%d", opts_resp.status_code)
+
+            chosen_itag = None
+            chosen_ext  = "mp3" if audio_only else "mp4"
+
+            if opts_resp.status_code == 200:
+                opts = opts_resp.json()  # list of {itag, qualityLabel, mimeType, …}
+                if audio_only:
+                    # Pick highest-bitrate audio stream
+                    audio_streams = [
+                        s for s in opts
+                        if "audio" in s.get("mimeType", "").lower()
+                        and "video" not in s.get("mimeType", "").lower()
+                    ]
+                    if audio_streams:
+                        chosen_itag = max(audio_streams,
+                                          key=lambda s: s.get("bitrate", 0)).get("itag")
+                        chosen_ext = "mp3"
+                else:
+                    # Pick best video≤720p that has audio (progressive streams have audioQuality)
+                    # itag 22 = 720p progressive, 18 = 360p progressive
+                    preferred_itags = [22, 18]  # progressive mp4s with audio baked in
+                    for itag in preferred_itags:
+                        if any(s.get("itag") == itag for s in opts):
+                            chosen_itag = itag
+                            break
+                    if not chosen_itag:
+                        # Fallback: any video stream ≤720p
+                        video_streams = [
+                            s for s in opts
+                            if "video" in s.get("mimeType", "").lower()
+                            and s.get("height", 9999) <= 720
+                            and s.get("audioQuality")  # must have audio
+                        ]
+                        if video_streams:
+                            chosen_itag = max(video_streams,
+                                              key=lambda s: s.get("height", 0)).get("itag")
+
+            if chosen_itag:
+                # Step 2: get the direct download URL for chosen itag
+                dl_resp = WEB.get(
+                    f"https://{host}/download_video/{vid_id}",
+                    params={"quality": chosen_itag},
+                    headers=headers, timeout=20,
+                )
+                log.debug("_youtube_rapidapi download_video: status=%d", dl_resp.status_code)
+                if dl_resp.status_code == 200:
+                    dl_data = dl_resp.json()
+                    # Response is typically {"url": "...", "title": "..."}
+                    # or may be the stream URL string directly
+                    if isinstance(dl_data, dict):
+                        stream_url = dl_data.get("url") or dl_data.get("downloadUrl") or ""
+                        title = dl_data.get("title", vid_id)[:60]
+                    elif isinstance(dl_data, str) and dl_data.startswith("http"):
+                        stream_url = dl_data
+                        title = vid_id
+                    else:
+                        stream_url = ""
+                        title = vid_id
+
+                    if stream_url:
+                        log.info("_youtube_rapidapi: downloading itag=%s from %s",
+                                 chosen_itag, stream_url[:80])
+                        vid_bytes = download_bytes(stream_url, MAX_FILE_SIZE * 2)
+                        if vid_bytes and len(vid_bytes) > 10000:
+                            fname = f"{title.replace('/', '_')}.{chosen_ext}"
+                            log.info("_youtube_rapidapi OK: %.1fMB  %s",
+                                     len(vid_bytes)/1024/1024, fname)
+                            return vid_bytes, fname
+                        log.warning("_youtube_rapidapi: download too small or empty")
+                    else:
+                        log.warning("_youtube_rapidapi: no stream URL in response: %s",
+                                    str(dl_data)[:200])
+            else:
+                log.warning("_youtube_rapidapi: no suitable itag found in quality options")
+
+        except Exception as e:
+            log.error("_youtube_rapidapi: %s", e)
+    else:
+        log.warning("_youtube_rapidapi: RAPIDAPI_KEY not set, skipping to Cobalt")
+
+    # Final fallback: Cobalt API
+    return _youtube_cobalt(url, audio_only)
+
+
+def _youtube_cobalt(url: str, audio_only: bool = False) -> Optional[tuple[bytes, str]]:
+    """Download YouTube video via Cobalt API (cobalt.tools) — no auth, no key needed.
+    Reliable fallback when yt-dlp and RapidAPI both fail.
+    """
+    log.info("_youtube_cobalt: trying cobalt.tools for %s", url)
+    try:
+        payload = {
+            "url": url,
+            "videoQuality": "720",
+            "filenameStyle": "basic",
+        }
+        if audio_only:
+            payload["downloadMode"] = "audio"
+
+        resp = WEB.post(
+            "https://api.cobalt.tools/",
+            json=payload,
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
             timeout=30,
         )
         if resp.status_code != 200:
-            log.warning("_youtube_rapidapi: status=%d", resp.status_code)
+            log.warning("_youtube_cobalt: status=%d", resp.status_code)
             return None
-        data_j = resp.json()
-        links = data_j.get("links", {})
-        chosen_url = None
-        chosen_ext = "mp4"
-        if audio_only:
-            for key in ["mp3", "m4a", "audio"]:
-                if key in links:
-                    chosen_url = links[key]
-                    chosen_ext = "mp3"
-                    break
+
+        j = resp.json()
+        status = j.get("status", "")
+        log.debug("_youtube_cobalt: status=%s keys=%s", status, list(j.keys()))
+
+        # Cobalt returns "tunnel", "redirect", or "picker" (for multiple streams)
+        dl_url = (j.get("url")
+                  or (j.get("picker", [{}])[0].get("url") if j.get("picker") else None))
+
+        if dl_url and status in ("tunnel", "redirect", "stream"):
+            log.info("_youtube_cobalt: downloading from %s", dl_url[:80])
+            vid_bytes = download_bytes(dl_url, MAX_FILE_SIZE * 2)
+            if vid_bytes and len(vid_bytes) > 10000:
+                ext = "mp3" if audio_only else "mp4"
+                m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", url)
+                fname = f"{m.group(1) if m else 'youtube'}.{ext}"
+                log.info("_youtube_cobalt OK: %.1fMB  %s", len(vid_bytes)/1024/1024, fname)
+                return vid_bytes, fname
+            log.warning("_youtube_cobalt: download too small or empty")
         else:
-            for key in ["720", "480", "360", "240", "mp4"]:
-                if key in links:
-                    chosen_url = links[key]
-                    break
-        if not chosen_url:
-            for k, v in links.items():
-                if isinstance(v, str) and v.startswith("http"):
-                    chosen_url = v
-                    break
-        if not chosen_url:
-            log.warning("_youtube_rapidapi: no usable link. keys=%s", list(links.keys()))
-            return None
-        log.info("_youtube_rapidapi: downloading from %s", chosen_url[:80])
-        vid_bytes = download_bytes(chosen_url, MAX_FILE_SIZE * 2)
-        if not vid_bytes or len(vid_bytes) < 10000:
-            log.warning("_youtube_rapidapi: download too small or failed")
-            return None
-        title = data_j.get("title", vid_id)[:60].replace("/", "_").replace("\\", "_")
-        fname = f"{title}.{chosen_ext}"
-        log.info("_youtube_rapidapi OK: %.1fMB  %s", len(vid_bytes)/1024/1024, fname)
-        return vid_bytes, fname
+            log.warning("_youtube_cobalt: unexpected response status=%s j=%s",
+                        status, str(j)[:200])
     except Exception as e:
-        log.error("_youtube_rapidapi: %s", e)
-        return None
+        log.error("_youtube_cobalt: %s", e)
+    return None
 
 def _trim_video(src: Path, tmp: str, ffmpeg_dir="/usr/bin") -> Optional[tuple[bytes,Path]]:
     out = Path(tmp) / ("trimmed_" + src.name)
@@ -1380,7 +1477,9 @@ def soundcloud_download(url: str) -> Optional[tuple[bytes, str]]:
 # ─── Generic yt-dlp social downloader ────────────────────────────────────────
 def social_download_ytdlp(url: str, audio_only=False,
                            cookies_file: str = "") -> Optional[tuple[bytes, str]]:
-    """Download from any yt-dlp-supported URL (TikTok, Instagram, Twitter, etc.)"""
+    """Download from any yt-dlp-supported URL (TikTok, Instagram, Twitter, etc.)
+    Falls back to Cobalt API if yt-dlp fails.
+    """
     log.info("social_download_ytdlp: %r  audio=%s", url, audio_only)
     import shutil
     ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
@@ -1410,16 +1509,74 @@ def social_download_ytdlp(url: str, audio_only=False,
             return data, f.name
 
     if audio_only:
-        return _run(["-x", "--audio-format", "mp3", "--audio-quality", "5"], url)
+        result = _run(["-x", "--audio-format", "mp3", "--audio-quality", "5"], url)
     else:
+        result = None
         for fmt in [
             ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"],
             ["-f", "best", "--merge-output-format", "mp4"],
             ["--merge-output-format", "mp4"],
         ]:
-            r = _run(fmt, url)
-            if r:
-                return r
+            result = _run(fmt, url)
+            if result:
+                break
+
+    if result:
+        return result
+
+    # Cobalt API fallback — handles TikTok, Twitter/X, Instagram, YouTube Shorts
+    return _social_cobalt(url, audio_only)
+
+
+def _social_cobalt(url: str, audio_only: bool = False) -> Optional[tuple[bytes, str]]:
+    """Cobalt API fallback for social media downloads (TikTok, Twitter/X, Instagram, etc.).
+    No API key required. Supports most major platforms.
+    """
+    log.info("_social_cobalt: trying cobalt.tools for %s", url)
+    try:
+        payload = {
+            "url": url,
+            "videoQuality": "720",
+            "filenameStyle": "basic",
+        }
+        if audio_only:
+            payload["downloadMode"] = "audio"
+
+        resp = WEB.post(
+            "https://api.cobalt.tools/",
+            json=payload,
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            log.warning("_social_cobalt: status=%d body=%s",
+                        resp.status_code, resp.text[:200])
+            return None
+
+        j = resp.json()
+        status = j.get("status", "")
+        log.debug("_social_cobalt: status=%s", status)
+
+        dl_url = (j.get("url")
+                  or (j.get("picker", [{}])[0].get("url") if j.get("picker") else None))
+
+        if dl_url and status in ("tunnel", "redirect", "stream"):
+            log.info("_social_cobalt: downloading from %s", dl_url[:80])
+            vid_bytes = download_bytes(dl_url, MAX_FILE_SIZE * 2)
+            if vid_bytes and len(vid_bytes) > 10000:
+                ext = "mp3" if audio_only else "mp4"
+                # Build a clean filename from URL domain
+                domain = re.search(r"(?:https?://)?(?:www\.)?([^/]+)", url)
+                prefix  = domain.group(1).split(".")[0] if domain else "social"
+                fname   = f"{prefix}_video.{ext}"
+                log.info("_social_cobalt OK: %.1fMB  %s", len(vid_bytes)/1024/1024, fname)
+                return vid_bytes, fname
+            log.warning("_social_cobalt: download too small or empty")
+        else:
+            log.warning("_social_cobalt: unexpected response: status=%s j=%s",
+                        status, str(j)[:200])
+    except Exception as e:
+        log.error("_social_cobalt: %s", e)
     return None
 
 
@@ -1902,6 +2059,11 @@ def twitter_download_media(tweet_url: str) -> Optional[tuple[bytes, str]]:
             except Exception as e:
                 log.warning("Nitter scrape %s: %s", instance, e)
 
+    # Strategy 5: Cobalt API — handles Twitter/X natively
+    cobalt_result = _social_cobalt(tweet_url)
+    if cobalt_result:
+        return cobalt_result
+
     log.error("twitter_download_media: all strategies failed for %s", tweet_url)
     return None
 
@@ -1984,28 +2146,10 @@ def instagram_download_all(url: str) -> list[dict]:
         log.error("yt-dlp instagram: %s", e)
 
     # Strategy 3: Cobalt API (cobalt.tools) — no auth needed, handles reels well
-    try:
-        resp = WEB.post(
-            "https://api.cobalt.tools/",
-            json={"url": url, "videoQuality": "720", "filenameStyle": "basic"},
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
-            timeout=30,
-        )
-        if resp.status_code == 200:
-            j = resp.json()
-            status = j.get("status", "")
-            dl_url = j.get("url") or (j.get("picker", [{}])[0].get("url") if j.get("picker") else None)
-            if dl_url and status in ("tunnel", "redirect", "stream"):
-                log.info("cobalt instagram: downloading from %s", dl_url[:80])
-                vid_bytes = download_bytes(dl_url, MAX_FILE_SIZE * 2)
-                if vid_bytes and len(vid_bytes) > 10000:
-                    fname = f"instagram_reel.mp4"
-                    log.info("cobalt instagram OK: %.1fMB", len(vid_bytes)/1024/1024)
-                    return [{"data": vid_bytes, "fname": fname, "caption": "", "is_video": True}]
-            else:
-                log.warning("cobalt instagram: status=%s j=%s", status, str(j)[:200])
-    except Exception as e:
-        log.error("cobalt instagram: %s", e)
+    cobalt = _social_cobalt(url, audio_only=False)
+    if cobalt:
+        vid_bytes, fname = cobalt
+        return [{"data": vid_bytes, "fname": fname, "caption": "", "is_video": True}]
 
     return []
 
@@ -2056,7 +2200,10 @@ def instagram_get_profile(username: str) -> list[dict]:
 
 # ─── TikTok ──────────────────────────────────────────────────────────────────
 def tiktok_download(url: str) -> Optional[tuple[bytes, str]]:
-    """Download TikTok video via yt-dlp (no auth needed for public videos)."""
+    """Download TikTok video.
+    Strategy 1: yt-dlp (no auth needed for public videos)
+    Strategy 2: Cobalt API (via social_download_ytdlp fallback)
+    """
     log.info("tiktok_download: %s", url)
     return social_download_ytdlp(url)
 
