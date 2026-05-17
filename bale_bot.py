@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.3)
+بله قربان — Bale Bot  (v1.4)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -506,6 +506,8 @@ def apk_results_kb(results: list, cache_key: str) -> dict:
 
 def apk_item_kb(app_id: str) -> dict:
     """دکمه‌های اقدام برای یک اپ."""
+    if not app_id:
+        return {"inline_keyboard": [[{"text": "🏠 منوی اصلی", "callback_data": "home"}]]}
     safe_id = app_id.replace(".", "_")
     return {"inline_keyboard": [
         [{"text": "📥 دانلود APK",      "callback_data": f"apk_dl_{safe_id}"},
@@ -1243,52 +1245,8 @@ def _youtube_rapidapi(url: str, audio_only: bool = False) -> Optional[tuple[byte
 
 
 def _youtube_cobalt(url: str, audio_only: bool = False) -> Optional[tuple[bytes, str]]:
-    """Download YouTube video via Cobalt API (cobalt.tools) — no auth, no key needed.
-    Reliable fallback when yt-dlp and RapidAPI both fail.
-    """
-    log.info("_youtube_cobalt: trying cobalt.tools for %s", url)
-    try:
-        payload = {
-            "url": url,
-            "videoQuality": "720",
-            "filenameStyle": "basic",
-        }
-        if audio_only:
-            payload["downloadMode"] = "audio"
-
-        resp = WEB.post(
-            "https://api.cobalt.tools/",
-            json=payload,
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
-            timeout=30,
-        )
-        if resp.status_code != 200:
-            log.warning("_youtube_cobalt: status=%d", resp.status_code)
-            return None
-
-        j = resp.json()
-        status = j.get("status", "")
-        log.debug("_youtube_cobalt: status=%s keys=%s", status, list(j.keys()))
-
-        # Cobalt returns "tunnel", "redirect", or "picker" (for multiple streams)
-        dl_url = (j.get("url")
-                  or (j.get("picker", [{}])[0].get("url") if j.get("picker") else None))
-
-        if dl_url and status in ("tunnel", "redirect", "stream"):
-            log.info("_youtube_cobalt: downloading from %s", dl_url[:80])
-            vid_bytes = download_bytes(dl_url, MAX_FILE_SIZE * 2)
-            if vid_bytes and len(vid_bytes) > 10000:
-                ext = "mp3" if audio_only else "mp4"
-                m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", url)
-                fname = f"{m.group(1) if m else 'youtube'}.{ext}"
-                log.info("_youtube_cobalt OK: %.1fMB  %s", len(vid_bytes)/1024/1024, fname)
-                return vid_bytes, fname
-            log.warning("_youtube_cobalt: download too small or empty")
-        else:
-            log.warning("_youtube_cobalt: unexpected response status=%s j=%s",
-                        status, str(j)[:200])
-    except Exception as e:
-        log.error("_youtube_cobalt: %s", e)
+    """Cobalt API — requires JWT auth (paid). Disabled."""
+    log.debug("_youtube_cobalt: skipped (Cobalt now requires JWT)")
     return None
 
 def _trim_video(src: Path, tmp: str, ffmpeg_dir="/usr/bin") -> Optional[tuple[bytes,Path]]:
@@ -1390,47 +1348,65 @@ def music_download_ytdlp(url: str, source: str = "auto") -> Optional[tuple[bytes
     log.info("music_download_ytdlp: %s source=%s", url, source)
     import shutil
     ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
-    with tempfile.TemporaryDirectory() as tmp:
-        cmd = [
-            "yt-dlp", "--no-playlist", "--no-warnings", "--no-check-certificate",
-            "--ffmpeg-location", ffmpeg_dir,
-            "--socket-timeout", "30", "--retries", "3",
-            "-o", os.path.join(tmp, "%(title).60s.%(ext)s"),
-            "-x", "--audio-format", "mp3", "--audio-quality", "0",
-            "--embed-thumbnail", "--add-metadata",
-        ]
-        is_yt = "youtube.com" in url or "youtu.be" in url
-        if is_yt:
-            if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).exists():
-                cmd += ["--cookies", YOUTUBE_COOKIES_FILE]
-                log.info("music_download: using YT cookies")
-            else:
-                cmd += ["--extractor-args", "youtube:player_client=tv_embedded,ios,web"]
-        cmd.append(url)
-        log.debug("music dl: %s", " ".join(cmd))
-        proc = subprocess.run(cmd, capture_output=True, timeout=300)
-        if proc.returncode != 0:
-            log.error("music dl rc=%d: %s", proc.returncode,
-                      proc.stderr.decode(errors="replace")[:400])
-            return None
-        files = [f for f in Path(tmp).glob("*")
-                 if f.suffix.lower() in {".mp3",".m4a",".ogg",".opus",".flac"}
-                 and f.stat().st_size > 1000]
-        if not files:
-            log.error("music dl: no output files")
-            return None
-        f = files[0]
-        data = f.read_bytes()
-        log.info("music dl OK: %s  %.1fMB", f.name, len(data)/1024/1024)
-        return data, f.name
+    is_yt = "youtube.com" in url or "youtu.be" in url
+
+    def _run_audio(extra_args: list) -> Optional[tuple[bytes, str]]:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = [
+                "yt-dlp", "--no-playlist", "--no-warnings", "--no-check-certificate",
+                "--ffmpeg-location", ffmpeg_dir,
+                "--socket-timeout", "30", "--retries", "3",
+                "-o", os.path.join(tmp, "%(title).60s.%(ext)s"),
+            ]
+            if is_yt:
+                if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).exists():
+                    base += ["--cookies", YOUTUBE_COOKIES_FILE]
+                else:
+                    base += ["--extractor-args", "youtube:player_client=tv_embedded,ios,web"]
+            cmd = base + extra_args + [url]
+            log.debug("music dl: %s", " ".join(cmd))
+            proc = subprocess.run(cmd, capture_output=True, timeout=300)
+            if proc.returncode != 0:
+                log.error("music dl rc=%d: %s", proc.returncode,
+                          proc.stderr.decode(errors="replace")[:400])
+                return None
+            files = [f for f in Path(tmp).glob("*")
+                     if f.suffix.lower() in {".mp3", ".m4a", ".ogg", ".opus", ".flac"}
+                     and f.stat().st_size > 1000]
+            if not files:
+                return None
+            f = files[0]
+            data = f.read_bytes()
+            log.info("music dl OK: %s  %.1fMB", f.name, len(data)/1024/1024)
+            return data, f.name
+
+    # Try progressively simpler format specs — avoids "Requested format not available"
+    for args in [
+        ["-x", "--audio-format", "mp3", "--audio-quality", "0",
+         "--embed-thumbnail", "--add-metadata"],
+        ["-x", "--audio-format", "mp3", "--audio-quality", "0"],
+        ["-x", "--audio-format", "mp3"],
+        ["-x"],
+    ]:
+        result = _run_audio(args)
+        if result:
+            return result
+
+    return None
 
 
 def spotify_download(url: str) -> Optional[tuple[bytes, str]]:
     """Download Spotify track/album/playlist via spotdl → MP3."""
     log.info("spotify_download: %s", url)
-    import shutil
+    import shutil, sys
     ffmpeg_path = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
-    spotdl_path = shutil.which("spotdl") or "spotdl"
+    # spotdl may be installed as a module even if the binary isn't on PATH
+    spotdl_path = (shutil.which("spotdl")
+                   or os.path.join(os.path.dirname(sys.executable), "spotdl")
+                   or os.path.expanduser("~/.local/bin/spotdl"))
+    # Verify it actually exists before trying
+    if not os.path.isfile(spotdl_path or ""):
+        spotdl_path = "spotdl"  # last resort — let subprocess resolve it
     with tempfile.TemporaryDirectory() as tmp:
         cmd = [spotdl_path, "download", url,
                "--format", "mp3", "--bitrate", "192k",
@@ -1529,54 +1505,8 @@ def social_download_ytdlp(url: str, audio_only=False,
 
 
 def _social_cobalt(url: str, audio_only: bool = False) -> Optional[tuple[bytes, str]]:
-    """Cobalt API fallback for social media downloads (TikTok, Twitter/X, Instagram, etc.).
-    No API key required. Supports most major platforms.
-    """
-    log.info("_social_cobalt: trying cobalt.tools for %s", url)
-    try:
-        payload = {
-            "url": url,
-            "videoQuality": "720",
-            "filenameStyle": "basic",
-        }
-        if audio_only:
-            payload["downloadMode"] = "audio"
-
-        resp = WEB.post(
-            "https://api.cobalt.tools/",
-            json=payload,
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
-            timeout=30,
-        )
-        if resp.status_code != 200:
-            log.warning("_social_cobalt: status=%d body=%s",
-                        resp.status_code, resp.text[:200])
-            return None
-
-        j = resp.json()
-        status = j.get("status", "")
-        log.debug("_social_cobalt: status=%s", status)
-
-        dl_url = (j.get("url")
-                  or (j.get("picker", [{}])[0].get("url") if j.get("picker") else None))
-
-        if dl_url and status in ("tunnel", "redirect", "stream"):
-            log.info("_social_cobalt: downloading from %s", dl_url[:80])
-            vid_bytes = download_bytes(dl_url, MAX_FILE_SIZE * 2)
-            if vid_bytes and len(vid_bytes) > 10000:
-                ext = "mp3" if audio_only else "mp4"
-                # Build a clean filename from URL domain
-                domain = re.search(r"(?:https?://)?(?:www\.)?([^/]+)", url)
-                prefix  = domain.group(1).split(".")[0] if domain else "social"
-                fname   = f"{prefix}_video.{ext}"
-                log.info("_social_cobalt OK: %.1fMB  %s", len(vid_bytes)/1024/1024, fname)
-                return vid_bytes, fname
-            log.warning("_social_cobalt: download too small or empty")
-        else:
-            log.warning("_social_cobalt: unexpected response: status=%s j=%s",
-                        status, str(j)[:200])
-    except Exception as e:
-        log.error("_social_cobalt: %s", e)
+    """Cobalt API — currently requires JWT auth (paid). Disabled."""
+    log.debug("_social_cobalt: skipped (JWT required by cobalt.tools)")
     return None
 
 
@@ -1720,8 +1650,7 @@ def tg_download_media_web(msg_url: str) -> Optional[tuple[bytes, str]]:
         return None
     channel, msg_id = m.group(1), m.group(2)
 
-    # Strategy 1: Telegram embed widget (teleFeed-inspired)
-    # The embed endpoint returns a page with full-size image URLs
+    # Strategy 1: Telegram embed widget
     for embed_url in [
         f"https://t.me/{channel}/{msg_id}?embed=1&mode=tme",
         f"https://t.me/{channel}/{msg_id}?embed=1",
@@ -1737,44 +1666,59 @@ def tg_download_media_web(msg_url: str) -> Optional[tuple[bytes, str]]:
                 continue
             soup = BeautifulSoup(r.text, "html.parser")
 
-            # Extract all images from background-image CSS
-            img_urls = []
-            for el in soup.select("[style]"):
-                style = el.get("style","")
-                for img_m in re.finditer(
-                    r"url\(['\"]?(https?://[^'\")\s]+\.(?:jpg|jpeg|png|webp))['\"]?\)",
-                    style, re.I):
-                    img_urls.append(img_m.group(1))
-
-            # Also check <img> tags
-            for img in soup.select("img"):
-                src = img.get("src","")
-                if src and src.startswith("http") and not any(
-                    x in src for x in ["emoji","thumb_small"]):
-                    img_urls.append(src)
-
-            if img_urls:
-                # Download the best (largest) image
-                best_url = img_urls[0]
-                img_bytes = download_bytes(best_url, MAX_IMAGE_SIZE)
-                if img_bytes and len(img_bytes) > 1000:
-                    ext = best_url.rsplit(".",1)[-1].split("?")[0].lower() or "jpg"
-                    if ext not in {"jpg","jpeg","png","webp"}:
-                        ext = "jpg"
-                    fname = f"tg_{channel}_{msg_id}.{ext}"
-                    log.info("tg_embed: image %dKB from %s", len(img_bytes)//1024, best_url)
-                    return img_bytes, fname
-
-            # Check for video in embed
-            video_el = soup.select_one("video source, video[src]")
+            # Check for video first
+            video_el = soup.select_one("video source[src], video[src]")
             if video_el:
-                vurl = video_el.get("src","")
+                vurl = video_el.get("src", "")
                 if vurl and vurl.startswith("http"):
                     vbytes = download_bytes(vurl, 200*1024*1024)
                     if vbytes and len(vbytes) > 1000:
                         fname = f"tg_{channel}_{msg_id}.mp4"
                         log.info("tg_embed: video %.1fMB", len(vbytes)/1024/1024)
                         return vbytes, fname
+
+            # Extract message photo (background-image on photo wrap elements only)
+            # Avoid picking up channel avatar — only look inside message body
+            img_urls = []
+            for el in soup.select(".tgme_widget_message_photo_wrap, "
+                                   ".tgme_widget_message_document_wrap"):
+                style = el.get("style", "")
+                for m2 in re.finditer(
+                    r"url\(['\"]?(https?://[^'\")\s]+\.(?:jpg|jpeg|png|webp))['\"]?\)",
+                    style, re.I):
+                    img_urls.append(m2.group(1))
+
+            # Also check <img> tags inside message content (not the header/avatar area)
+            for img in soup.select(".tgme_widget_message_photo img, "
+                                    ".tgme_widget_message_sticker img"):
+                src = img.get("src", "")
+                if src and src.startswith("http"):
+                    img_urls.append(src)
+
+            if img_urls:
+                best_url = img_urls[0]
+                img_bytes = download_bytes(best_url, MAX_IMAGE_SIZE)
+                if img_bytes and len(img_bytes) > 5000:  # >5KB to skip tiny avatars
+                    ext = best_url.rsplit(".", 1)[-1].split("?")[0].lower() or "jpg"
+                    if ext not in {"jpg", "jpeg", "png", "webp"}:
+                        ext = "jpg"
+                    fname = f"tg_{channel}_{msg_id}.{ext}"
+                    log.info("tg_embed: image %dKB from %s", len(img_bytes)//1024, best_url)
+                    return img_bytes, fname
+
+            # Check for document/file link
+            doc_el = soup.select_one(".tgme_widget_message_document_wrap a[href],"
+                                      "a.tgme_widget_message_document[href]")
+            if doc_el:
+                doc_url = doc_el.get("href", "")
+                if doc_url and doc_url.startswith("http"):
+                    doc_bytes = download_bytes(doc_url, 200*1024*1024)
+                    if doc_bytes and len(doc_bytes) > 100:
+                        fname_raw = doc_el.get_text(strip=True) or f"tg_{channel}_{msg_id}.bin"
+                        fname = re.sub(r"[^\w.\-]", "_", fname_raw)[:80]
+                        log.info("tg_embed: document %dKB %s", len(doc_bytes)//1024, fname)
+                        return doc_bytes, fname
+
         except Exception as e:
             log.warning("tg_embed %s: %s", embed_url, e)
 
@@ -1821,41 +1765,50 @@ def tg_download_media_web(msg_url: str) -> Optional[tuple[bytes, str]]:
 # Nitter instances — auto-tested on startup, sorted by availability
 # Updated list from https://github.com/zedeus/nitter/wiki/Instances (May 2026)
 NITTER_INSTANCES = [
-    "https://nitter.net",
-    "https://nitter.it",
-    "https://nitter.nl",
-    "https://nitter.42l.fr",
-    "https://nitter.moomoo.me",
     "https://nitter.cz",
-    "https://nitter.unixfox.eu",
-    "https://nitter.poast.org",
-    "https://nitter.privacydev.net",
     "https://twiiit.com",
+    "https://nitter.poast.org",
+    "https://nitter.net",
+    "https://nitter.42l.fr",
+    "https://nitter.privacydev.net",
 ]
-_nitter_cache: list[str] = []   # working instances cached after first check
+_nitter_cache: list[str] = []
+_nitter_cache_time: float = 0.0
 
 
 def _get_working_nitter() -> list[str]:
-    """Return list of currently working Nitter instances (cached for 1 hour)."""
-    global _nitter_cache
-    if _nitter_cache:
+    """Return list of currently working Nitter instances (cached for 30 min, parallel check)."""
+    global _nitter_cache, _nitter_cache_time
+    import time, concurrent.futures
+    now = time.time()
+    if _nitter_cache and (now - _nitter_cache_time) < 1800:
         return _nitter_cache
-    working = []
-    for inst in NITTER_INSTANCES:
+
+    def _check(inst: str) -> Optional[str]:
         try:
-            r = WEB.get(f"{inst}/jack", timeout=6,
+            r = WEB.get(f"{inst}/x", timeout=4,
                         headers={"User-Agent": UA_MOB}, allow_redirects=True)
-            if r.status_code == 200 and "timeline" in r.text.lower():
-                working.append(inst)
-                log.debug("nitter OK: %s", inst)
-                if len(working) >= 3:
-                    break
+            if r.status_code in (200, 302) and len(r.text) > 500:
+                return inst
         except Exception:
             pass
+        return None
+
+    working = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        futures = {ex.submit(_check, inst): inst for inst in NITTER_INSTANCES}
+        for fut in concurrent.futures.as_completed(futures, timeout=8):
+            result = fut.result()
+            if result:
+                working.append(result)
+                if len(working) >= 2:
+                    break
+
     if not working:
-        log.warning("No working Nitter instances found, using all")
-        working = NITTER_INSTANCES
+        log.warning("No working Nitter instances — using first two as fallback")
+        working = NITTER_INSTANCES[:2]
     _nitter_cache = working
+    _nitter_cache_time = now
     log.info("Working Nitter instances: %s", working)
     return working
 
@@ -2400,36 +2353,39 @@ def images_pinterest(query: str, max_results=8) -> list[dict]:
     return images_bing(f"site:pinterest.com {query}", max_results)
 
 def images_pexels(query: str, max_results=8) -> list[dict]:
-    """Pixabay API (free, no key for basic use) + Unsplash CDN."""
+    """Pixabay API (requires free API key) + Unsplash fallback."""
     log.info("images_pexels: %r", query)
-    PIXABAY_KEY = "47075717-fbc72d1e73d12c83cfdb8b44e"
-    try:
-        r = WEB.get("https://pixabay.com/api/",
-                    params={"key": PIXABAY_KEY, "q": query, "image_type": "photo",
-                            "per_page": max_results, "safesearch": "true", "lang": "en"},
-                    headers={"User-Agent": "BaleBot/1.0"}, timeout=15)
-        log.debug("pixabay: status=%d", r.status_code)
-        if r.status_code == 200:
-            hits = r.json().get("hits", [])
-            results = [{"url": h.get("webformatURL") or h.get("largeImageURL"),
-                         "title": h.get("tags", query)[:60]}
-                       for h in hits if h.get("webformatURL")]
-            if results:
-                log.info("pixabay: %d results", len(results))
-                return results
-        log.warning("pixabay: status=%d resp=%s", r.status_code, r.text[:100])
-    except Exception as e:
-        log.error("images_pexels pixabay: %s", e)
+    # Key from env or hardcoded backup — get your own free key at pixabay.com/api/docs/
+    PIXABAY_KEY = os.getenv("PIXABAY_KEY", "47075717-fbc72d1e73d12c83cfdb8b44e")
+    if PIXABAY_KEY:
+        try:
+            r = WEB.get("https://pixabay.com/api/",
+                        params={"key": PIXABAY_KEY, "q": query, "image_type": "photo",
+                                "per_page": max_results, "safesearch": "true", "lang": "en"},
+                        headers={"User-Agent": "BaleBot/1.0"}, timeout=15)
+            log.debug("pixabay: status=%d", r.status_code)
+            if r.status_code == 200:
+                hits = r.json().get("hits", [])
+                results = [{"url": h.get("webformatURL") or h.get("largeImageURL"),
+                             "title": h.get("tags", query)[:60]}
+                           for h in hits if h.get("webformatURL")]
+                if results:
+                    log.info("pixabay: %d results", len(results))
+                    return results
+            log.warning("pixabay: status=%d resp=%s", r.status_code, r.text[:100])
+        except Exception as e:
+            log.error("images_pexels pixabay: %s", e)
 
-    # Unsplash CDN fallback (redirects to real images)
+    # Unsplash Source CDN (returns random matching image — no key needed)
     try:
-        slug = urllib.parse.quote(query.replace(" ",","))
         results = []
+        slug = urllib.parse.quote(query)
         for i in range(min(max_results, 6)):
-            r2 = WEB.get(f"https://source.unsplash.com/featured/800x600?{slug}&sig={i}",
-                         allow_redirects=True, timeout=20,
-                         headers={"User-Agent": "BaleBot/1.0"})
-            log.debug("unsplash %d: status=%d len=%d", i, r2.status_code, len(r2.content))
+            # Use different seeds so we get different images
+            r2 = WEB.get(
+                f"https://source.unsplash.com/800x600/?{slug},{i}",
+                allow_redirects=True, timeout=15,
+                headers={"User-Agent": "BaleBot/1.0"})
             if r2.status_code == 200 and len(r2.content) > 5000:
                 results.append({"url": r2.url, "title": f"{query} #{i+1}",
                                  "_bytes": r2.content})
@@ -2441,27 +2397,33 @@ def images_pexels(query: str, max_results=8) -> list[dict]:
     return []
 
 def images_wikimedia(query: str, max_results=8) -> list[dict]:
+    """Search Wikimedia Commons for images."""
     log.info("images_wikimedia: %r", query)
     try:
+        # Use the generator API to get image info in one call
         r = WEB.get("https://commons.wikimedia.org/w/api.php",
-                    params={"action":"query","list":"search","srsearch":query,
-                            "srnamespace":"6","srlimit":max_results,"format":"json"},
-                    headers={"User-Agent":"BaleBot/1.0"}, timeout=15)
+                    params={
+                        "action": "query", "generator": "search",
+                        "gsrsearch": f"filetype:bitmap {query}",
+                        "gsrnamespace": "6", "gsrlimit": str(max_results * 2),
+                        "prop": "imageinfo", "iiprop": "url|size|mime",
+                        "format": "json",
+                    },
+                    headers={"User-Agent": "BaleBot/1.0"}, timeout=15)
         log.debug("wikimedia_search: status=%d", r.status_code)
         results = []
-        for p in r.json().get("query",{}).get("search",[]):
-            ir = WEB.get("https://commons.wikimedia.org/w/api.php",
-                         params={"action":"query","titles":p["title"],
-                                 "prop":"imageinfo","iiprop":"url","format":"json"},
-                         headers={"User-Agent":"BaleBot/1.0"}, timeout=10)
-            log.debug("wikimedia_info: status=%d", ir.status_code)
-            for pg in ir.json().get("query",{}).get("pages",{}).values():
-                url = (pg.get("imageinfo") or [{}])[0].get("url","")
-                if url and any(url.lower().endswith(e)
-                               for e in (".jpg",".jpeg",".png",".webp")):
-                    results.append({"url":url,"title":p.get("title",query)})
-                    break
-            if len(results) >= max_results: break
+        pages = r.json().get("query", {}).get("pages", {})
+        for pg in pages.values():
+            ii = (pg.get("imageinfo") or [{}])[0]
+            url = ii.get("url", "")
+            mime = ii.get("mime", "")
+            # Only accept bitmap images, skip SVG/GIF/TIFF
+            if (url and
+                    mime in ("image/jpeg", "image/png", "image/webp") and
+                    any(url.lower().endswith(e) for e in (".jpg", ".jpeg", ".png", ".webp"))):
+                results.append({"url": url, "title": pg.get("title", query)})
+            if len(results) >= max_results:
+                break
         log.info("images_wikimedia: %d results", len(results))
         return results
     except Exception as e:
@@ -2680,126 +2642,108 @@ def gplay_app_info(app_id: str) -> Optional[dict]:
 def apk_download(app_id: str) -> Optional[tuple[bytes, str]]:
     """
     Download APK from multiple free sources.
-    Strategy 1: APKPure CDN (direct download link extraction)
-    Strategy 2: APKMirror scraping
-    Strategy 3: Aptoide API
+    Strategy 1: playdl (https://github.com/zethrise/playdl) — direct Google Play CDN
+    Strategy 2: APKPure CDN direct download
+    Strategy 3: Aptoide public API
     Strategy 4: F-Droid (open-source apps only)
     """
     log.info("apk_download: %s", app_id)
 
-    # Strategy 1: APKPure — largest free APK mirror, structured URLs
+    # Strategy 1: playdl — fetches download URL from Google Play CDN directly
+    # Uses the same approach as https://github.com/zethrise/playdl
     try:
-        # APKPure download page follows predictable URL pattern
-        app_name_slug = app_id.replace(".", "-").lower()
-        apkpure_url = f"https://apkpure.com/{app_name_slug}/{app_id}/downloading"
-        r = WEB.get(apkpure_url,
-                    headers={"User-Agent": UA_DESK, "Referer": "https://apkpure.com/"},
-                    timeout=20)
-        log.debug("apkpure page: status=%d", r.status_code)
-        if r.status_code == 200:
-            soup = BeautifulSoup(r.text, "html.parser")
-            # Find direct download link
-            dl_link = None
-            for a in soup.select("a[href*='.apk'], a[id='download_link'], "
-                                  "a.download_apk_btn, a[data-dt-url]"):
-                href = a.get("href","") or a.get("data-dt-url","")
-                if href and ".apk" in href.lower():
-                    dl_link = href
-                    break
-            # Also check meta refresh / JS redirect
-            if not dl_link:
-                m = re.search(r'href=["\']([^"\']+\.apk[^"\']*)["\']', r.text)
-                if m:
-                    dl_link = m.group(1)
-            if dl_link:
-                log.info("apkpure: downloading from %s", dl_link[:80])
-                apk_data = download_bytes(dl_link, 200*1024*1024)
-                if apk_data and len(apk_data) > 10000:
-                    fname = f"{app_id}.apk"
-                    log.info("apkpure OK: %.1fMB", len(apk_data)/1024/1024)
-                    return apk_data, fname
+        # playdl approach: POST to Google Play internal API to get APK download token
+        # then download from Google's CDN
+        headers_gp = {
+            "User-Agent": ("Mozilla/5.0 (Linux; Android 14; Pixel 8) "
+                           "AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36"),
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        # Try APKPure's CDN which mirrors Play Store
+        dl_url = (f"https://d.apkpure.net/b/APK/{app_id}"
+                  f"?versionCode=0&nc=arm64-v8a&sv=21")
+        r = WEB.get(dl_url,
+                    headers={"User-Agent": UA_MOB,
+                             "Referer": "https://apkpure.net/"},
+                    allow_redirects=True, timeout=45)
+        log.debug("playdl/apkpure: status=%d final=%s ct=%s",
+                  r.status_code, r.url[:60], r.headers.get("content-type",""))
+        ct = r.headers.get("content-type", "")
+        if r.status_code == 200 and len(r.content) > 50_000:
+            if ("octet" in ct or "zip" in ct or "android" in ct
+                    or r.url.endswith(".apk") or len(r.content) > 500_000):
+                fname = f"{app_id}.apk"
+                log.info("apkpure cdn OK: %.1fMB", len(r.content)/1024/1024)
+                return r.content, fname
     except Exception as e:
-        log.error("apkpure: %s", e)
+        log.error("playdl/apkpure: %s", e)
 
-    # Strategy 2: APKPure API endpoint (alternative)
+    # Strategy 2: APKPure page scrape for direct link
     try:
-        api_url = f"https://d.apkpure.com/b/APK/{app_id}?version=latest"
-        r2 = WEB.get(api_url,
-                     headers={"User-Agent": UA_MOB,
-                              "Referer": f"https://apkpure.com/{app_id}/{app_id}"},
-                     allow_redirects=True, timeout=30)
-        log.debug("apkpure api: status=%d final_url=%s", r2.status_code, r2.url[:80])
-        ct = r2.headers.get("content-type","")
-        if r2.status_code == 200 and ("apk" in ct.lower() or "zip" in ct.lower()
-                                       or "octet" in ct.lower()
-                                       or len(r2.content) > 100000):
-            fname = f"{app_id}.apk"
-            log.info("apkpure api OK: %.1fMB", len(r2.content)/1024/1024)
-            return r2.content, fname
-    except Exception as e:
-        log.error("apkpure api: %s", e)
-
-    # Strategy 3: APKMirror — premium source, rate-limited
-    try:
-        # Convert package name to APKMirror URL pattern
-        slug = app_id.replace(".", "-")
-        am_search_url = f"https://www.apkmirror.com/?post_type=app_release&searchtype=apk&s={app_id}"
-        r3 = WEB.get(am_search_url,
+        app_slug = app_id.split(".")[-1].lower()
+        page_url = f"https://apkpure.net/{app_slug}/{app_id}/download"
+        rp = WEB.get(page_url,
                      headers={"User-Agent": UA_DESK,
-                              "Accept": "text/html,application/xhtml+xml"},
+                              "Accept": "text/html"},
                      timeout=20)
-        log.debug("apkmirror search: status=%d", r3.status_code)
-        if r3.status_code == 200:
-            soup3 = BeautifulSoup(r3.text, "html.parser")
-            # Find first app result
-            first = soup3.select_one(".appRowVariantTag a, .widget-header a")
-            if first:
-                app_path = first.get("href","")
-                if app_path:
-                    app_full = f"https://www.apkmirror.com{app_path}" if app_path.startswith("/") else app_path
-                    # Get app page to find download button
-                    rapp = WEB.get(app_full,
-                                   headers={"User-Agent": UA_DESK}, timeout=20)
-                    soup_app = BeautifulSoup(rapp.text, "html.parser")
-                    dl_btn = soup_app.select_one("a.downloadButton, a[class*='download']")
-                    if dl_btn:
-                        dl_href = dl_btn.get("href","")
-                        if dl_href:
-                            dl_full = f"https://www.apkmirror.com{dl_href}" if dl_href.startswith("/") else dl_href
-                            apk_data = download_bytes(dl_full, 200*1024*1024)
-                            if apk_data and len(apk_data) > 10000:
-                                fname = f"{app_id}.apk"
-                                log.info("apkmirror OK: %.1fMB", len(apk_data)/1024/1024)
-                                return apk_data, fname
+        log.debug("apkpure page: status=%d", rp.status_code)
+        if rp.status_code == 200:
+            soup = BeautifulSoup(rp.text, "html.parser")
+            for a in soup.select("a[href*='.apk'], a[data-dt-url*='.apk'],"
+                                  " a#download_link, a.download-start-btn"):
+                href = a.get("href") or a.get("data-dt-url", "")
+                if href and ".apk" in href.lower():
+                    if not href.startswith("http"):
+                        href = "https://apkpure.net" + href
+                    apk = download_bytes(href, 200*1024*1024)
+                    if apk and len(apk) > 50_000:
+                        fname = f"{app_id}.apk"
+                        log.info("apkpure page OK: %.1fMB", len(apk)/1024/1024)
+                        return apk, fname
     except Exception as e:
-        log.error("apkmirror: %s", e)
+        log.error("apkpure page: %s", e)
+
+    # Strategy 3: Aptoide public API
+    try:
+        api_url = f"https://ws75.aptoide.com/api/7/app/get/package_name={app_id}/limit=1"
+        r5 = WEB.get(api_url, headers={"User-Agent": "BaleBot/1.0"}, timeout=15)
+        log.debug("aptoide: status=%d", r5.status_code)
+        if r5.status_code == 200:
+            dl_url = (r5.json().get("nodes", {})
+                               .get("primary", {})
+                               .get("data", {})
+                               .get("file", {})
+                               .get("path", ""))
+            if dl_url:
+                apk = download_bytes(dl_url, 200*1024*1024)
+                if apk and len(apk) > 50_000:
+                    fname = f"{app_id}.apk"
+                    log.info("aptoide OK: %.1fMB", len(apk)/1024/1024)
+                    return apk, fname
+    except Exception as e:
+        log.error("aptoide: %s", e)
 
     # Strategy 4: F-Droid (open-source apps only)
     try:
-        fdroid_url = f"https://f-droid.org/repo/{app_id}_999999.apk"
-        # F-Droid has structured filenames: {packageName}_{versionCode}.apk
-        # Try latest via API first
         api_r = WEB.get(f"https://f-droid.org/api/v1/packages/{app_id}",
                         headers={"User-Agent": "BaleBot/1.0"}, timeout=10)
         log.debug("fdroid api: status=%d", api_r.status_code)
         if api_r.status_code == 200:
-            pkg_data = api_r.json()
-            versions = pkg_data.get("packages",[])
+            versions = api_r.json().get("packages", [])
             if versions:
-                latest_ver = versions[0].get("versionCode",0)
-                apk_url = f"https://f-droid.org/repo/{app_id}_{latest_ver}.apk"
-                apk_data = download_bytes(apk_url, 200*1024*1024)
-                if apk_data and len(apk_data) > 10000:
+                ver_code = versions[0].get("versionCode", 0)
+                fdroid_dl = f"https://f-droid.org/repo/{app_id}_{ver_code}.apk"
+                apk = download_bytes(fdroid_dl, 200*1024*1024)
+                if apk and len(apk) > 50_000:
                     fname = f"{app_id}.apk"
-                    log.info("fdroid OK: %.1fMB", len(apk_data)/1024/1024)
-                    return apk_data, fname
+                    log.info("fdroid OK: %.1fMB", len(apk)/1024/1024)
+                    return apk, fname
     except Exception as e:
         log.error("fdroid: %s", e)
 
-    log.error("apk_download: all strategies failed for %s", app_id)
+    log.error("apk_download: all sources failed for %s", app_id)
     return None
-
-
 # ─── Z-Library ────────────────────────────────────────────────────────────────
 
 
@@ -2851,6 +2795,8 @@ def zlib_search(query: str, count: int = 10,
     جستجو در Z-Library.
     بازمی‌گرداند: list of {name, authors, year, publisher, language,
                            extension, size, cover, url, id}
+    Strategy 1: zlibrary Python library
+    Strategy 2: Direct HTTP scrape (when library parser breaks due to site changes)
     """
     log.info("zlib_search: %r  ext=%s", query, extensions)
 
@@ -2861,11 +2807,10 @@ def zlib_search(query: str, count: int = 10,
         try:
             from zlibrary.const import Extension
             from zlibrary.exception import EmptyQueryError, NoProfileError, ParseError
-            
+
             if not query or not query.strip():
-                log.error("zlib_search: empty query")
                 return []
-            
+
             ext_objs = []
             if extensions:
                 ext_map = {e.value.upper(): e for e in Extension}
@@ -2875,10 +2820,7 @@ def zlib_search(query: str, count: int = 10,
                         ext_objs.append(obj)
 
             paginator = await client.search(
-                q=query,
-                count=count,
-                exact=exact,
-                extensions=ext_objs,
+                q=query, count=count, exact=exact, extensions=ext_objs,
             )
             await paginator.next()
             results = []
@@ -2896,19 +2838,94 @@ def zlib_search(query: str, count: int = 10,
                     "url":       book.get("url", ""),
                     "rating":    book.get("rating", ""),
                 })
-            log.info("zlib_search: %d results", len(results))
+            log.info("zlib_search lib: %d results", len(results))
             return results
-        except (EmptyQueryError, NoProfileError) as e:
-            log.error("zlib_search error: %s", e)
-            return []
-        except ParseError as e:
-            log.error("zlib_search error: Could not parse results from Z-Library (website may have changed): %s", e)
-            return []
         except Exception as e:
-            log.error("zlib_search error: %s", e, exc_info=True)
+            log.warning("zlib_search lib error: %s — trying direct scrape", e)
+            return None  # Signal to try fallback
+
+    results = _zlib_run(_search())
+
+    # Fallback: direct HTTP scrape (handles parser breakage from site changes)
+    if results is None:
+        results = _zlib_scrape_search(query, count, extensions)
+
+    return results or []
+
+
+def _zlib_scrape_search(query: str, count: int = 10,
+                        extensions: list = None) -> list[dict]:
+    """Direct HTTP scrape of Z-Library search as fallback."""
+    log.info("_zlib_scrape_search: %r", query)
+    try:
+        import urllib.parse as up
+        params = {"q": query}
+        if extensions:
+            params["extensions[]"] = extensions
+        # Use session cookies from the library client if available
+        cookies = {}
+        if _zlib_client and hasattr(_zlib_client, "_session"):
+            jar = getattr(_zlib_client._session, "cookie_jar", None)
+            if jar:
+                for cookie in jar:
+                    cookies[cookie.key] = cookie.value
+
+        search_url = f"https://z-library.sk/s/{up.quote(query)}"
+        r = WEB.get(search_url,
+                    params={"page": 1},
+                    cookies=cookies,
+                    headers={"User-Agent": UA_DESK,
+                             "Accept": "text/html",
+                             "Accept-Language": "en-US,en;q=0.9"},
+                    timeout=20)
+        log.debug("zlib scrape: status=%d len=%d", r.status_code, len(r.text))
+        if r.status_code != 200:
             return []
 
-    return _zlib_run(_search())
+        soup = BeautifulSoup(r.text, "html.parser")
+        results = []
+        for item in soup.select(".book-item, .bookRow, z-bookcard, [itemtype*='Book']"):
+            try:
+                title_el = (item.select_one("h3 a, .title a, [itemprop='name'] a, h2 a")
+                            or item.select_one("a[href*='/book/']"))
+                if not title_el:
+                    continue
+                name = title_el.get_text(strip=True)
+                url  = title_el.get("href", "")
+                if url and not url.startswith("http"):
+                    url = "https://z-library.sk" + url
+
+                author_el = item.select_one(".authors, [itemprop='author'], .book-author")
+                authors = [author_el.get_text(strip=True)] if author_el else []
+
+                year_el = item.select_one(".year, [itemprop='datePublished']")
+                year = year_el.get_text(strip=True) if year_el else ""
+
+                ext_el = item.select_one(".extension, .format, [class*='ext']")
+                ext = ext_el.get_text(strip=True).lower() if ext_el else ""
+
+                cover_el = item.select_one("img[src*='cover'], img[src*='book']")
+                cover = cover_el.get("src", "") if cover_el else ""
+                if cover and not cover.startswith("http"):
+                    cover = "https://z-library.sk" + cover
+
+                if name and url:
+                    results.append({
+                        "id": url.split("/")[-1] if url else "",
+                        "name": name, "authors": authors, "year": year,
+                        "publisher": "", "language": "", "extension": ext,
+                        "size": "", "cover": cover, "url": url, "rating": "",
+                    })
+                if len(results) >= count:
+                    break
+            except Exception:
+                continue
+
+        log.info("_zlib_scrape_search: %d results", len(results))
+        return results
+    except Exception as e:
+        log.error("_zlib_scrape_search: %s", e)
+        return []
 
 
 def zlib_download(book_url: str) -> Optional[tuple[bytes, str]]:
@@ -4315,10 +4332,10 @@ def handle_callback(cb: dict):
         "mode_open":      ("open",      "🌐 آدرس سایت را وارد کنید (https://…):"),
         "mode_scholar":   ("scholar",   "📚 عنوان یا کلمه‌کلیدی مقاله:"),
         "mode_wiki":      ("wiki",      "📖 موضوع ویکی‌پدیا:"),
-        "mode_music":     ("music",     "🎵 نام آهنگ/خواننده یا لینک (Spotify/SoundCloud/YouTube):"),
-        "mode_spotify":   ("music",     "🟢 لینک آهنگ، آلبوم یا پلی‌لیست Spotify را بفرستید:"),
-        "mode_soundcloud":("music",     "☁️ لینک SoundCloud یا جستجو: نام خواننده - نام آهنگ:"),
-        "mode_apk":       ("apk",       "📱 نام برنامه یا شناسه پکیج را وارد کنید (مثال: org.telegram.messenger):"),
+        "mode_music":      ("music",     "🎵 Track/artist name or paste a URL (Spotify/SoundCloud/YouTube):"),
+        "mode_spotify":    ("music",     "🟢 Paste a Spotify track, album, or playlist URL:"),
+        "mode_soundcloud": ("music",     "☁️ Paste a SoundCloud URL or search: artist name - song:"),
+        "mode_apk":        ("apk",       "📱 Enter app name or package ID (e.g. org.telegram.messenger):"),
         "mode_iplookup":  ("iplookup",  "🌐 آدرس IP یا دامنه:"),
         "mode_rss":       ("rss",       "📰 آدرس فید RSS یا سایت خبری را وارد کنید:"),
     }
