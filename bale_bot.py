@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.6)
+بله قربان — Bale Bot  (v1.7)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -24,6 +24,9 @@ load_dotenv()
 TOKEN          = os.getenv("BALE_TOKEN", "YOUR_BOT_TOKEN_HERE")
 BASE_URL       = f"https://tapi.bale.ai/bot{TOKEN}"
 MAX_FILE_SIZE  = 20 * 1024 * 1024
+
+# yt-dlp binary — resolved from PATH at runtime
+YTDLP_BIN = "yt-dlp"
 MAX_IMAGE_SIZE = 10 * 1024 * 1024
 MAX_OCR_SIZE   =  5 * 1024 * 1024
 GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN", "")
@@ -169,13 +172,54 @@ def _safe_json(r: requests.Response) -> dict:
         log.error("Non-JSON response (status=%d): %r", r.status_code, r.text[:200])
         return {"ok": False, "_raw": r.text[:200]}
 
-def api(method: str, **kwargs) -> dict:
+def api(method: str, _retries: int = 4, **kwargs) -> dict:
+    """Call Bale Bot API with exponential backoff retry."""
+    delay = 2
+    last_err = None
+    for attempt in range(_retries):
+        try:
+            r = requests.post(f"{BASE_URL}/{method}", json=kwargs, timeout=30)
+            result = _safe_json(r)
+            if result.get("ok"):
+                return result
+            # Bale returns ok=False with error_code on server errors
+            code = result.get("error_code", 0)
+            if code in (429, 500, 502, 503, 504) or r.status_code >= 500:
+                log.warning("api %s: server error %s — retry %d/%d in %ds",
+                            method, result, attempt+1, _retries, delay)
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+                last_err = result
+                continue
+            # Permanent client error — don't retry
+            log.error("api %s: %s", method, result)
+            return result
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError) as e:
+            log.warning("api %s: connection error %s — retry %d/%d in %ds",
+                        method, e, attempt+1, _retries, delay)
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+            last_err = {"ok": False, "_err": str(e)}
+        except Exception as e:
+            log.error("api %s: %s", method, e)
+            return {"ok": False}
+    log.error("api %s: all %d retries failed. last=%s", method, _retries, last_err)
+    return {"ok": False, "_retries_exhausted": True}
+
+
+def _notify_bale_error(chat_id: int):
+    """Send a user-facing message when Bale server is unresponsive."""
     try:
-        r = requests.post(f"{BASE_URL}/{method}", json=kwargs, timeout=30)
-        return _safe_json(r)
-    except Exception as e:
-        log.error("api %s: %s", method, e)
-        return {"ok": False}
+        requests.post(
+            f"{BASE_URL}/sendMessage",
+            json={"chat_id": chat_id,
+                  "text": "⚠️ سرور بله در حال حاضر پاسخ نمی‌دهد. لطفاً چند دقیقه دیگر دوباره امتحان کنید."},
+            timeout=15,
+        )
+    except Exception:
+        pass  # Nothing we can do if Bale is truly down
 
 def send_message(chat_id, text, reply_markup=None,
                  reply_to_message_id=None, parse_mode=None) -> dict:
@@ -191,21 +235,41 @@ def send_message(chat_id, text, reply_markup=None,
     return api("sendMessage", **kw)
 
 def _post_file(endpoint: str, field: str, filename: str,
-               data_bytes: bytes, extra_data: dict) -> bool:
-    """Low-level multipart file POST to Bale API."""
-    files = {field: (filename, io.BytesIO(data_bytes), _mime(filename))}
-    try:
-        r = requests.post(f"{BASE_URL}/{endpoint}", data=extra_data,
-                          files=files, timeout=180)
-        resp = _safe_json(r)
-        ok = resp.get("ok", False)
-        if not ok:
+               data_bytes: bytes, extra_data: dict,
+               _retries: int = 3) -> bool:
+    """Low-level multipart file POST to Bale API with retry."""
+    delay = 3
+    for attempt in range(_retries):
+        files = {field: (filename, io.BytesIO(data_bytes), _mime(filename))}
+        try:
+            r = requests.post(f"{BASE_URL}/{endpoint}", data=extra_data,
+                              files=files, timeout=180)
+            resp = _safe_json(r)
+            ok = resp.get("ok", False)
+            if ok:
+                return True
+            code = resp.get("error_code", 0)
+            if code in (429, 500, 502, 503, 504) or r.status_code >= 500:
+                log.warning("%s: server error %s — retry %d/%d in %ds",
+                            endpoint, resp, attempt+1, _retries, delay)
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+                continue
             log.error("%s failed: %s  file=%s  size=%dKB",
                       endpoint, resp, filename, len(data_bytes)//1024)
-        return ok
-    except Exception as e:
-        log.error("%s exception: %s  file=%s", endpoint, e, filename)
-        return False
+            return False
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError) as e:
+            log.warning("%s: connection error %s — retry %d/%d in %ds",
+                        endpoint, e, attempt+1, _retries, delay)
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+        except Exception as e:
+            log.error("%s exception: %s  file=%s", endpoint, e, filename)
+            return False
+    log.error("%s: all %d retries failed for %s", endpoint, _retries, filename)
+    return False
 
 def _send_one_chunk(chat_id, data_bytes: bytes, filename: str,
                     caption="", media_type="document") -> bool:
@@ -293,24 +357,35 @@ def send_video(chat_id, video_bytes: bytes, filename: str, caption="") -> bool:
     return smart_send(chat_id, video_bytes, filename, caption, media_type="video")
 
 def send_photo(chat_id, img_bytes: bytes, caption="", reply_markup=None) -> bool:
-    """Photos don't chunk — just post directly."""
+    """Photos don't chunk — just post directly with retry."""
     if not img_bytes:
         return False
     ext = "jpg"
-    files = {"photo": (f"image.{ext}", io.BytesIO(img_bytes), "image/jpeg")}
-    data  = {"chat_id": str(chat_id), "caption": caption[:1024]}
+    data = {"chat_id": str(chat_id), "caption": caption[:1024]}
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup)
-    try:
-        r = requests.post(f"{BASE_URL}/sendPhoto", data=data, files=files, timeout=60)
-        resp = _safe_json(r)
-        ok = resp.get("ok", False)
-        if not ok:
+    delay = 2
+    for attempt in range(3):
+        try:
+            files = {"photo": (f"image.{ext}", io.BytesIO(img_bytes), "image/jpeg")}
+            r = requests.post(f"{BASE_URL}/sendPhoto", data=data,
+                              files=files, timeout=60)
+            resp = _safe_json(r)
+            if resp.get("ok"):
+                return True
+            code = resp.get("error_code", 0)
+            if code in (429, 500, 502, 503, 504) or r.status_code >= 500:
+                time.sleep(delay); delay = min(delay*2, 30); continue
             log.error("sendPhoto failed: %s", resp)
-        return ok
-    except Exception as e:
-        log.error("sendPhoto exception: %s", e)
-        return False
+            return False
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            log.warning("sendPhoto retry %d: %s", attempt+1, e)
+            time.sleep(delay); delay = min(delay*2, 30)
+        except Exception as e:
+            log.error("sendPhoto exception: %s", e)
+            return False
+    return False
 
 def send_audio(chat_id, audio_bytes: bytes, filename: str, caption="") -> bool:
     return smart_send(chat_id, audio_bytes, filename, caption, media_type="audio")
@@ -1052,7 +1127,7 @@ def youtube_search(query: str, max_results=8) -> list[dict]:
     log.info("youtube_search: %r", query)
     try:
         result = subprocess.run(
-            ["yt-dlp", "--flat-playlist", "--print",
+            [YTDLP_BIN, "--flat-playlist", "--print",
              "%(id)s|||%(title)s|||%(uploader)s|||%(duration_string)s|||%(thumbnail)s",
              f"ytsearch{max_results}:{query}", "--no-warnings",
              "--no-check-certificate"],
@@ -1087,7 +1162,7 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
 
     def _build_base(player_client: str) -> list:
         base = [
-            "yt-dlp",
+            YTDLP_BIN,
             "--no-playlist", "--no-warnings", "--no-check-certificate",
             "--ffmpeg-location", ffmpeg_dir,
             "--socket-timeout", "30", "--retries", "2",
@@ -1326,7 +1401,7 @@ def music_search_ytdlp(query: str, max_results: int = 6,
     if source != "soundcloud" and YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).exists():
         extra = ["--cookies", YOUTUBE_COOKIES_FILE]
     try:
-        cmd = (["yt-dlp", "--flat-playlist", "--no-warnings", "--no-check-certificate",
+        cmd = ([YTDLP_BIN, "--flat-playlist", "--no-warnings", "--no-check-certificate",
                 "--ffmpeg-location", ffmpeg_dir]
                + extra
                + ["--print",
@@ -1394,7 +1469,7 @@ def music_download_ytdlp(url: str, source: str = "auto") -> Optional[tuple[bytes
     def _run_audio(extra_args: list) -> Optional[tuple[bytes, str]]:
         with tempfile.TemporaryDirectory() as tmp:
             base = [
-                "yt-dlp", "--no-playlist", "--no-warnings", "--no-check-certificate",
+                YTDLP_BIN, "--no-playlist", "--no-warnings", "--no-check-certificate",
                 "--ffmpeg-location", ffmpeg_dir,
                 "--socket-timeout", "30", "--retries", "3",
                 "-o", os.path.join(tmp, "%(title).60s.%(ext)s"),
@@ -1503,7 +1578,7 @@ def social_download_ytdlp(url: str, audio_only=False,
     import shutil
     ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
     base = [
-        "yt-dlp", "--no-playlist", "--no-warnings", "--no-check-certificate",
+        YTDLP_BIN, "--no-playlist", "--no-warnings", "--no-check-certificate",
         "--ffmpeg-location", ffmpeg_dir,
         "--socket-timeout", "30", "--retries", "3",
     ]
@@ -2243,7 +2318,7 @@ def tiktok_user_videos(username: str, limit: int = 10) -> list[dict]:
     username = username.lstrip("@")
     try:
         result = subprocess.run(
-            ["yt-dlp", "--flat-playlist", "--no-warnings", "--no-check-certificate",
+            [YTDLP_BIN, "--flat-playlist", "--no-warnings", "--no-check-certificate",
              "--print", "%(id)s|||%(title)s|||%(duration_string)s|||%(url)s|||%(thumbnail)s",
              f"https://www.tiktok.com/@{username}"],
             capture_output=True, text=True, timeout=30,
@@ -5091,7 +5166,6 @@ def handle_update(update: dict):
         cid = msg["chat"]["id"]
         text = msg.get("text","")
         st = get_state(cid)
-        # Special case: images_query mode
         if st.get("mode") == "images_query" and text and not text.startswith("/"):
             init_user(cid)
             handle_message_images_query(cid, text, st)
@@ -5106,23 +5180,43 @@ def run():
         log.critical("BALE_TOKEN not set! Run: export BALE_TOKEN=your_token")
         return
     offset = 0
+    consecutive_failures = 0
     while True:
         try:
-            resp = api("getUpdates", offset=offset, timeout=30)
+            resp = api("getUpdates", _retries=2, offset=offset, timeout=30)
             if not resp.get("ok"):
-                log.warning("getUpdates not ok: %s", resp)
-                time.sleep(5); continue
+                consecutive_failures += 1
+                log.warning("getUpdates not ok (failure #%d): %s",
+                            consecutive_failures, resp)
+                # Back off progressively when Bale is down
+                sleep_time = min(5 * consecutive_failures, 60)
+                time.sleep(sleep_time)
+                continue
+            consecutive_failures = 0
             for update in resp.get("result", []):
                 offset = update["update_id"] + 1
                 try:
                     handle_update(update)
                 except Exception as e:
                     log.error("handle_update: %s", e, exc_info=True)
+                    # Try to notify user if we know who they are
+                    try:
+                        cid = None
+                        if "message" in update:
+                            cid = update["message"]["chat"]["id"]
+                        elif "callback_query" in update:
+                            cid = update["callback_query"]["message"]["chat"]["id"]
+                        if cid:
+                            _notify_bale_error(cid)
+                    except Exception:
+                        pass
         except KeyboardInterrupt:
             log.info("Bot stopped."); break
         except Exception as e:
-            log.error("Polling error: %s", e, exc_info=True)
-            time.sleep(5)
+            consecutive_failures += 1
+            log.error("Polling error (failure #%d): %s", consecutive_failures, e,
+                      exc_info=True)
+            time.sleep(min(5 * consecutive_failures, 60))
 
 if __name__ == "__main__":
     run()
