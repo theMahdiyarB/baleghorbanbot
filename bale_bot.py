@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.7)
+بله قربان — Bale Bot  (v1.8)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -61,6 +61,12 @@ RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
 # yt-dlp and HTTP requests through WARP (avoids datacenter IP blocks).
 # Install: https://pkg.cloudflareclient.com/ then: warp-cli set-mode proxy && warp-cli connect
 WARP_PROXY = os.getenv("WARP_PROXY", "")  # e.g. "socks5://127.0.0.1:40000"
+
+# Cobalt API — self-hosted instance for reliable social/YouTube downloads.
+# Self-host: https://github.com/imputnet/cobalt
+# Default assumes local instance on port 9000.
+# Set COBALT_URL= (empty) to disable, or point to a remote instance.
+COBALT_URL = os.getenv("COBALT_URL", "http://localhost:9000")
 
 ZLIB_DOMAINS = [
     "https://z-library.sk",
@@ -391,6 +397,8 @@ def send_audio(chat_id, audio_bytes: bytes, filename: str, caption="") -> bool:
     return smart_send(chat_id, audio_bytes, filename, caption, media_type="audio")
 
 def chat_action(chat_id, action="typing"):
+    if not chat_id:
+        return
     api("sendChatAction", chat_id=chat_id, action=action)
 
 def get_file_url(file_id: str) -> Optional[str]:
@@ -401,6 +409,9 @@ def get_file_url(file_id: str) -> Optional[str]:
 
 
 def download_bytes(url: str, max_bytes=MAX_FILE_SIZE) -> Optional[bytes]:
+    if not url or url.strip() in ("", "NA", "na", "none", "None", "null"):
+        log.debug("download_bytes: skipping invalid URL %r", url)
+        return None
     log.debug("download_bytes: %s", url)
     try:
         r = WEB.get(url, timeout=30, stream=True)
@@ -1360,10 +1371,93 @@ def _youtube_rapidapi(url: str, audio_only: bool = False) -> Optional[tuple[byte
     return _youtube_cobalt(url, audio_only)
 
 
+def _cobalt_download(url: str, audio_only: bool = False,
+                     quality: str = "720") -> Optional[tuple[bytes, str]]:
+    """
+    Download via Cobalt API (self-hosted or remote).
+    Supports: YouTube, TikTok, Twitter/X, Instagram, Reddit, SoundCloud,
+              Twitch, Vimeo, Dailymotion, Bilibili, Pinterest, and more.
+    Set COBALT_URL env var to your self-hosted instance (default: http://localhost:9000).
+    Leave COBALT_URL empty to disable.
+    """
+    if not COBALT_URL:
+        log.debug("_cobalt_download: COBALT_URL not set, skipping")
+        return None
+    log.info("_cobalt_download: %s audio=%s via %s", url, audio_only, COBALT_URL)
+    try:
+        payload = {
+            "url": url,
+            "videoQuality": quality,
+            "filenameStyle": "basic",
+            "alwaysProxy": False,
+        }
+        if audio_only:
+            payload["downloadMode"] = "audio"
+            payload["audioFormat"] = "mp3"
+            payload["audioBitrate"] = "192"
+        else:
+            payload["downloadMode"] = "auto"
+
+        resp = WEB.post(
+            f"{COBALT_URL}/",
+            json=payload,
+            headers={"Accept": "application/json",
+                     "Content-Type": "application/json"},
+            timeout=30,
+        )
+        if resp.status_code not in (200, 201):
+            log.warning("_cobalt_download: status=%d body=%s",
+                        resp.status_code, resp.text[:200])
+            return None
+
+        j = resp.json()
+        status = j.get("status", "")
+        log.debug("_cobalt_download: status=%s", status)
+
+        if status == "error":
+            code = j.get("error", {}).get("code", "unknown")
+            log.warning("_cobalt_download: API error code=%s", code)
+            return None
+
+        # Cobalt returns a direct URL or a picker (multiple items e.g. carousel)
+        dl_url = j.get("url")
+        if not dl_url and j.get("picker"):
+            for item in j["picker"]:
+                if item.get("type") in ("video", None) and item.get("url"):
+                    dl_url = item["url"]
+                    break
+            if not dl_url:
+                dl_url = j["picker"][0].get("url")
+
+        if not dl_url:
+            log.warning("_cobalt_download: no URL in response: %s", str(j)[:200])
+            return None
+
+        log.info("_cobalt_download: fetching from %s", dl_url[:80])
+        vid_bytes = download_bytes(dl_url, MAX_FILE_SIZE * 2)
+        if not vid_bytes or len(vid_bytes) < 1000:
+            log.warning("_cobalt_download: download too small or empty")
+            return None
+
+        ext = "mp3" if audio_only else "mp4"
+        domain_m = re.search(r"(?:https?://)?(?:www\.)?([^/]+)", url)
+        prefix = domain_m.group(1).split(".")[0] if domain_m else "media"
+        fname = f"{prefix}_download.{ext}"
+        log.info("_cobalt_download OK: %.1fMB  %s", len(vid_bytes)/1024/1024, fname)
+        return vid_bytes, fname
+
+    except requests.exceptions.ConnectionError:
+        log.warning("_cobalt_download: cannot connect to %s — is Cobalt running?",
+                    COBALT_URL)
+        return None
+    except Exception as e:
+        log.error("_cobalt_download: %s", e)
+        return None
+
+
 def _youtube_cobalt(url: str, audio_only: bool = False) -> Optional[tuple[bytes, str]]:
-    """Cobalt API — requires JWT auth (paid). Disabled."""
-    log.debug("_youtube_cobalt: skipped (Cobalt now requires JWT)")
-    return None
+    """YouTube download via Cobalt API (self-hosted)."""
+    return _cobalt_download(url, audio_only=audio_only, quality="720")
 
 def _trim_video(src: Path, tmp: str, ffmpeg_dir="/usr/bin") -> Optional[tuple[bytes,Path]]:
     out = Path(tmp) / ("trimmed_" + src.name)
@@ -1625,9 +1719,8 @@ def social_download_ytdlp(url: str, audio_only=False,
 
 
 def _social_cobalt(url: str, audio_only: bool = False) -> Optional[tuple[bytes, str]]:
-    """Cobalt API — currently requires JWT auth (paid). Disabled."""
-    log.debug("_social_cobalt: skipped (JWT required by cobalt.tools)")
-    return None
+    """Social media download via Cobalt API (TikTok, Twitter, Instagram, etc.)"""
+    return _cobalt_download(url, audio_only=audio_only)
 
 
 # ─── Telegram channel reader ─────────────────────────────────────────────────
