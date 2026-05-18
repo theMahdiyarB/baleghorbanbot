@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.4)
+بله قربان — Bale Bot  (v1.5)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -54,8 +54,18 @@ SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 # Sign up free at https://rapidapi.com → subscribe to "youtube-search-download3"
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
 
-# Z-Library: ایمیل و رمز حساب از z-library.sk/login
-# ثبت‌نام رایگان در: https://z-library.sk/login
+# Cloudflare WARP proxy — set WARP_PROXY=socks5://127.0.0.1:40000 to route
+# yt-dlp and HTTP requests through WARP (avoids datacenter IP blocks).
+# Install: https://pkg.cloudflareclient.com/ then: warp-cli set-mode proxy && warp-cli connect
+WARP_PROXY = os.getenv("WARP_PROXY", "")  # e.g. "socks5://127.0.0.1:40000"
+
+ZLIB_DOMAINS = [
+    "https://z-library.sk",
+    "https://z-lib.fm",
+    "https://z-lib.id",
+    "https://zlibrary.to",
+    "https://singlelogin.re",
+]
 ZLIB_EMAIL    = os.getenv("ZLIB_EMAIL", "")
 ZLIB_PASSWORD = os.getenv("ZLIB_PASSWORD", "")
 _zlib_client  = None   # shared AsyncZlib instance (initialized on first use)
@@ -77,16 +87,27 @@ logging.getLogger("requests").setLevel(logging.WARNING)
 # ═══════════════════════════════════════════════════════════════════════════════
 # SHARED HTTP SESSION
 # ═══════════════════════════════════════════════════════════════════════════════
-def _make_session() -> requests.Session:
+def _make_session(proxy: str = "") -> requests.Session:
     s = requests.Session()
     r = Retry(total=3, backoff_factor=0.4,
               status_forcelist=[429, 500, 502, 503, 504],
               allowed_methods=["GET", "POST", "HEAD"])
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.mount("http://",  HTTPAdapter(max_retries=r))
+    if proxy:
+        s.proxies = {"http": proxy, "https": proxy}
     return s
 
 WEB = _make_session()
+
+
+def _get_web(use_warp: bool = False) -> requests.Session:
+    """Return WEB session, optionally routing through WARP proxy."""
+    if use_warp and WARP_PROXY:
+        if not hasattr(_get_web, "_warp_session"):
+            _get_web._warp_session = _make_session(WARP_PROXY)
+        return _get_web._warp_session
+    return WEB
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STATE
@@ -1062,75 +1083,84 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
     import shutil
     ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
     cookies_file = YOUTUBE_COOKIES_FILE
+    has_cookies = bool(cookies_file and Path(cookies_file).exists())
 
-    base_cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--no-warnings",
-        "--no-check-certificate",
-        "--ffmpeg-location", ffmpeg_dir,
-        "--geo-bypass",
-        "--socket-timeout", "30",
-        "--retries", "5",
-    ]
-    # Always add cookies if available — this is the primary bot-detection bypass
-    if cookies_file and Path(cookies_file).exists():
-        base_cmd += ["--cookies", cookies_file]
-        log.info("youtube_download: using cookies from %s", cookies_file)
-    else:
-        log.warning("youtube_download: no cookies file — bot detection likely")
-        base_cmd += ["--extractor-args", "youtube:player_client=tv_embedded,ios,web"]
+    def _build_base(player_client: str) -> list:
+        base = [
+            "yt-dlp",
+            "--no-playlist", "--no-warnings", "--no-check-certificate",
+            "--ffmpeg-location", ffmpeg_dir,
+            "--socket-timeout", "30", "--retries", "2",
+            "--extractor-args", f"youtube:player_client={player_client}",
+        ]
+        if has_cookies:
+            base += ["--cookies", cookies_file]
+        if WARP_PROXY:
+            base += ["--proxy", WARP_PROXY]
+        return base
 
-    def _run(extra_args, target_url) -> Optional[tuple[bytes,str]]:
+    def _run(base_cmd, extra_args, target_url) -> Optional[tuple[bytes,str]]:
         with tempfile.TemporaryDirectory() as tmp:
             out_tpl = os.path.join(tmp, "%(title).60s.%(ext)s")
             cmd = base_cmd + ["-o", out_tpl] + extra_args + [target_url]
             log.debug("yt-dlp cmd: %s", " ".join(cmd))
             proc = subprocess.run(cmd, capture_output=True, timeout=300)
             stderr = proc.stderr.decode(errors="replace")
-            stdout = proc.stdout.decode(errors="replace")
             if proc.returncode != 0:
-                log.error("yt-dlp rc=%d stderr=%s", proc.returncode, stderr[:800])
+                log.error("yt-dlp rc=%d stderr=%s", proc.returncode, stderr[:300])
                 return None
             files = [f for f in Path(tmp).glob("*") if f.stat().st_size > 100]
             if not files:
-                log.error("yt-dlp: no output files. stdout=%s", stdout[:200])
                 return None
             f = sorted(files, key=lambda x: x.stat().st_size, reverse=True)[0]
             data = f.read_bytes()
             log.info("yt-dlp OK: %s  %.1fMB", f.name, len(data)/1024/1024)
             return data, f.name
 
+    if has_cookies:
+        log.info("youtube_download: using cookies from %s", cookies_file)
+    else:
+        log.warning("youtube_download: no cookies file — bot-detection likely")
+
+    # Player clients ordered by datacenter-IP friendliness:
+    # tv_embedded: no bot-detection, but some videos restricted
+    # mweb: mobile web, different CDN path
+    # ios: native app client, bypasses most blocks
+    # web: standard, most likely to get 403 on datacenter IPs
+    player_clients = ["tv_embedded", "mweb", "ios", "web"]
+
     if audio_only:
-        for args in [
-            ["-x", "--audio-format", "mp3", "--audio-quality", "5"],
-            ["-x", "--audio-format", "mp3", "--audio-quality", "5", "-f", "bestaudio"],
-            ["-x", "--audio-format", "mp3"],
-        ]:
-            result = _run(args, url)
-            if result:
-                return result
-        # RapidAPI fallback for audio
+        for client in player_clients:
+            base = _build_base(client)
+            for args in [
+                ["-x", "--audio-format", "mp3", "--audio-quality", "5"],
+                ["-x", "--audio-format", "mp3", "--audio-quality", "5", "-f", "bestaudio"],
+                ["-x", "--audio-format", "mp3"],
+            ]:
+                result = _run(base, args, url)
+                if result:
+                    return result
         return _youtube_rapidapi(url, audio_only=True)
     else:
-        for fmt in [
-            "bestvideo[height<=720]+bestaudio/best[height<=720]",
-            "bestvideo+bestaudio/best",
-            "best[height<=720]",
-            "best",
-        ]:
-            result = _run(["-f", fmt, "--merge-output-format", "mp4"], url)
-            if result:
-                if len(result[0]) > MAX_FILE_SIZE - 1*1024*1024:
-                    log.info("Video %.1fMB too large, trimming…", len(result[0])/1024/1024)
-                    with tempfile.TemporaryDirectory() as tmp2:
-                        src = Path(tmp2) / result[1]
-                        src.write_bytes(result[0])
-                        trimmed = _trim_video(src, tmp2, ffmpeg_dir)
-                        if trimmed:
-                            result = trimmed
-                return result
-        # RapidAPI fallback for video
+        for client in player_clients:
+            base = _build_base(client)
+            for fmt in [
+                "bestvideo[height<=720]+bestaudio/best[height<=720]",
+                "bestvideo+bestaudio/best",
+                "best[height<=720]",
+                "best",
+            ]:
+                result = _run(base, ["-f", fmt, "--merge-output-format", "mp4"], url)
+                if result:
+                    if len(result[0]) > MAX_FILE_SIZE - 1*1024*1024:
+                        log.info("Video %.1fMB too large, trimming…", len(result[0])/1024/1024)
+                        with tempfile.TemporaryDirectory() as tmp2:
+                            src = Path(tmp2) / result[1]
+                            src.write_bytes(result[0])
+                            trimmed = _trim_video(src, tmp2, ffmpeg_dir)
+                            if trimmed:
+                                result = trimmed
+                    return result
         return _youtube_rapidapi(url, audio_only=False)
 
 def _youtube_rapidapi(url: str, audio_only: bool = False) -> Optional[tuple[bytes, str]]:
@@ -1362,7 +1392,9 @@ def music_download_ytdlp(url: str, source: str = "auto") -> Optional[tuple[bytes
                 if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).exists():
                     base += ["--cookies", YOUTUBE_COOKIES_FILE]
                 else:
-                    base += ["--extractor-args", "youtube:player_client=tv_embedded,ios,web"]
+                    base += ["--extractor-args", "youtube:player_client=tv_embedded,mweb,ios,web"]
+            if WARP_PROXY:
+                base += ["--proxy", WARP_PROXY]
             cmd = base + extra_args + [url]
             log.debug("music dl: %s", " ".join(cmd))
             proc = subprocess.run(cmd, capture_output=True, timeout=300)
@@ -1466,6 +1498,8 @@ def social_download_ytdlp(url: str, audio_only=False,
     ]
     if cookies_file and Path(cookies_file).exists():
         base += ["--cookies", cookies_file]
+    if WARP_PROXY:
+        base += ["--proxy", WARP_PROXY]
 
     def _run(extra, target):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1666,7 +1700,56 @@ def tg_download_media_web(msg_url: str) -> Optional[tuple[bytes, str]]:
                 continue
             soup = BeautifulSoup(r.text, "html.parser")
 
-            # Check for video first
+            # ── Document / file attachment — CHECKED FIRST ─────────────────
+            # Telegram CDN links appear as href on .tgme_widget_message_document
+            # OR as data-url on the document wrap, OR directly in <a href>
+            doc_url = ""
+            doc_fname = f"tg_{channel}_{msg_id}.bin"
+            for sel in [
+                "a.tgme_widget_message_document",
+                ".tgme_widget_message_document_wrap > a",
+                ".tgme_widget_message_document_wrap a[href]",
+                "a[href*='telesco.pe']",
+                "a[href*='cdn.telegram.org']",
+                # data-url variant
+                "[data-url*='telesco.pe']",
+                "[data-url*='cdn.telegram.org']",
+            ]:
+                el = soup.select_one(sel)
+                if not el:
+                    continue
+                candidate = el.get("href") or el.get("data-url", "")
+                if candidate and ("telesco.pe" in candidate
+                                  or "cdn.telegram.org" in candidate
+                                  or candidate.startswith("http")):
+                    doc_url = candidate
+                    # Try to get filename
+                    title_el = el.select_one(
+                        ".tgme_widget_message_document_title,"
+                        " .document-name, [class*='title'], [class*='name']"
+                    )
+                    ext_el = el.select_one(
+                        ".tgme_widget_message_document_extra,"
+                        " .document-ext, [class*='ext']"
+                    )
+                    raw_name = title_el.get_text(strip=True) if title_el else ""
+                    raw_ext  = ext_el.get_text(strip=True).lower() if ext_el else ""
+                    if raw_name:
+                        if raw_ext and not raw_name.endswith(raw_ext):
+                            raw_name = f"{raw_name}.{raw_ext}"
+                        doc_fname = re.sub(r"[^\w.\-]", "_", raw_name)[:80]
+                    break
+
+            if doc_url:
+                log.info("tg_embed: downloading document %s from %s",
+                         doc_fname, doc_url[:80])
+                doc_bytes = download_bytes(doc_url, 200*1024*1024)
+                if doc_bytes and len(doc_bytes) > 10:
+                    log.info("tg_embed: document OK %dKB %s",
+                             len(doc_bytes)//1024, doc_fname)
+                    return doc_bytes, doc_fname
+
+            # ── Video ───────────────────────────────────────────────────────
             video_el = soup.select_one("video source[src], video[src]")
             if video_el:
                 vurl = video_el.get("src", "")
@@ -1677,47 +1760,29 @@ def tg_download_media_web(msg_url: str) -> Optional[tuple[bytes, str]]:
                         log.info("tg_embed: video %.1fMB", len(vbytes)/1024/1024)
                         return vbytes, fname
 
-            # Extract message photo (background-image on photo wrap elements only)
-            # Avoid picking up channel avatar — only look inside message body
+            # ── Photo ───────────────────────────────────────────────────────
             img_urls = []
             for el in soup.select(".tgme_widget_message_photo_wrap, "
-                                   ".tgme_widget_message_document_wrap"):
+                                   ".tgme_widget_message_photo"):
                 style = el.get("style", "")
                 for m2 in re.finditer(
                     r"url\(['\"]?(https?://[^'\")\s]+\.(?:jpg|jpeg|png|webp))['\"]?\)",
                     style, re.I):
                     img_urls.append(m2.group(1))
-
-            # Also check <img> tags inside message content (not the header/avatar area)
-            for img in soup.select(".tgme_widget_message_photo img, "
-                                    ".tgme_widget_message_sticker img"):
+            for img in soup.select(".tgme_widget_message_photo img"):
                 src = img.get("src", "")
                 if src and src.startswith("http"):
                     img_urls.append(src)
 
             if img_urls:
-                best_url = img_urls[0]
-                img_bytes = download_bytes(best_url, MAX_IMAGE_SIZE)
-                if img_bytes and len(img_bytes) > 5000:  # >5KB to skip tiny avatars
-                    ext = best_url.rsplit(".", 1)[-1].split("?")[0].lower() or "jpg"
+                img_bytes = download_bytes(img_urls[0], MAX_IMAGE_SIZE)
+                if img_bytes and len(img_bytes) > 5000:
+                    ext = img_urls[0].rsplit(".", 1)[-1].split("?")[0].lower() or "jpg"
                     if ext not in {"jpg", "jpeg", "png", "webp"}:
                         ext = "jpg"
                     fname = f"tg_{channel}_{msg_id}.{ext}"
-                    log.info("tg_embed: image %dKB from %s", len(img_bytes)//1024, best_url)
+                    log.info("tg_embed: image %dKB", len(img_bytes)//1024)
                     return img_bytes, fname
-
-            # Check for document/file link
-            doc_el = soup.select_one(".tgme_widget_message_document_wrap a[href],"
-                                      "a.tgme_widget_message_document[href]")
-            if doc_el:
-                doc_url = doc_el.get("href", "")
-                if doc_url and doc_url.startswith("http"):
-                    doc_bytes = download_bytes(doc_url, 200*1024*1024)
-                    if doc_bytes and len(doc_bytes) > 100:
-                        fname_raw = doc_el.get_text(strip=True) or f"tg_{channel}_{msg_id}.bin"
-                        fname = re.sub(r"[^\w.\-]", "_", fname_raw)[:80]
-                        log.info("tg_embed: document %dKB %s", len(doc_bytes)//1024, fname)
-                        return doc_bytes, fname
 
         except Exception as e:
             log.warning("tg_embed %s: %s", embed_url, e)
@@ -2359,7 +2424,7 @@ def images_pexels(query: str, max_results=8) -> list[dict]:
     PIXABAY_KEY = os.getenv("PIXABAY_KEY", "47075717-fbc72d1e73d12c83cfdb8b44e")
     if PIXABAY_KEY:
         try:
-            r = WEB.get("https://pixabay.com/api/",
+            r = _get_web(use_warp=True).get("https://pixabay.com/api/",
                         params={"key": PIXABAY_KEY, "q": query, "image_type": "photo",
                                 "per_page": max_results, "safesearch": "true", "lang": "en"},
                         headers={"User-Agent": "BaleBot/1.0"}, timeout=15)
@@ -2400,12 +2465,11 @@ def images_wikimedia(query: str, max_results=8) -> list[dict]:
     """Search Wikimedia Commons for images."""
     log.info("images_wikimedia: %r", query)
     try:
-        # Use the generator API to get image info in one call
-        r = WEB.get("https://commons.wikimedia.org/w/api.php",
+        r = _get_web(use_warp=True).get("https://commons.wikimedia.org/w/api.php",
                     params={
                         "action": "query", "generator": "search",
-                        "gsrsearch": f"filetype:bitmap {query}",
-                        "gsrnamespace": "6", "gsrlimit": str(max_results * 2),
+                        "gsrsearch": query,  # no filetype filter — too restrictive
+                        "gsrnamespace": "6", "gsrlimit": str(max_results * 3),
                         "prop": "imageinfo", "iiprop": "url|size|mime",
                         "format": "json",
                     },
@@ -2413,14 +2477,13 @@ def images_wikimedia(query: str, max_results=8) -> list[dict]:
         log.debug("wikimedia_search: status=%d", r.status_code)
         results = []
         pages = r.json().get("query", {}).get("pages", {})
-        for pg in pages.values():
+        for pg in sorted(pages.values(), key=lambda p: p.get("index", 999)):
             ii = (pg.get("imageinfo") or [{}])[0]
             url = ii.get("url", "")
             mime = ii.get("mime", "")
-            # Only accept bitmap images, skip SVG/GIF/TIFF
-            if (url and
-                    mime in ("image/jpeg", "image/png", "image/webp") and
-                    any(url.lower().endswith(e) for e in (".jpg", ".jpeg", ".png", ".webp"))):
+            # Accept jpeg, png, webp — skip SVG, GIF, TIFF, OGG
+            if url and mime in ("image/jpeg", "image/png", "image/webp",
+                                "image/jpg"):
                 results.append({"url": url, "title": pg.get("title", query)})
             if len(results) >= max_results:
                 break
@@ -2764,7 +2827,7 @@ def _zlib_run(coro):
 
 
 async def _zlib_get_client():
-    """Get or create a logged-in AsyncZlib client."""
+    """Get or create a logged-in AsyncZlib client, trying all known domains."""
     global _zlib_client
     if _zlib_client is not None:
         return _zlib_client
@@ -2774,14 +2837,25 @@ async def _zlib_get_client():
     try:
         from zlibrary import AsyncZlib
         from zlibrary.exception import LoginFailed, NoDomainError
-        client = AsyncZlib()
-        await client.login(ZLIB_EMAIL, ZLIB_PASSWORD)
-        _zlib_client = client
-        log.info("Z-Library: logged in as %s", ZLIB_EMAIL)
-        return client
-    except (LoginFailed, NoDomainError) as e:
-        log.error("Z-Library login failed: %s (domain unreachable or credentials invalid)", e)
-        _zlib_client = None
+        # Try each domain in order
+        for domain in ZLIB_DOMAINS:
+            try:
+                client = AsyncZlib()
+                # Some versions of zlibrary accept a domain parameter
+                try:
+                    await client.login(ZLIB_EMAIL, ZLIB_PASSWORD, domain=domain)
+                except TypeError:
+                    await client.login(ZLIB_EMAIL, ZLIB_PASSWORD)
+                _zlib_client = client
+                log.info("Z-Library: logged in as %s via %s", ZLIB_EMAIL, domain)
+                return client
+            except (LoginFailed, NoDomainError) as e:
+                log.warning("Z-Library login via %s failed: %s", domain, e)
+                continue
+            except Exception as e:
+                log.warning("Z-Library login via %s error: %s", domain, e)
+                continue
+        log.error("Z-Library: all domains failed")
         return None
     except Exception as e:
         log.error("Z-Library login failed: %s", e)
@@ -2855,77 +2929,99 @@ def zlib_search(query: str, count: int = 10,
 
 def _zlib_scrape_search(query: str, count: int = 10,
                         extensions: list = None) -> list[dict]:
-    """Direct HTTP scrape of Z-Library search as fallback."""
+    """Direct HTTP scrape of Z-Library search — tries multiple domains as fallback."""
     log.info("_zlib_scrape_search: %r", query)
-    try:
-        import urllib.parse as up
-        params = {"q": query}
-        if extensions:
-            params["extensions[]"] = extensions
-        # Use session cookies from the library client if available
-        cookies = {}
-        if _zlib_client and hasattr(_zlib_client, "_session"):
-            jar = getattr(_zlib_client._session, "cookie_jar", None)
-            if jar:
-                for cookie in jar:
-                    cookies[cookie.key] = cookie.value
+    import urllib.parse as up
 
-        search_url = f"https://z-library.sk/s/{up.quote(query)}"
-        r = WEB.get(search_url,
-                    params={"page": 1},
-                    cookies=cookies,
-                    headers={"User-Agent": UA_DESK,
-                             "Accept": "text/html",
-                             "Accept-Language": "en-US,en;q=0.9"},
-                    timeout=20)
-        log.debug("zlib scrape: status=%d len=%d", r.status_code, len(r.text))
-        if r.status_code != 200:
-            return []
-
-        soup = BeautifulSoup(r.text, "html.parser")
-        results = []
-        for item in soup.select(".book-item, .bookRow, z-bookcard, [itemtype*='Book']"):
-            try:
-                title_el = (item.select_one("h3 a, .title a, [itemprop='name'] a, h2 a")
-                            or item.select_one("a[href*='/book/']"))
-                if not title_el:
-                    continue
-                name = title_el.get_text(strip=True)
-                url  = title_el.get("href", "")
-                if url and not url.startswith("http"):
-                    url = "https://z-library.sk" + url
-
-                author_el = item.select_one(".authors, [itemprop='author'], .book-author")
-                authors = [author_el.get_text(strip=True)] if author_el else []
-
-                year_el = item.select_one(".year, [itemprop='datePublished']")
-                year = year_el.get_text(strip=True) if year_el else ""
-
-                ext_el = item.select_one(".extension, .format, [class*='ext']")
-                ext = ext_el.get_text(strip=True).lower() if ext_el else ""
-
-                cover_el = item.select_one("img[src*='cover'], img[src*='book']")
-                cover = cover_el.get("src", "") if cover_el else ""
-                if cover and not cover.startswith("http"):
-                    cover = "https://z-library.sk" + cover
-
-                if name and url:
-                    results.append({
-                        "id": url.split("/")[-1] if url else "",
-                        "name": name, "authors": authors, "year": year,
-                        "publisher": "", "language": "", "extension": ext,
-                        "size": "", "cover": cover, "url": url, "rating": "",
-                    })
-                if len(results) >= count:
-                    break
-            except Exception:
+    for base_domain in ZLIB_DOMAINS:
+        try:
+            search_url = f"{base_domain}/s/{up.quote(query)}"
+            r = WEB.get(search_url,
+                        params={"page": 1},
+                        headers={"User-Agent": UA_DESK,
+                                 "Accept": "text/html",
+                                 "Accept-Language": "en-US,en;q=0.9"},
+                        timeout=15)
+            log.debug("zlib scrape %s: status=%d len=%d",
+                      base_domain, r.status_code, len(r.text))
+            if r.status_code not in (200, 301, 302):
                 continue
 
-        log.info("_zlib_scrape_search: %d results", len(results))
-        return results
-    except Exception as e:
-        log.error("_zlib_scrape_search: %s", e)
-        return []
+            soup = BeautifulSoup(r.text, "html.parser")
+            results = []
+            for item in soup.select(
+                ".book-item, .bookRow, z-bookcard, "
+                "[itemtype*='Book'], .resItemBox"
+            ):
+                try:
+                    title_el = (
+                        item.select_one(
+                            "h3 a, .title a, [itemprop='name'] a, "
+                            "h2 a, a[href*='/book/']"
+                        )
+                    )
+                    if not title_el:
+                        continue
+                    name = title_el.get_text(strip=True)
+                    href = title_el.get("href", "")
+                    url  = (href if href.startswith("http")
+                            else f"{base_domain}{href}")
+
+                    author_el = item.select_one(
+                        ".authors, [itemprop='author'], .book-author, "
+                        "a[href*='/author/']"
+                    )
+                    authors = ([author_el.get_text(strip=True)]
+                               if author_el else [])
+
+                    year_el = item.select_one(
+                        ".year, [itemprop='datePublished'], .property_year .property_value"
+                    )
+                    year = year_el.get_text(strip=True) if year_el else ""
+
+                    ext_el = item.select_one(
+                        ".extension, .format, [class*='ext'], "
+                        ".property_files .property_value"
+                    )
+                    ext = ext_el.get_text(strip=True).lower() if ext_el else ""
+
+                    cover_el = item.select_one("img[src*='cover'], img[src*='book'], img[data-src]")
+                    cover = ""
+                    if cover_el:
+                        cover = cover_el.get("src") or cover_el.get("data-src", "")
+                        if cover and not cover.startswith("http"):
+                            cover = f"{base_domain}{cover}"
+
+                    if name and url:
+                        results.append({
+                            "id":        url.rstrip("/").split("/")[-1],
+                            "name":      name,
+                            "authors":   authors,
+                            "year":      year,
+                            "publisher": "",
+                            "language":  "",
+                            "extension": ext,
+                            "size":      "",
+                            "cover":     cover,
+                            "url":       url,
+                            "rating":    "",
+                        })
+                    if len(results) >= count:
+                        break
+                except Exception:
+                    continue
+
+            if results:
+                log.info("_zlib_scrape_search: %d results from %s",
+                         len(results), base_domain)
+                return results
+            log.warning("_zlib_scrape_search: 0 results from %s", base_domain)
+
+        except Exception as e:
+            log.warning("_zlib_scrape_search %s: %s", base_domain, e)
+
+    log.error("_zlib_scrape_search: all domains failed")
+    return []
 
 
 def zlib_download(book_url: str) -> Optional[tuple[bytes, str]]:
@@ -3634,7 +3730,8 @@ def do_zlib_search(cid: int, query: str, extensions: list = None):
         send_message(cid,
             "❌ نتیجه‌ای یافت نشد.\n"
             "• کلمات دیگری امتحان کنید\n"
-            "• اگر خطای لاگین است، مطمئن شوید ZLIB_EMAIL/PASSWORD درست است",
+            "• اگر خطای لاگین است، مطمئن شوید ZLIB_EMAIL/PASSWORD درست است\n"
+            "• دامنه‌های جایگزین: z-lib.fm / z-lib.id / singlelogin.re",
             reply_markup=home_kb())
         return
 
