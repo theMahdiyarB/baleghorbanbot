@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.5)
+بله قربان — Bale Bot  (v1.6)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -1122,34 +1122,45 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
     else:
         log.warning("youtube_download: no cookies file — bot-detection likely")
 
-    # Player clients ordered by datacenter-IP friendliness:
-    # tv_embedded: no bot-detection, but some videos restricted
-    # mweb: mobile web, different CDN path
-    # ios: native app client, bypasses most blocks
-    # web: standard, most likely to get 403 on datacenter IPs
-    player_clients = ["tv_embedded", "mweb", "ios", "web"]
+    # Each client needs its own format list.
+    # tv_embedded → killed by Google for yt-dlp, skip entirely.
+    # android/android_vr → best for datacenter IPs, serve mp4 directly.
+    # ios → works but only serves combined streams (use "best" only).
+    # mweb/web → 403 on datacenter IPs even through WARP, try last.
+    #
+    # Format notes:
+    #   android/android_vr serve pre-muxed mp4 — don't use bestvideo+bestaudio
+    #   ios also pre-muxed — use "best" only
+    #   web/mweb support separate streams but 403 on CDN anyway
+
+    # (client, formats_to_try)
+    client_strategies = [
+        ("android",    ["best[height<=720]", "best"]),
+        ("android_vr", ["best[height<=720]", "best"]),
+        ("ios",        ["best[height<=720]", "best"]),
+        ("mweb",       ["bestvideo[height<=720]+bestaudio/best[height<=720]",
+                        "best[height<=720]", "best"]),
+        ("web",        ["bestvideo[height<=720]+bestaudio/best[height<=720]",
+                        "best[height<=720]", "best"]),
+    ]
 
     if audio_only:
-        for client in player_clients:
+        for client, _ in client_strategies:
             base = _build_base(client)
             for args in [
                 ["-x", "--audio-format", "mp3", "--audio-quality", "5"],
                 ["-x", "--audio-format", "mp3", "--audio-quality", "5", "-f", "bestaudio"],
                 ["-x", "--audio-format", "mp3"],
+                ["-x"],
             ]:
                 result = _run(base, args, url)
                 if result:
                     return result
         return _youtube_rapidapi(url, audio_only=True)
     else:
-        for client in player_clients:
+        for client, fmts in client_strategies:
             base = _build_base(client)
-            for fmt in [
-                "bestvideo[height<=720]+bestaudio/best[height<=720]",
-                "bestvideo+bestaudio/best",
-                "best[height<=720]",
-                "best",
-            ]:
+            for fmt in fmts:
                 result = _run(base, ["-f", fmt, "--merge-output-format", "mp4"], url)
                 if result:
                     if len(result[0]) > MAX_FILE_SIZE - 1*1024*1024:
@@ -1391,8 +1402,8 @@ def music_download_ytdlp(url: str, source: str = "auto") -> Optional[tuple[bytes
             if is_yt:
                 if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).exists():
                     base += ["--cookies", YOUTUBE_COOKIES_FILE]
-                else:
-                    base += ["--extractor-args", "youtube:player_client=tv_embedded,mweb,ios,web"]
+                base += ["--extractor-args",
+                         "youtube:player_client=android,android_vr,ios,mweb,web"]
             if WARP_PROXY:
                 base += ["--proxy", WARP_PROXY]
             cmd = base + extra_args + [url]
