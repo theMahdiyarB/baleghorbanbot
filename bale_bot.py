@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.8)
+بله قربان — Bale Bot  (v1.9)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -104,7 +104,14 @@ def _make_session(proxy: str = "") -> requests.Session:
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.mount("http://",  HTTPAdapter(max_retries=r))
     if proxy:
-        s.proxies = {"http": proxy, "https": proxy}
+        try:
+            s.proxies = {"http": proxy, "https": proxy}
+            # Test SOCKS support early to give a clear error
+            import socks  # noqa — just check it's importable
+        except ImportError:
+            log.warning("PySocks not installed — WARP proxy disabled. "
+                        "Run: pip install PySocks --break-system-packages")
+            s.proxies = {}
     return s
 
 WEB = _make_session()
@@ -1139,9 +1146,11 @@ def youtube_search(query: str, max_results=8) -> list[dict]:
     try:
         result = subprocess.run(
             [YTDLP_BIN, "--flat-playlist", "--print",
-             "%(id)s|||%(title)s|||%(uploader)s|||%(duration_string)s|||%(thumbnail)s",
+             "%(id)s|||%(title)s|||%(uploader)s|||%(duration_string)s|||%(thumbnail)s|||%(view_count)s|||%(like_count)s|||%(description)s",
              f"ytsearch{max_results}:{query}", "--no-warnings",
-             "--no-check-certificate"],
+             "--no-check-certificate",
+             "--extractor-args", "youtube:lang=en",
+             "--geo-bypass-country", "US"],
             capture_output=True, text=True, timeout=30,
         )
         items = []
@@ -1150,13 +1159,16 @@ def youtube_search(query: str, max_results=8) -> list[dict]:
             if len(parts) >= 2 and parts[0].strip():
                 vid_id = parts[0].strip()
                 items.append({
-                    "id": vid_id,
-                    "title": parts[1].strip(),
-                    "uploader": parts[2].strip() if len(parts)>2 else "",
-                    "duration":  parts[3].strip() if len(parts)>3 else "",
-                    "thumbnail": parts[4].strip() if len(parts)>4 else
-                                 f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg",
-                    "url": f"https://www.youtube.com/watch?v={vid_id}",
+                    "id":          vid_id,
+                    "title":       parts[1].strip() if len(parts)>1 else "",
+                    "uploader":    parts[2].strip() if len(parts)>2 else "",
+                    "duration":    parts[3].strip() if len(parts)>3 else "",
+                    "thumbnail":   parts[4].strip() if len(parts)>4 and parts[4].strip() not in ("NA","")
+                                   else f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg",
+                    "view_count":  parts[5].strip() if len(parts)>5 else "",
+                    "like_count":  parts[6].strip() if len(parts)>6 else "",
+                    "description": parts[7].strip()[:300] if len(parts)>7 else "",
+                    "url":         f"https://www.youtube.com/watch?v={vid_id}",
                 })
         log.info("youtube_search: %d results", len(items))
         return items
@@ -1208,18 +1220,14 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
     else:
         log.warning("youtube_download: no cookies file — bot-detection likely")
 
-    # Each client needs its own format list.
-    # tv_embedded → killed by Google for yt-dlp, skip entirely.
-    # android/android_vr → best for datacenter IPs, serve mp4 directly.
-    # ios → works but only serves combined streams (use "best" only).
-    # mweb/web → 403 on datacenter IPs even through WARP, try last.
-    #
-    # Format notes:
-    #   android/android_vr serve pre-muxed mp4 — don't use bestvideo+bestaudio
-    #   ios also pre-muxed — use "best" only
-    #   web/mweb support separate streams but 403 on CDN anyway
+    # Strategy 0: Cobalt API (self-hosted) — fastest, handles PO token internally
+    cobalt_result = _youtube_cobalt(url, audio_only=audio_only)
+    if cobalt_result:
+        return cobalt_result
 
-    # (client, formats_to_try)
+    # Strategy 1-5: yt-dlp with multiple player clients
+    # android/ios serve pre-muxed mp4 — only use "best" formats
+    # mweb/web support separate streams but may 403 on datacenter IPs
     client_strategies = [
         ("android",    ["best[height<=720]", "best"]),
         ("android_vr", ["best[height<=720]", "best"]),
@@ -2010,11 +2018,11 @@ def tg_download_media_web(msg_url: str) -> Optional[tuple[bytes, str]]:
 # Updated list from https://github.com/zedeus/nitter/wiki/Instances (May 2026)
 NITTER_INSTANCES = [
     "https://nitter.cz",
-    "https://twiiit.com",
     "https://nitter.poast.org",
+    "https://twiiit.com",
     "https://nitter.net",
-    "https://nitter.42l.fr",
     "https://nitter.privacydev.net",
+    "https://nitter.42l.fr",
 ]
 _nitter_cache: list[str] = []
 _nitter_cache_time: float = 0.0
@@ -2169,6 +2177,33 @@ def twitter_get_channel(username: str, limit: int = 20) -> list[dict]:
     except Exception as e:
         log.warning("xcancel rss: %s", e)
 
+    # Strategy 4: bird.makeup RSS (another reliable Nitter-compatible frontend)
+    try:
+        r4 = WEB.get(f"https://bird.makeup/users/{username}/feed.atom",
+                     headers={"User-Agent": UA_DESK}, timeout=15)
+        log.debug("bird.makeup: status=%d", r4.status_code)
+        if r4.status_code == 200:
+            soup = BeautifulSoup(r4.content, "xml")
+            tweets = []
+            for entry in soup.select("entry")[:limit]:
+                title   = (entry.find("title") or {}).get_text(strip=True)
+                link_el = entry.find("link")
+                link    = link_el.get("href","") if link_el else ""
+                content = BeautifulSoup(
+                    (entry.find("content") or {}).get_text(strip=True),
+                    "html.parser").get_text(" ", strip=True)
+                updated = (entry.find("updated") or {}).get_text(strip=True)
+                tweets.append({
+                    "text": f"{title}\n{content}".strip(),
+                    "date": updated[:19], "url": link, "nitter_url": "",
+                    "has_video": False, "has_photo": False, "img_urls": [],
+                })
+            if tweets:
+                log.info("bird.makeup: %d tweets", len(tweets))
+                return tweets
+    except Exception as e:
+        log.warning("bird.makeup: %s", e)
+
     log.error("twitter_get_channel: all strategies failed for @%s", username)
     return []
 
@@ -2176,16 +2211,23 @@ def twitter_get_channel(username: str, limit: int = 20) -> list[dict]:
 def twitter_download_media(tweet_url: str) -> Optional[tuple[bytes, str]]:
     """
     Download video/image from a tweet.
-    1. vxtwitter/fxtwitter API (direct media URL, no auth)
+    0. Cobalt API (handles Twitter natively when self-hosted)
+    1. vxtwitter/fxtwitter API
     2. yt-dlp with twitter cookies
     3. yt-dlp via Nitter instances
     4. Direct image scrape from Nitter HTML
+    5. Final Cobalt retry on original URL
     """
     log.info("twitter_download_media: %s", tweet_url)
     tweet_url = tweet_url.replace("x.com/", "twitter.com/")
     m = re.search(r"twitter\.com/([^/]+)/status/(\d+)", tweet_url)
     username = m.group(1) if m else ""
     tweet_id = m.group(2) if m else ""
+
+    # Strategy 0: Cobalt API (self-hosted handles Twitter well)
+    cobalt = _cobalt_download(tweet_url)
+    if cobalt:
+        return cobalt
 
     # Strategy 1: vxtwitter / fxtwitter API
     if username and tweet_id:
@@ -2270,12 +2312,17 @@ def twitter_download_media(tweet_url: str) -> Optional[tuple[bytes, str]]:
 def instagram_download_all(url: str) -> list[dict]:
     """
     Download ALL media from an Instagram post (single/carousel/reel).
-    Returns list of {data, fname, caption, is_video}.
+    Returns list of {data, fname, caption, is_video} — up to 20 items.
     """
     log.info("instagram_download_all: %s", url)
-    results = []
 
-    # Strategy 1: instaloader (handles GraphSidecar carousels natively)
+    # Strategy 1: Cobalt API (handles reels and single posts reliably, no login)
+    cobalt = _cobalt_download(url, audio_only=False)
+    if cobalt:
+        vid_bytes, fname = cobalt
+        return [{"data": vid_bytes, "fname": fname, "caption": "", "is_video": True}]
+
+    # Strategy 2: instaloader (handles carousel / multiple slides natively)
     try:
         import instaloader
         L = instaloader.Instaloader(
@@ -2300,21 +2347,21 @@ def instagram_download_all(url: str) -> list[dict]:
         shortcode = m.group(1)
         post = instaloader.Post.from_shortcode(L.context, shortcode)
 
-        caption = post.caption or ""
+        caption = (post.caption or "")[:1000]
         log.info("instagram: typename=%s caption_len=%d", post.typename, len(caption))
 
+        results = []
         with tempfile.TemporaryDirectory() as tmp:
             L.dirname_pattern = tmp
             L.filename_pattern = "{shortcode}_{media_id}"
             L.download_post(post, target=tmp)
 
-            # Collect all media files sorted by name (preserves carousel order)
             all_files = sorted(Path(tmp).rglob("*"), key=lambda f: f.name)
             media_files = [
                 f for f in all_files
                 if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"}
                 and f.stat().st_size > 1000
-            ]
+            ][:20]  # max 20 slides
             log.info("instaloader: %d media files for %s", len(media_files), shortcode)
 
             for f in media_files:
@@ -2332,7 +2379,7 @@ def instagram_download_all(url: str) -> list[dict]:
     except Exception as e:
         log.error("instaloader: %s", e)
 
-    # Strategy 2: yt-dlp (single video/reel, no carousel support)
+    # Strategy 3: yt-dlp with cookies
     try:
         ig_cookies = INSTAGRAM_COOKIES_FILE
         result = social_download_ytdlp(url, cookies_file=ig_cookies)
@@ -2342,16 +2389,9 @@ def instagram_download_all(url: str) -> list[dict]:
     except Exception as e:
         log.error("yt-dlp instagram: %s", e)
 
-    # Strategy 3: Cobalt API (cobalt.tools) — no auth needed, handles reels well
-    cobalt = _social_cobalt(url, audio_only=False)
-    if cobalt:
-        vid_bytes, fname = cobalt
-        return [{"data": vid_bytes, "fname": fname, "caption": "", "is_video": True}]
-
     return []
+    results = []
 
-
-def instagram_download(url: str) -> Optional[tuple[bytes, str]]:
     """Backward-compat single-item wrapper."""
     items = instagram_download_all(url)
     if items:
@@ -2398,10 +2438,13 @@ def instagram_get_profile(username: str) -> list[dict]:
 # ─── TikTok ──────────────────────────────────────────────────────────────────
 def tiktok_download(url: str) -> Optional[tuple[bytes, str]]:
     """Download TikTok video.
-    Strategy 1: yt-dlp (no auth needed for public videos)
-    Strategy 2: Cobalt API (via social_download_ytdlp fallback)
+    Strategy 1: Cobalt API (self-hosted, most reliable for TikTok)
+    Strategy 2: yt-dlp fallback
     """
     log.info("tiktok_download: %s", url)
+    cobalt = _cobalt_download(url)
+    if cobalt:
+        return cobalt
     return social_download_ytdlp(url)
 
 
@@ -4571,8 +4614,12 @@ def handle_message(msg: dict):
 # CALLBACK HANDLER
 # ═══════════════════════════════════════════════════════════════════════════════
 def handle_callback(cb: dict):
-    cid  = cb["message"]["chat"]["id"]
-    data = cb.get("data","")
+    msg = cb.get("message") or {}
+    cid = (msg.get("chat") or {}).get("id") or 0
+    if not cid:
+        log.warning("handle_callback: no chat id in callback, skipping")
+        return
+    data = cb.get("data", "")
     answer_cb(cb["id"])
     init_user(cid)
     log.info("CB cid=%d data=%r", cid, data)
@@ -4643,7 +4690,7 @@ def handle_callback(cb: dict):
         set_state(cid, mode="yt_search")
         send_message(cid, "🔍 کلمه جستجو:", reply_markup=cancel_kb()); return
 
-    # YouTube result click → download
+    # YouTube result click → show info card with download button
     m = re.match(r"yt_res_(\w+)_(\d+)$", data)
     if m:
         key, idx = m.group(1), int(m.group(2))
@@ -4652,26 +4699,79 @@ def handle_callback(cb: dict):
             send_message(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید."); return
         vid = results[idx]
 
-        # Send thumbnail first
-        thumb_url = vid.get("thumbnail") or \
-                    f"https://i.ytimg.com/vi/{vid.get('id','')}/hqdefault.jpg"
-        if thumb_url:
-            try:
-                thumb = download_bytes(thumb_url, MAX_IMAGE_SIZE)
-                if thumb:
-                    uploader = vid.get("uploader","")
-                    dur = vid.get("duration","")
-                    caption = f"📺 {vid['title']}"
-                    if uploader: caption += f"\n🎬 {uploader}"
-                    if dur:      caption += f"\n⏱ {dur}"
-                    send_photo(cid, thumb, caption=caption)
-            except Exception as e:
-                log.warning("yt thumb: %s", e)
+        # Build info card text
+        title    = vid.get("title", "")
+        uploader = vid.get("uploader", "")
+        duration = vid.get("duration", "")
+        views    = vid.get("view_count", "")
+        likes    = vid.get("like_count", "")
+        desc     = vid.get("description", "")
+        url      = vid.get("url", "")
 
-        send_message(cid, f"⏳ دانلود: _{vid['title']}_…", parse_mode="Markdown")
-        chat_action(cid, "upload_video")
-        result = youtube_download(vid["url"], audio_only=False)
+        def _fmt_num(n):
+            try:
+                n = int(n)
+                if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+                if n >= 1_000: return f"{n/1_000:.1f}K"
+                return str(n)
+            except Exception: return str(n) if n else ""
+
+        lines = [f"📺 *{title}*"]
+        if uploader: lines.append(f"🎬 {uploader}")
+        if duration: lines.append(f"⏱ {duration}")
+        if views:    lines.append(f"👁 {_fmt_num(views)} بازدید")
+        if likes:    lines.append(f"👍 {_fmt_num(likes)} لایک")
+        if desc:     lines.append(f"\n_{desc[:200]}_")
+
+        info_text = "\n".join(lines)
+
+        # Store selected video for download
+        dl_key = make_cache_key("ytdl", url)
+        cache_set(dl_key, [vid])
+
+        kb = {"inline_keyboard": [
+            [{"text": "📥 دانلود ویدیو", "callback_data": f"yt_do_dl_{dl_key}"},
+             {"text": "🎵 دانلود صدا",   "callback_data": f"yt_do_audio_{dl_key}"}],
+            [{"text": "🔙 برگشت",        "callback_data": f"yt_back_{key}"},
+             {"text": "🏠 منوی اصلی",    "callback_data": "home"}],
+        ]}
+
+        # Send thumbnail + info card
+        thumb_url = vid.get("thumbnail") or f"https://i.ytimg.com/vi/{vid.get('id','')}/hqdefault.jpg"
+        thumb = download_bytes(thumb_url, MAX_IMAGE_SIZE)
+        if thumb:
+            send_photo(cid, thumb, caption=info_text[:1000], reply_markup=kb)
+        else:
+            send_message(cid, info_text, parse_mode="Markdown", reply_markup=kb)
+        return
+
+    # YouTube download from info card
+    m = re.match(r"yt_do_(dl|audio)_(\w+)$", data)
+    if m:
+        dl_type, dl_key = m.group(1), m.group(2)
+        vids = cache_get(dl_key)
+        if not vids:
+            send_message(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید."); return
+        vid = vids[0]
+        audio_only = (dl_type == "audio")
+        label = "🎵 صدا" if audio_only else "📺 ویدیو"
+        send_message(cid, f"⏳ در حال دانلود {label}: _{vid['title']}_…",
+                     parse_mode="Markdown")
+        chat_action(cid, "upload_video" if not audio_only else "upload_voice")
+        result = youtube_download(vid["url"], audio_only=audio_only)
         _finish_video(cid, result); return
+
+    # YouTube back to search results
+    m = re.match(r"yt_back_(\w+)$", data)
+    if m:
+        key = m.group(1)
+        results = cache_get(key)
+        if results:
+            page = st.get("page", 0)
+            text = f"📺 *یوتیوب — نتایج جستجو:*\nروی ویدیو کلیک کنید:"
+            kb = yt_results_kb(results, key, page, len(results) == 8)
+            send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
+        return
 
     m = re.match(r"yt_page_(\d+)$", data)
     if m:
