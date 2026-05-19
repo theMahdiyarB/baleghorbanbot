@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.9)
+بله قربان — Bale Bot  (v1.10)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -4726,7 +4726,7 @@ def handle_callback(cb: dict):
         info_text = "\n".join(lines)
 
         # Store selected video for download
-        dl_key = make_cache_key("ytdl", url)
+        dl_key = "ytdl_" + hashlib.md5(url.encode()).hexdigest()[:8]
         cache_set(dl_key, [vid])
 
         kb = {"inline_keyboard": [
