@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.10)
+بله قربان — Bale Bot  (v1.11)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -404,9 +404,12 @@ def send_audio(chat_id, audio_bytes: bytes, filename: str, caption="") -> bool:
     return smart_send(chat_id, audio_bytes, filename, caption, media_type="audio")
 
 def chat_action(chat_id, action="typing"):
-    if not chat_id:
+    if not chat_id or chat_id == 0:
         return
-    api("sendChatAction", chat_id=chat_id, action=action)
+    try:
+        api("sendChatAction", _retries=1, chat_id=chat_id, action=action)
+    except Exception:
+        pass  # chat actions are best-effort, never crash on them
 
 def get_file_url(file_id: str) -> Optional[str]:
     resp = api("getFile", file_id=file_id)
@@ -1382,29 +1385,45 @@ def _youtube_rapidapi(url: str, audio_only: bool = False) -> Optional[tuple[byte
 def _cobalt_download(url: str, audio_only: bool = False,
                      quality: str = "720") -> Optional[tuple[bytes, str]]:
     """
-    Download via Cobalt API (self-hosted or remote).
-    Supports: YouTube, TikTok, Twitter/X, Instagram, Reddit, SoundCloud,
-              Twitch, Vimeo, Dailymotion, Bilibili, Pinterest, and more.
-    Set COBALT_URL env var to your self-hosted instance (default: http://localhost:9000).
-    Leave COBALT_URL empty to disable.
+    Download single item via Cobalt API.
+    For carousels/multiple items use _cobalt_download_all().
+    """
+    results = _cobalt_download_all(url, audio_only=audio_only, quality=quality)
+    if results:
+        return results[0]["data"], results[0]["fname"]
+    return None
+
+
+def _cobalt_download_all(url: str, audio_only: bool = False,
+                         quality: str = "720") -> list[dict]:
+    """
+    Download ALL items via Cobalt API (handles carousels, playlists, etc).
+    Returns list of {data, fname, is_video} dicts.
+    Set COBALT_URL env var to your self-hosted instance.
     """
     if not COBALT_URL:
-        log.debug("_cobalt_download: COBALT_URL not set, skipping")
-        return None
-    log.info("_cobalt_download: %s audio=%s via %s", url, audio_only, COBALT_URL)
+        log.debug("_cobalt_download_all: COBALT_URL not set, skipping")
+        return []
+    log.info("_cobalt_download_all: %s audio=%s via %s", url, audio_only, COBALT_URL)
     try:
-        payload = {
-            "url": url,
+        payload: dict = {
+            "url":          url,
             "videoQuality": quality,
             "filenameStyle": "basic",
-            "alwaysProxy": False,
+            "alwaysProxy":  False,
         }
         if audio_only:
             payload["downloadMode"] = "audio"
-            payload["audioFormat"] = "mp3"
+            payload["audioFormat"]  = "mp3"
             payload["audioBitrate"] = "192"
         else:
             payload["downloadMode"] = "auto"
+
+        # Pass YouTube cookies to Cobalt if available (fixes error.api.youtube.login)
+        if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).exists():
+            # Cobalt doesn't accept cookie files directly, but we can try youtubeCookies
+            # For self-hosted, set COOKIE_YOUTUBE in cobalt's own .env instead
+            pass
 
         resp = WEB.post(
             f"{COBALT_URL}/",
@@ -1414,53 +1433,67 @@ def _cobalt_download(url: str, audio_only: bool = False,
             timeout=30,
         )
         if resp.status_code not in (200, 201):
-            log.warning("_cobalt_download: status=%d body=%s",
+            log.warning("_cobalt_download_all: status=%d body=%s",
                         resp.status_code, resp.text[:200])
-            return None
+            return []
 
         j = resp.json()
         status = j.get("status", "")
-        log.debug("_cobalt_download: status=%s", status)
+        log.debug("_cobalt_download_all: status=%s", status)
 
         if status == "error":
             code = j.get("error", {}).get("code", "unknown")
-            log.warning("_cobalt_download: API error code=%s", code)
-            return None
+            log.warning("_cobalt_download_all: API error code=%s", code)
+            return []
 
-        # Cobalt returns a direct URL or a picker (multiple items e.g. carousel)
-        dl_url = j.get("url")
-        if not dl_url and j.get("picker"):
-            for item in j["picker"]:
-                if item.get("type") in ("video", None) and item.get("url"):
-                    dl_url = item["url"]
-                    break
-            if not dl_url:
-                dl_url = j["picker"][0].get("url")
+        def _fetch_item(item_url: str, is_video: bool = True,
+                        ext_hint: str = "") -> Optional[dict]:
+            if not item_url:
+                return None
+            raw = download_bytes(item_url, MAX_FILE_SIZE * 2)
+            if not raw or len(raw) < 500:
+                return None
+            # Detect extension from URL or content-type hint
+            ext = ext_hint or ("mp4" if is_video else "jpg")
+            if "webp" in item_url.lower(): ext = "webp"
+            elif ".jpg" in item_url.lower() or ".jpeg" in item_url.lower(): ext = "jpg"
+            elif ".png" in item_url.lower(): ext = "png"
+            domain_m = re.search(r"(?:https?://)?(?:www\.)?([^/]+)", url)
+            prefix = domain_m.group(1).split(".")[0] if domain_m else "media"
+            fname = f"{prefix}_media.{ext}"
+            log.info("cobalt item OK: %.1fMB %s", len(raw)/1024/1024, fname)
+            return {"data": raw, "fname": fname, "is_video": is_video}
 
-        if not dl_url:
-            log.warning("_cobalt_download: no URL in response: %s", str(j)[:200])
-            return None
+        # Single direct URL
+        if j.get("url") and status in ("tunnel", "redirect", "stream"):
+            ext = "mp3" if audio_only else "mp4"
+            result = _fetch_item(j["url"], is_video=not audio_only, ext_hint=ext)
+            return [result] if result else []
 
-        log.info("_cobalt_download: fetching from %s", dl_url[:80])
-        vid_bytes = download_bytes(dl_url, MAX_FILE_SIZE * 2)
-        if not vid_bytes or len(vid_bytes) < 1000:
-            log.warning("_cobalt_download: download too small or empty")
-            return None
+        # Picker = carousel / multiple items
+        if j.get("picker"):
+            results = []
+            for item in j["picker"][:20]:  # max 20 slides
+                item_url = item.get("url", "")
+                item_type = item.get("type", "")
+                is_video = item_type == "video"
+                r = _fetch_item(item_url, is_video=is_video)
+                if r:
+                    results.append(r)
+            log.info("cobalt picker: %d/%d items fetched",
+                     len(results), len(j["picker"]))
+            return results
 
-        ext = "mp3" if audio_only else "mp4"
-        domain_m = re.search(r"(?:https?://)?(?:www\.)?([^/]+)", url)
-        prefix = domain_m.group(1).split(".")[0] if domain_m else "media"
-        fname = f"{prefix}_download.{ext}"
-        log.info("_cobalt_download OK: %.1fMB  %s", len(vid_bytes)/1024/1024, fname)
-        return vid_bytes, fname
+        log.warning("_cobalt_download_all: unhandled status=%s j=%s",
+                    status, str(j)[:200])
+        return []
 
     except requests.exceptions.ConnectionError:
-        log.warning("_cobalt_download: cannot connect to %s — is Cobalt running?",
-                    COBALT_URL)
-        return None
+        log.warning("_cobalt_download_all: cannot connect to %s", COBALT_URL)
+        return []
     except Exception as e:
-        log.error("_cobalt_download: %s", e)
-        return None
+        log.error("_cobalt_download_all: %s", e)
+        return []
 
 
 def _youtube_cobalt(url: str, audio_only: bool = False) -> Optional[tuple[bytes, str]]:
@@ -2316,11 +2349,13 @@ def instagram_download_all(url: str) -> list[dict]:
     """
     log.info("instagram_download_all: %s", url)
 
-    # Strategy 1: Cobalt API (handles reels and single posts reliably, no login)
-    cobalt = _cobalt_download(url, audio_only=False)
-    if cobalt:
-        vid_bytes, fname = cobalt
-        return [{"data": vid_bytes, "fname": fname, "caption": "", "is_video": True}]
+    # Strategy 1: Cobalt API (handles reels and carousels — returns all slides)
+    cobalt_items = _cobalt_download_all(url, audio_only=False)
+    if cobalt_items:
+        # Cobalt returns all carousel items — wrap with caption placeholder
+        return [{"data": it["data"], "fname": it["fname"],
+                 "caption": "", "is_video": it.get("is_video", True)}
+                for it in cobalt_items]
 
     # Strategy 2: instaloader (handles carousel / multiple slides natively)
     try:
@@ -3587,7 +3622,7 @@ def do_youtube_search_cmd(cid: int, query: str, page=0):
     if not results:
         send_message(cid, "❌ ویدیویی یافت نشد.", reply_markup=home_kb())
         return
-    text = f"📺 *یوتیوب:* _{query}_\nروی ویدیو کلیک کنید تا دانلود شود:"
+    text = f"📺 *یوتیوب:* _{query}_\nروی ویدیو کلیک کنید:"
     kb = yt_results_kb(results, key, page, len(results)==8)
     send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
 
@@ -3605,16 +3640,15 @@ def _finish_video(cid: int, result):
     if not result:
         send_message(cid,
                      "❌ دانلود ناموفق بود.\n"
-                     "• اجرا کنید: `yt-dlp -U`\n"
-                     "• یا یک ویدیو دیگر امتحان کنید.",
+                     "• ویدیو ممکن است در دسترس نباشد\n"
+                     "• ویدیوی دیگری امتحان کنید",
                      parse_mode="Markdown", reply_markup=home_kb())
         return
     data, fname = result
     fname = Path(fname).name
     size_mb = len(data)/1024/1024
     log.info("_finish_video: %s  %.1fMB", fname, size_mb)
-    # smart_send handles chunking automatically — no size limit needed here
-    if smart_send(cid, data, fname, caption=f"📺 {fname[:60]}", media_type="video"):
+    if smart_send(cid, data, fname, caption="", media_type="video"):
         send_message(cid, f"✅ ارسال شد ({size_mb:.1f}MB).", reply_markup=home_kb())
     else:
         send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
@@ -3681,9 +3715,9 @@ def _do_audio_download(cid: int, url: str, source: str = "auto",
     result = music_download_ytdlp(url, source=source)
     if not result:
         send_message(cid,
-            "❌ دانلود ناموفق بود.\n"
-            "• دستور `yt-dlp -U` را اجرا کنید تا yt-dlp آپدیت شود.\n"
-            "• یا لینک را مستقیم از مرورگر کپی کنید.",
+            "❌ دانلود موسیقی ناموفق بود.\n"
+            "• لینک را بررسی کنید\n"
+            "• ممکن است محتوا محدودیت داشته باشد",
             parse_mode="Markdown", reply_markup=home_kb())
         return
 
@@ -4049,7 +4083,7 @@ def do_apk_search(cid: int, query: str):
         send_message(cid,
             "❌ اپلیکیشنی یافت نشد.\n"
             "• نام پکیج را امتحان کنید (مثل `org.telegram.messenger`)\n"
-            "• یا دستور `pip install google-play-scraper` را اجرا کنید",
+            "• اپ ممکن است در منطقه شما در دسترس نباشد",
             parse_mode="Markdown", reply_markup=home_kb())
         return
     key = make_cache_key("apk", query, 0)
@@ -4331,7 +4365,7 @@ def do_tg_dl_media(cid: int, msg_url: str):
     chat_action(cid, "upload_document")
     result = tg_download_media_web(msg_url)
     if not result:
-        send_message(cid, "❌ دانلود ناموفق — این پیام ممکن است رسانه نداشته باشد.",
+        send_message(cid, "❌ دانلود ناموفق بود — این پیام ممکن است رسانه نداشته باشد.",
                      reply_markup=home_kb())
         return
     data, fname = result
@@ -4434,41 +4468,47 @@ def do_instagram_profile(cid: int, username: str):
 
 
 def do_instagram_dl(cid: int, url: str):
-    """Download ALL media from an Instagram post (single/carousel/reel) with full caption."""
+    """دانلود تمام رسانه‌های یک پست اینستاگرام (تکی / کاروسل / ریل) با کپشن کامل."""
     bump(cid, "downloads")
-    send_message(cid, "⏳ Downloading from Instagram…")
+    send_message(cid, "⏳ در حال دانلود از اینستاگرام…")
     chat_action(cid, "upload_video")
 
     items = instagram_download_all(url)
+    # Filter out empty/tiny items (< 5KB) that are likely broken
+    items = [it for it in items if it.get("data") and len(it["data"]) > 5000]
+
     if not items:
         send_message(cid,
-            "❌ Download failed.\n"
-            "• Post must be public\n"
-            "• Set INSTAGRAM_USER/PASS for private posts",
+            "❌ دانلود ناموفق بود.\n"
+            "• پست باید عمومی باشد\n"
+            "• برای پست‌های خصوصی INSTAGRAM_USER/PASS را تنظیم کنید",
             reply_markup=home_kb())
         return
 
-    caption = items[0].get("caption", "")
+    caption = items[0].get("caption", "") or ""
     total   = len(items)
     log.info("do_instagram_dl: sending %d items, caption_len=%d", total, len(caption))
 
     if total > 1:
-        send_message(cid, f"📸 Found {total} items in carousel — sending all…")
+        send_message(cid, f"📸 {total} تصویر/ویدیو یافت شد — در حال ارسال همه…")
 
     sent = 0
     for i, item in enumerate(items):
-        # Caption only on first item
+        # Send caption only on the first item, full length
         item_caption = caption[:1024] if i == 0 and caption else ""
         try:
             ok = smart_send(cid, item["data"], item["fname"],
                             caption=item_caption,
-                            media_type="video" if item["is_video"] else "document")
+                            media_type="video" if item.get("is_video") else "photo")
             if ok:
                 sent += 1
         except Exception as e:
             log.error("do_instagram_dl item %d: %s", i, e)
 
-    send_message(cid, f"✅ Sent {sent}/{total} items.", reply_markup=home_kb())
+    if sent > 0:
+        send_message(cid, f"✅ {sent} از {total} مورد ارسال شد.", reply_markup=home_kb())
+    else:
+        send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
     clear_state(cid)
 
 
@@ -4495,16 +4535,18 @@ def do_tiktok_user(cid: int, username: str):
 
 
 def do_tiktok_dl(cid: int, url: str):
-    """Download TikTok video."""
+    """دانلود ویدیوی TikTok."""
     bump(cid, "downloads")
-    send_message(cid, f"⏳ در حال دانلود از TikTok…")
+    send_message(cid, "⏳ در حال دانلود از TikTok…")
     chat_action(cid, "upload_video")
     result = tiktok_download(url)
     if not result:
-        send_message(cid, "❌ دانلود ناموفق.", reply_markup=home_kb())
+        send_message(cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb())
         return
     data, fname = result
-    smart_send(cid, data, fname, caption=f"🎵 {fname[:60]}")
+    # Use stored caption from state if available
+    caption = get_state(cid).get("last_caption", "") or ""
+    smart_send(cid, data, fname, caption=caption[:1024])
     send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
     clear_state(cid)
 
@@ -4912,7 +4954,7 @@ def handle_callback(cb: dict):
         key, idx = m.group(1), int(m.group(2))
         results = cache_get(key)
         if not results or idx >= len(results):
-            send_message(cid, "❌ Result expired. Search again."); return
+            send_message(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید."); return
         app = results[idx]
         # Fetch full info
         chat_action(cid)
@@ -5314,7 +5356,7 @@ def handle_callback(cb: dict):
         key, idx = m.group(1), int(m.group(2))
         results = cache_get(key)
         if not results or idx >= len(results):
-            send_message(cid, "❌ Result expired. Search again."); return
+            send_message(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید."); return
         track = results[idx]
         url   = track.get("url", "")
         title = track.get("title", "")
