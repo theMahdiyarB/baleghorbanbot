@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.11)
+بله قربان — Bale Bot  (v1.12)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -407,9 +407,11 @@ def chat_action(chat_id, action="typing"):
     if not chat_id or chat_id == 0:
         return
     try:
-        api("sendChatAction", _retries=1, chat_id=chat_id, action=action)
+        requests.post(f"{BASE_URL}/sendChatAction",
+                      json={"chat_id": chat_id, "action": action},
+                      timeout=5)
     except Exception:
-        pass  # chat actions are best-effort, never crash on them
+        pass  # Best-effort — never block on this
 
 def get_file_url(file_id: str) -> Optional[str]:
     resp = api("getFile", file_id=file_id)
@@ -1190,6 +1192,7 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
         base = [
             YTDLP_BIN,
             "--no-playlist", "--no-warnings", "--no-check-certificate",
+            "--no-check-formats",   # skip format verification — avoids false "not available"
             "--ffmpeg-location", ffmpeg_dir,
             "--socket-timeout", "30", "--retries", "2",
             "--extractor-args", f"youtube:player_client={player_client}",
@@ -1232,13 +1235,15 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
     # android/ios serve pre-muxed mp4 — only use "best" formats
     # mweb/web support separate streams but may 403 on datacenter IPs
     client_strategies = [
-        ("android",    ["best[height<=720]", "best"]),
-        ("android_vr", ["best[height<=720]", "best"]),
-        ("ios",        ["best[height<=720]", "best"]),
-        ("mweb",       ["bestvideo[height<=720]+bestaudio/best[height<=720]",
-                        "best[height<=720]", "best"]),
-        ("web",        ["bestvideo[height<=720]+bestaudio/best[height<=720]",
-                        "best[height<=720]", "best"]),
+        ("android",       ["best[height<=720]", "best"]),
+        ("android_vr",    ["best[height<=720]", "best"]),
+        ("ios",           ["best[height<=720]", "best"]),
+        ("web_embedded",  ["bestvideo[height<=720]+bestaudio/best[height<=720]",
+                           "best[height<=720]", "best"]),
+        ("mweb",          ["bestvideo[height<=720]+bestaudio/best[height<=720]",
+                           "best[height<=720]", "best"]),
+        ("web",           ["bestvideo[height<=720]+bestaudio/best[height<=720]",
+                           "best[height<=720]", "best"]),
     ]
 
     if audio_only:
@@ -2423,6 +2428,30 @@ def instagram_download_all(url: str) -> list[dict]:
             return [{"data": data, "fname": fname, "caption": "", "is_video": True}]
     except Exception as e:
         log.error("yt-dlp instagram: %s", e)
+
+    # Strategy 4: Instagram oEmbed API — returns thumbnail for photo posts
+    # Works for public posts without login
+    try:
+        m = re.search(r"instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)", url)
+        if m:
+            shortcode = m.group(1)
+            oe_resp = WEB.get(
+                f"https://www.instagram.com/p/{shortcode}/media/?size=l",
+                headers={"User-Agent": UA_MOB,
+                         "Accept": "image/webp,image/apng,image/*,*/*",
+                         "Referer": "https://www.instagram.com/"},
+                allow_redirects=True, timeout=20)
+            if oe_resp.status_code == 200 and len(oe_resp.content) > 5000:
+                ct = oe_resp.headers.get("content-type", "")
+                if "image" in ct:
+                    ext = "jpg" if "jpeg" in ct else ct.split("/")[-1].split(";")[0]
+                    fname = f"instagram_{shortcode}.{ext}"
+                    log.info("instagram media redirect OK: %dKB %s",
+                             len(oe_resp.content)//1024, fname)
+                    return [{"data": oe_resp.content, "fname": fname,
+                             "caption": "", "is_video": False}]
+    except Exception as e:
+        log.error("instagram media redirect: %s", e)
 
     return []
     results = []
@@ -4413,19 +4442,23 @@ def do_twitter_show(cid: int, tweet: dict):
 
     send_message(cid, "\n".join(lines) or "_(توییت بدون متن)_", parse_mode="Markdown")
 
-    # Auto-download and send images
-    for img_url in img_urls[:4]:
+    # Auto-download and send ALL images in the tweet
+    for img_url in img_urls[:10]:
         try:
             img_bytes = download_bytes(img_url, MAX_IMAGE_SIZE)
             if img_bytes and len(img_bytes) > 500:
-                send_photo(cid, img_bytes, caption="🐦")
+                send_photo(cid, img_bytes, caption="")
         except Exception as e:
             log.warning("twitter img dl: %s", e)
+
+    # Store tweet text as caption for media download
+    if text:
+        set_state(cid, last_caption=text[:1024])
 
     # Show video download button if has video
     kb = social_post_kb(url, "tw", has_vid) if url else home_kb()
     if has_vid or not img_urls:
-        send_message(cid, "👆", reply_markup=kb)
+        send_message(cid, "📥 دانلود ویدیو؟", reply_markup=kb)
     else:
         send_message(cid, "✅", reply_markup=home_kb())
 
@@ -4433,7 +4466,7 @@ def do_twitter_show(cid: int, tweet: dict):
 def do_twitter_dl(cid: int, url: str):
     """Download media from a tweet URL."""
     bump(cid, "downloads")
-    send_message(cid, f"⏳ در حال دانلود از توییت…")
+    send_message(cid, "⏳ در حال دانلود از توییت…")
     chat_action(cid, "upload_video")
     result = twitter_download_media(url)
     if not result:
@@ -4441,7 +4474,8 @@ def do_twitter_dl(cid: int, url: str):
                      reply_markup=home_kb())
         return
     data, fname = result
-    smart_send(cid, data, fname, caption=f"🐦 {fname[:60]}")
+    caption = get_state(cid).get("last_caption", "") or ""
+    smart_send(cid, data, fname, caption=caption[:1024])
     send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
     clear_state(cid)
 
@@ -4485,7 +4519,7 @@ def do_instagram_dl(cid: int, url: str):
             reply_markup=home_kb())
         return
 
-    caption = items[0].get("caption", "") or ""
+    caption = get_state(cid).get("last_caption", "") or ""
     total   = len(items)
     log.info("do_instagram_dl: sending %d items, caption_len=%d", total, len(caption))
 
@@ -4494,11 +4528,11 @@ def do_instagram_dl(cid: int, url: str):
 
     sent = 0
     for i, item in enumerate(items):
-        # Send caption only on the first item, full length
-        item_caption = caption[:1024] if i == 0 and caption else ""
+        # Send full caption only on first item
+        item_caption = caption if i == 0 and caption else ""
         try:
             ok = smart_send(cid, item["data"], item["fname"],
-                            caption=item_caption,
+                            caption=item_caption[:1024],
                             media_type="video" if item.get("is_video") else "photo")
             if ok:
                 sent += 1
@@ -4752,17 +4786,21 @@ def handle_callback(cb: dict):
 
         def _fmt_num(n):
             try:
-                n = int(n)
+                if not n or str(n).strip().upper() in ("NA", "NONE", "", "0"):
+                    return ""
+                n = int(str(n).replace(",", ""))
                 if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
                 if n >= 1_000: return f"{n/1_000:.1f}K"
                 return str(n)
-            except Exception: return str(n) if n else ""
+            except Exception: return ""
 
         lines = [f"📺 *{title}*"]
         if uploader: lines.append(f"🎬 {uploader}")
         if duration: lines.append(f"⏱ {duration}")
-        if views:    lines.append(f"👁 {_fmt_num(views)} بازدید")
-        if likes:    lines.append(f"👍 {_fmt_num(likes)} لایک")
+        views_fmt = _fmt_num(views)
+        likes_fmt = _fmt_num(likes)
+        if views_fmt: lines.append(f"👁 {views_fmt} بازدید")
+        if likes_fmt: lines.append(f"👍 {likes_fmt} لایک")
         if desc:     lines.append(f"\n_{desc[:200]}_")
 
         info_text = "\n".join(lines)
@@ -5305,6 +5343,10 @@ def handle_callback(cb: dict):
                 except Exception as e:
                     log.warning("ig thumb dl: %s", e)
 
+            # Store caption in state for download
+            if text:
+                set_state(cid, last_caption=text[:1024])
+
             # Download button for video or full quality
             kb = social_post_kb(url, "ig", True) if url else home_kb()
             send_message(cid,
@@ -5315,13 +5357,12 @@ def handle_callback(cb: dict):
             title     = item.get("title", "")
             dur       = item.get("duration", "")
             thumbnail = item.get("thumbnail", "")
-            text = f"🎵 *{title}*"
+            text = f"🎵 *{title}*" if title else "🎵 ویدیوی TikTok"
             if dur:
                 text += f"\n⏱ {dur}"
             if url:
                 text += f"\n[🔗 لینک]({url})"
             send_message(cid, text, parse_mode="Markdown")
-            # Auto-download thumbnail
             if thumbnail:
                 try:
                     thumb_bytes = download_bytes(thumbnail, MAX_IMAGE_SIZE)
@@ -5329,6 +5370,8 @@ def handle_callback(cb: dict):
                         send_photo(cid, thumb_bytes, caption="🎵")
                 except Exception as e:
                     log.warning("tt thumb dl: %s", e)
+            # Store full caption so do_tiktok_dl can use it
+            set_state(cid, last_caption=title)
             kb = social_post_kb(url, "tt", True) if url else home_kb()
             send_message(cid, "📥 دانلود ویدیو؟", reply_markup=kb)
         return
