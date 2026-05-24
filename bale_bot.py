@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.12)
+بله قربان — Bale Bot  (v1.13)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -52,10 +52,6 @@ INSTAGRAM_COOKIES_FILE = os.getenv("INSTAGRAM_COOKIES_FILE", "")
 # Get from: https://developer.spotify.com/dashboard
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
-
-# RapidAPI: fallback YouTube downloader when yt-dlp fails (bot detection / 403)
-# Sign up free at https://rapidapi.com → subscribe to "youtube-search-download3"
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
 
 # Cloudflare WARP proxy — set WARP_PROXY=socks5://127.0.0.1:40000 to route
 # yt-dlp and HTTP requests through WARP (avoids datacenter IP blocks).
@@ -300,14 +296,84 @@ def _send_one_chunk(chat_id, data_bytes: bytes, filename: str,
     else:
         return _post_file("sendDocument", "document", filename, data_bytes, extra)
 
+def _split_video_ffmpeg(data: bytes, filename: str, ffmpeg_dir: str = "/usr/bin",
+                        max_mb: float = 18.5) -> list:
+    """Split a video into time-based chunks using ffmpeg.
+    Each chunk is a fully self-contained, playable MP4 file.
+    Returns list of (chunk_bytes, chunk_filename) tuples.
+    Falls back to [(data, filename)] if ffmpeg fails.
+    """
+    import shutil as _sh
+    ffmpeg  = str(Path(_sh.which("ffmpeg")  or f"{ffmpeg_dir}/ffmpeg").resolve())
+    ffprobe = str(Path(_sh.which("ffprobe") or f"{ffmpeg_dir}/ffprobe").resolve())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src_path = Path(tmp) / filename
+        src_path.write_bytes(data)
+
+        # Get total duration
+        try:
+            probe = subprocess.run(
+                [ffprobe, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(src_path)],
+                capture_output=True, text=True, timeout=30)
+            duration = float(probe.stdout.strip() or "0")
+        except Exception as e:
+            log.error("_split_video_ffmpeg probe: %s", e)
+            return [(data, filename)]
+
+        if duration <= 0:
+            log.warning("_split_video_ffmpeg: could not determine duration")
+            return [(data, filename)]
+
+        total_mb  = len(data) / 1024 / 1024
+        n_chunks  = max(2, int(total_mb / max_mb) + 1)
+        chunk_dur = duration / n_chunks
+        base      = filename.rsplit(".", 1)[0] if "." in filename else filename
+        ext       = ("." + filename.rsplit(".", 1)[1]) if "." in filename else ".mp4"
+
+        log.info("_split_video_ffmpeg: %.1fMB  %.1fs → %d chunks of %.1fs each",
+                 total_mb, duration, n_chunks, chunk_dur)
+
+        chunks = []
+        for i in range(n_chunks):
+            start_t  = i * chunk_dur
+            out_path = Path(tmp) / f"{base}.part{i+1}of{n_chunks}{ext}"
+            cmd = [
+                ffmpeg, "-y",
+                "-ss", str(start_t),
+                "-i", str(src_path),
+                "-t", str(chunk_dur),
+                "-c:v", "libx264", "-c:a", "aac",
+                "-preset", "fast",
+                "-movflags", "+faststart",
+                str(out_path),
+            ]
+            log.debug("ffmpeg split %d/%d", i + 1, n_chunks)
+            proc = subprocess.run(cmd, capture_output=True, timeout=300)
+            if proc.returncode != 0:
+                log.error("ffmpeg split chunk %d rc=%d: %s",
+                          i + 1, proc.returncode,
+                          proc.stderr.decode(errors="replace")[:200])
+                return [(data, filename)]   # fall back to unsplit
+            if out_path.exists() and out_path.stat().st_size > 1000:
+                chunk_bytes = out_path.read_bytes()
+                chunks.append((chunk_bytes, out_path.name))
+                log.info("ffmpeg chunk %d/%d: %.1fMB",
+                         i + 1, n_chunks, len(chunk_bytes) / 1024 / 1024)
+
+        return chunks if chunks else [(data, filename)]
+
+
 def smart_send(chat_id, data: bytes, filename: str,
                caption="", media_type="auto") -> bool:
     """
-    Smart file sender that mirrors index.js logic:
+    Smart file sender:
     1. Wrap unsupported extensions in ZIP
-    2. If > CHUNK_SIZE, split into .part1ofN chunks
-    3. Send each chunk with correct endpoint
-    Returns True if all chunks sent successfully.
+    2. VIDEO files > CHUNK_SIZE: ffmpeg time-based split — each chunk is a
+       fully playable MP4 (no cat needed, no corrupt playback)
+    3. Non-video files > CHUNK_SIZE: raw byte-split with cat instructions
+    Returns True if all parts sent successfully.
     """
     if not data:
         log.error("smart_send: empty data for %s", filename)
@@ -327,25 +393,56 @@ def smart_send(chat_id, data: bytes, filename: str,
 
     total_size = len(data)
 
-    # Step 2: Send in one shot if small enough
+    # Step 2: Small enough to send in one shot
     if total_size <= CHUNK_SIZE:
         return _send_one_chunk(chat_id, data, filename, caption, media_type)
 
-    # Step 3: Chunk it
+    # Step 3: Large video → ffmpeg time-based split (each chunk = playable MP4)
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    is_video_ext = ext in {"mp4", "mkv", "avi", "mov", "webm", "m4v"}
+    is_video = media_type == "video" or is_video_ext
+
+    if is_video and is_video_ext:
+        import shutil as _sh
+        ffmpeg_dir = str(Path(_sh.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
+        chunks = _split_video_ffmpeg(data, filename, ffmpeg_dir, max_mb=18.5)
+
+        # Only use ffmpeg result if it actually split (not the fallback tuple)
+        if not (len(chunks) == 1 and chunks[0][0] is data):
+            n = len(chunks)
+            send_message(chat_id,
+                         f"📤 ویدیو بزرگ است — ارسال در *{n} بخش* (هر بخش مستقلاً قابل پخش)…",
+                         parse_mode="Markdown")
+            all_ok = True
+            for i, (chunk_data, chunk_name) in enumerate(chunks):
+                chunk_mb = len(chunk_data) / 1024 / 1024
+                send_message(chat_id, f"📤 ارسال بخش {i+1} از {n} ({chunk_mb:.1f}MB)…")
+                ok = _send_one_chunk(chat_id, chunk_data, chunk_name,
+                                     caption="", media_type="video")
+                if not ok:
+                    send_message(chat_id, f"❌ ارسال بخش {i+1} ناموفق بود.")
+                    all_ok = False
+                    break
+            if all_ok:
+                send_message(chat_id,
+                             f"✅ همه {n} بخش ارسال شدند (هر بخش مستقلاً قابل پخش است).")
+            return all_ok
+
+    # Step 4: Non-video (or ffmpeg fallback) → byte split with cat instructions
     total_chunks = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
-    base = filename.rsplit(".", 1)[0] if "." in filename else filename
-    ext  = ("." + filename.rsplit(".", 1)[1]) if "." in filename else ""
-    log.info("smart_send: splitting into %d chunks", total_chunks)
+    base  = filename.rsplit(".", 1)[0] if "." in filename else filename
+    ext2  = ("." + filename.rsplit(".", 1)[1]) if "." in filename else ""
+    log.info("smart_send: byte-splitting into %d chunks", total_chunks)
     send_message(chat_id,
                  f"📤 فایل بزرگ است — ارسال در *{total_chunks} بخش*…",
                  parse_mode="Markdown")
     all_ok = True
     for i in range(total_chunks):
-        start = i * CHUNK_SIZE
-        end   = min(start + CHUNK_SIZE, total_size)
-        chunk = data[start:end]
-        chunk_name = f"{base}.part{i+1}of{total_chunks}{ext}"
-        chunk_mb = len(chunk) / 1024 / 1024
+        start  = i * CHUNK_SIZE
+        end    = min(start + CHUNK_SIZE, total_size)
+        chunk  = data[start:end]
+        chunk_name = f"{base}.part{i+1}of{total_chunks}{ext2}"
+        chunk_mb   = len(chunk) / 1024 / 1024
         send_message(chat_id,
                      f"📤 ارسال بخش {i+1} از {total_chunks} ({chunk_mb:.1f}MB)…")
         ok = _send_one_chunk(chat_id, chunk, chunk_name, caption="", media_type="document")
@@ -357,7 +454,7 @@ def smart_send(chat_id, data: bytes, filename: str,
         send_message(chat_id,
                      f"✅ همه {total_chunks} بخش ارسال شدند!\n\n"
                      f"برای ترکیب:\n"
-                     f"`cat {base}.part*of{total_chunks}{ext} > {filename}`",
+                     f"`cat {base}.part*of{total_chunks}{ext2} > {filename}`",
                      parse_mode="Markdown")
     return all_ok
 
@@ -1182,6 +1279,18 @@ def youtube_search(query: str, max_results=8) -> list[dict]:
         return []
 
 def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
+    """Download YouTube video/audio.
+
+    Strategy order:
+      0. Cobalt API (self-hosted) — fastest, handles PO token internally
+      1-3. yt-dlp android/ios/tv_embedded — pre-muxed mp4, most reliable
+           on datacenter IPs; tv_embedded bypasses embed restrictions
+      4-5. yt-dlp android/ios with merged streams — higher quality fallback
+
+    Removed: RapidAPI (always 403), mweb/web/web_embedded/android_vr
+             (consistently "Requested format not available" on datacenter IPs),
+             --no-check-formats (was masking real errors).
+    """
     log.info("youtube_download: url=%r audio=%s", url, audio_only)
     import shutil
     ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
@@ -1192,7 +1301,6 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
         base = [
             YTDLP_BIN,
             "--no-playlist", "--no-warnings", "--no-check-certificate",
-            "--no-check-formats",   # skip format verification — avoids false "not available"
             "--ffmpeg-location", ffmpeg_dir,
             "--socket-timeout", "30", "--retries", "2",
             "--extractor-args", f"youtube:player_client={player_client}",
@@ -1226,165 +1334,39 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
     else:
         log.warning("youtube_download: no cookies file — bot-detection likely")
 
-    # Strategy 0: Cobalt API (self-hosted) — fastest, handles PO token internally
+    # Strategy 0: Cobalt API (self-hosted)
     cobalt_result = _youtube_cobalt(url, audio_only=audio_only)
     if cobalt_result:
         return cobalt_result
 
-    # Strategy 1-5: yt-dlp with multiple player clients
-    # android/ios serve pre-muxed mp4 — only use "best" formats
-    # mweb/web support separate streams but may 403 on datacenter IPs
-    client_strategies = [
-        ("android",       ["best[height<=720]", "best"]),
-        ("android_vr",    ["best[height<=720]", "best"]),
-        ("ios",           ["best[height<=720]", "best"]),
-        ("web_embedded",  ["bestvideo[height<=720]+bestaudio/best[height<=720]",
-                           "best[height<=720]", "best"]),
-        ("mweb",          ["bestvideo[height<=720]+bestaudio/best[height<=720]",
-                           "best[height<=720]", "best"]),
-        ("web",           ["bestvideo[height<=720]+bestaudio/best[height<=720]",
-                           "best[height<=720]", "best"]),
-    ]
-
     if audio_only:
-        for client, _ in client_strategies:
+        for client in ("android", "ios", "tv_embedded"):
             base = _build_base(client)
             for args in [
                 ["-x", "--audio-format", "mp3", "--audio-quality", "5"],
-                ["-x", "--audio-format", "mp3", "--audio-quality", "5", "-f", "bestaudio"],
                 ["-x", "--audio-format", "mp3"],
                 ["-x"],
             ]:
                 result = _run(base, args, url)
                 if result:
                     return result
-        return _youtube_rapidapi(url, audio_only=True)
+        return None
     else:
-        for client, fmts in client_strategies:
+        # Prefer pre-muxed mp4 (b[ext=mp4]) to avoid merge failures on datacenter IPs.
+        # tv_embedded bypasses embed-disabled restrictions without needing cookies.
+        strategies = [
+            ("android",     "b[ext=mp4][height<=720]/b[height<=720]/b"),
+            ("ios",         "b[ext=mp4][height<=720]/b[height<=720]/b"),
+            ("tv_embedded", "b[ext=mp4][height<=720]/b[height<=720]/b"),
+            ("android",     "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[height<=720]"),
+            ("ios",         "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[height<=720]"),
+        ]
+        for client, fmt in strategies:
             base = _build_base(client)
-            for fmt in fmts:
-                result = _run(base, ["-f", fmt, "--merge-output-format", "mp4"], url)
-                if result:
-                    if len(result[0]) > MAX_FILE_SIZE - 1*1024*1024:
-                        log.info("Video %.1fMB too large, trimming…", len(result[0])/1024/1024)
-                        with tempfile.TemporaryDirectory() as tmp2:
-                            src = Path(tmp2) / result[1]
-                            src.write_bytes(result[0])
-                            trimmed = _trim_video(src, tmp2, ffmpeg_dir)
-                            if trimmed:
-                                result = trimmed
-                    return result
-        return _youtube_rapidapi(url, audio_only=False)
-
-def _youtube_rapidapi(url: str, audio_only: bool = False) -> Optional[tuple[bytes, str]]:
-    """Fallback YouTube downloader via RapidAPI (youtube-video-fast-downloader-24-7).
-    Fetches quality options list, picks best fit, then downloads the stream URL.
-    Requires RAPIDAPI_KEY env var (free tier at rapidapi.com).
-    Falls back to Cobalt API if RapidAPI fails or key is missing.
-    """
-    m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", url)
-    if not m:
-        log.warning("_youtube_rapidapi: cannot extract video ID from %s", url)
-        return _youtube_cobalt(url, audio_only)
-    vid_id = m.group(1)
-
-    if RAPIDAPI_KEY:
-        log.info("_youtube_rapidapi: trying RapidAPI for %s", vid_id)
-        try:
-            host = "youtube-video-fast-downloader-24-7.p.rapidapi.com"
-            headers = {
-                "x-rapidapi-key":  RAPIDAPI_KEY,
-                "x-rapidapi-host": host,
-                "Content-Type":    "application/json",
-            }
-            # Step 1: get available quality options
-            opts_resp = WEB.get(
-                f"https://{host}/video_quality_options/{vid_id}",
-                headers=headers, timeout=20,
-            )
-            log.debug("_youtube_rapidapi quality_options: status=%d", opts_resp.status_code)
-
-            chosen_itag = None
-            chosen_ext  = "mp3" if audio_only else "mp4"
-
-            if opts_resp.status_code == 200:
-                opts = opts_resp.json()  # list of {itag, qualityLabel, mimeType, …}
-                if audio_only:
-                    # Pick highest-bitrate audio stream
-                    audio_streams = [
-                        s for s in opts
-                        if "audio" in s.get("mimeType", "").lower()
-                        and "video" not in s.get("mimeType", "").lower()
-                    ]
-                    if audio_streams:
-                        chosen_itag = max(audio_streams,
-                                          key=lambda s: s.get("bitrate", 0)).get("itag")
-                        chosen_ext = "mp3"
-                else:
-                    # Pick best video≤720p that has audio (progressive streams have audioQuality)
-                    # itag 22 = 720p progressive, 18 = 360p progressive
-                    preferred_itags = [22, 18]  # progressive mp4s with audio baked in
-                    for itag in preferred_itags:
-                        if any(s.get("itag") == itag for s in opts):
-                            chosen_itag = itag
-                            break
-                    if not chosen_itag:
-                        # Fallback: any video stream ≤720p
-                        video_streams = [
-                            s for s in opts
-                            if "video" in s.get("mimeType", "").lower()
-                            and s.get("height", 9999) <= 720
-                            and s.get("audioQuality")  # must have audio
-                        ]
-                        if video_streams:
-                            chosen_itag = max(video_streams,
-                                              key=lambda s: s.get("height", 0)).get("itag")
-
-            if chosen_itag:
-                # Step 2: get the direct download URL for chosen itag
-                dl_resp = WEB.get(
-                    f"https://{host}/download_video/{vid_id}",
-                    params={"quality": chosen_itag},
-                    headers=headers, timeout=20,
-                )
-                log.debug("_youtube_rapidapi download_video: status=%d", dl_resp.status_code)
-                if dl_resp.status_code == 200:
-                    dl_data = dl_resp.json()
-                    # Response is typically {"url": "...", "title": "..."}
-                    # or may be the stream URL string directly
-                    if isinstance(dl_data, dict):
-                        stream_url = dl_data.get("url") or dl_data.get("downloadUrl") or ""
-                        title = dl_data.get("title", vid_id)[:60]
-                    elif isinstance(dl_data, str) and dl_data.startswith("http"):
-                        stream_url = dl_data
-                        title = vid_id
-                    else:
-                        stream_url = ""
-                        title = vid_id
-
-                    if stream_url:
-                        log.info("_youtube_rapidapi: downloading itag=%s from %s",
-                                 chosen_itag, stream_url[:80])
-                        vid_bytes = download_bytes(stream_url, MAX_FILE_SIZE * 2)
-                        if vid_bytes and len(vid_bytes) > 10000:
-                            fname = f"{title.replace('/', '_')}.{chosen_ext}"
-                            log.info("_youtube_rapidapi OK: %.1fMB  %s",
-                                     len(vid_bytes)/1024/1024, fname)
-                            return vid_bytes, fname
-                        log.warning("_youtube_rapidapi: download too small or empty")
-                    else:
-                        log.warning("_youtube_rapidapi: no stream URL in response: %s",
-                                    str(dl_data)[:200])
-            else:
-                log.warning("_youtube_rapidapi: no suitable itag found in quality options")
-
-        except Exception as e:
-            log.error("_youtube_rapidapi: %s", e)
-    else:
-        log.warning("_youtube_rapidapi: RAPIDAPI_KEY not set, skipping to Cobalt")
-
-    # Final fallback: Cobalt API
-    return _youtube_cobalt(url, audio_only)
+            result = _run(base, ["-f", fmt, "--merge-output-format", "mp4"], url)
+            if result:
+                return result
+        return None
 
 
 def _cobalt_download(url: str, audio_only: bool = False,
