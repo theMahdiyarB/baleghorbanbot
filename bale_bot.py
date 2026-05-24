@@ -5488,6 +5488,7 @@ _orig_dispatch_key = "images_query"
 # MAIN DISPATCH
 # ═══════════════════════════════════════════════════════════════════════════════
 def handle_update(update: dict):
+    print(f"DEBUG: Received update: {update}")
     if "message" in update:
         msg = update["message"]
         handle_message(msg)
