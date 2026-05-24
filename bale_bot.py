@@ -1311,7 +1311,9 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
                 "--js-runtimes", "node",
                 "-f", fmt_spec,
                 "--merge-output-format", "mp4",
-                "-o", os.path.join(tmp, "%(title).60s.%(ext)s"),
+                "--split-chapters", 
+                "--max-filesize", "19M", 
+                "-o", os.path.join(tmp, "%(title)s.%(ext)s"),
             ]
             if cookies_file:
                 cmd += ["--cookies", cookies_file]
@@ -1342,14 +1344,14 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
     #   default  — yt-dlp's own best-effort selection
     #   android  — pre-muxed mp4, reliable for many videos
     #   ios      — pre-muxed mp4, good fallback
-    #   tv_embedded — bypasses embed restrictions, no cookies needed
+    #   tv_embedded — bypasses embed restrictions
     #   web_music,web,tv — combined multi-client probe (GH fallback 4 approach)
     probe_clients = [
-        "default",
+        "tv_embedded", 
         "android",
         "ios",
-        "tv_embedded",
-        "web_music,web,tv,web_embedded",  # multi-client probe
+        "default",
+        "web_music,web,tv,web_embedded",
     ]
 
     for client in probe_clients:
@@ -1373,7 +1375,9 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
                     "--js-runtimes", "node",
                     "-f", fmt_spec,
                     "-x", "--audio-format", "mp3", "--audio-quality", "0",
-                    "-o", os.path.join(tmp, "%(title).60s.%(ext)s"),
+                    "--split-chapters", 
+                    "--max-filesize", "19M", 
+                    "-o", os.path.join(tmp, "%(title)s.%(ext)s"),
                 ]
                 if cookies_file:
                     cmd += ["--cookies", cookies_file]
@@ -1412,7 +1416,9 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
                 "--js-runtimes", "node",
                 "-S", "height:720,ext:mp4:m4a",   # format-sort: prefer 720p mp4
                 "--merge-output-format", "mp4",
-                "-o", os.path.join(tmp, "%(title).60s.%(ext)s"),
+                "--split-chapters", 
+                "--max-filesize", "19M", 
+                "-o", os.path.join(tmp, "%(title)s.%(ext)s"),
             ]
             if cookies_file:
                 cmd += ["--cookies", cookies_file]
@@ -1663,6 +1669,9 @@ def music_download_ytdlp(url: str, source: str = "auto") -> Optional[tuple[bytes
                 "--ffmpeg-location", ffmpeg_dir,
                 "--socket-timeout", "30", "--retries", "3",
                 "-o", os.path.join(tmp, "%(title).60s.%(ext)s"),
+                "--split-chapters", 
+                "--max-filesize", "19M", 
+                "-o", os.path.join(tmp, "%(title)s.%(ext)s"),
             ]
             if is_yt:
                 if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).exists():
