@@ -4703,9 +4703,7 @@ def handle_message(msg: dict):
         "paste":        lambda: do_paste(cid, text),
         "qr":           lambda: do_qr(cid, text),
         "ocr":          lambda: send_message(cid,"🖼 لطفاً عکس ارسال کنید.",reply_markup=cancel_kb()),
-        "images_pick":  lambda: do_images(cid, st.get("last_query", text),
-                                          st.get("img_source","bing")),
-        # Social media
+        "images_pick":  lambda: do_images(cid, st.get("last_query", text), st.get("img_source","bing")),
         "tg_read":      lambda: do_tg_read(cid, text, False),
         "tg_mtproto":   lambda: do_tg_read(cid, text, True),
         "tg_dl":        lambda: do_tg_dl_media(cid, text),
@@ -4715,33 +4713,25 @@ def handle_message(msg: dict):
         "ig_dl":        lambda: do_instagram_dl(cid, text),
         "tt_user":      lambda: do_tiktok_user(cid, text),
         "tt_dl":        lambda: do_tiktok_dl(cid, text),
-        # RSS
         "rss":          lambda: do_rss(cid, text),
-        # Z-Library
         "zlib":         lambda: do_zlib_search(cid, text, st.get("zlib_ext")),
-        # APK
         "apk":          lambda: do_apk_search(cid, text),
     }
-    if mode in dispatch:
+
+    if mode and mode in dispatch:
         dispatch[mode]()
-    elif text.startswith("http"):
-        # Smart URL detection — route to correct handler automatically
-        if _is_youtube(text):
-            do_youtube_dl(cid, text)
-        elif "spotify.com" in text:
-            do_spotify_dl(cid, text)
-        elif "soundcloud.com" in text:
-            do_soundcloud_dl(cid, text)
-        elif any(x in text for x in ["tiktok.com", "vm.tiktok.com"]):
-            do_tiktok_dl(cid, text)
-        elif any(x in text for x in ["twitter.com", "x.com", "t.co"]):
-            do_twitter_dl(cid, text)
-        elif "instagram.com" in text:
-            do_instagram_dl(cid, text)
-        elif "t.me/" in text:
-            do_tg_dl_media(cid, text)
-        else:
-            do_open_url(cid, text)
+        return
+
+    if text.startswith("http"):
+        # Smart URL detection
+        if _is_youtube(text): do_youtube_dl(cid, text)
+        elif "spotify" in text: do_spotify_dl(cid, text)
+        elif "soundcloud.com" in text: do_soundcloud_dl(cid, text)
+        elif "tiktok.com" in text: do_tiktok_dl(cid, text)
+        elif "twitter.com" in text or "x.com" in text: do_twitter_dl(cid, text)
+        elif "instagram.com" in text: do_instagram_dl(cid, text)
+        elif "t.me/" in text: do_tg_dl_media(cid, text)
+        else: do_open_url(cid, text)
     else:
         do_search(cid, text)
 
@@ -5500,14 +5490,7 @@ _orig_dispatch_key = "images_query"
 def handle_update(update: dict):
     if "message" in update:
         msg = update["message"]
-        cid = msg["chat"]["id"]
-        text = msg.get("text","")
-        st = get_state(cid)
-        if st.get("mode") == "images_query" and text and not text.startswith("/"):
-            init_user(cid)
-            handle_message_images_query(cid, text, st)
-        else:
-            handle_message(msg)
+        handle_message(msg)
     elif "callback_query" in update:
         handle_callback(update["callback_query"])
 
