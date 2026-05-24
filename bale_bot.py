@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.13)
+بله قربان — Bale Bot  (v1.14)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -52,6 +52,8 @@ INSTAGRAM_COOKIES_FILE = os.getenv("INSTAGRAM_COOKIES_FILE", "")
 # Get from: https://developer.spotify.com/dashboard
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+
+# RapidAPI removed — consistently returned 403, replaced by probe-first strategy.
 
 # Cloudflare WARP proxy — set WARP_PROXY=socks5://127.0.0.1:40000 to route
 # yt-dlp and HTTP requests through WARP (avoids datacenter IP blocks).
@@ -296,84 +298,14 @@ def _send_one_chunk(chat_id, data_bytes: bytes, filename: str,
     else:
         return _post_file("sendDocument", "document", filename, data_bytes, extra)
 
-def _split_video_ffmpeg(data: bytes, filename: str, ffmpeg_dir: str = "/usr/bin",
-                        max_mb: float = 18.5) -> list:
-    """Split a video into time-based chunks using ffmpeg.
-    Each chunk is a fully self-contained, playable MP4 file.
-    Returns list of (chunk_bytes, chunk_filename) tuples.
-    Falls back to [(data, filename)] if ffmpeg fails.
-    """
-    import shutil as _sh
-    ffmpeg  = str(Path(_sh.which("ffmpeg")  or f"{ffmpeg_dir}/ffmpeg").resolve())
-    ffprobe = str(Path(_sh.which("ffprobe") or f"{ffmpeg_dir}/ffprobe").resolve())
-
-    with tempfile.TemporaryDirectory() as tmp:
-        src_path = Path(tmp) / filename
-        src_path.write_bytes(data)
-
-        # Get total duration
-        try:
-            probe = subprocess.run(
-                [ffprobe, "-v", "error", "-show_entries", "format=duration",
-                 "-of", "default=noprint_wrappers=1:nokey=1", str(src_path)],
-                capture_output=True, text=True, timeout=30)
-            duration = float(probe.stdout.strip() or "0")
-        except Exception as e:
-            log.error("_split_video_ffmpeg probe: %s", e)
-            return [(data, filename)]
-
-        if duration <= 0:
-            log.warning("_split_video_ffmpeg: could not determine duration")
-            return [(data, filename)]
-
-        total_mb  = len(data) / 1024 / 1024
-        n_chunks  = max(2, int(total_mb / max_mb) + 1)
-        chunk_dur = duration / n_chunks
-        base      = filename.rsplit(".", 1)[0] if "." in filename else filename
-        ext       = ("." + filename.rsplit(".", 1)[1]) if "." in filename else ".mp4"
-
-        log.info("_split_video_ffmpeg: %.1fMB  %.1fs → %d chunks of %.1fs each",
-                 total_mb, duration, n_chunks, chunk_dur)
-
-        chunks = []
-        for i in range(n_chunks):
-            start_t  = i * chunk_dur
-            out_path = Path(tmp) / f"{base}.part{i+1}of{n_chunks}{ext}"
-            cmd = [
-                ffmpeg, "-y",
-                "-ss", str(start_t),
-                "-i", str(src_path),
-                "-t", str(chunk_dur),
-                "-c:v", "libx264", "-c:a", "aac",
-                "-preset", "fast",
-                "-movflags", "+faststart",
-                str(out_path),
-            ]
-            log.debug("ffmpeg split %d/%d", i + 1, n_chunks)
-            proc = subprocess.run(cmd, capture_output=True, timeout=300)
-            if proc.returncode != 0:
-                log.error("ffmpeg split chunk %d rc=%d: %s",
-                          i + 1, proc.returncode,
-                          proc.stderr.decode(errors="replace")[:200])
-                return [(data, filename)]   # fall back to unsplit
-            if out_path.exists() and out_path.stat().st_size > 1000:
-                chunk_bytes = out_path.read_bytes()
-                chunks.append((chunk_bytes, out_path.name))
-                log.info("ffmpeg chunk %d/%d: %.1fMB",
-                         i + 1, n_chunks, len(chunk_bytes) / 1024 / 1024)
-
-        return chunks if chunks else [(data, filename)]
-
-
 def smart_send(chat_id, data: bytes, filename: str,
                caption="", media_type="auto") -> bool:
     """
-    Smart file sender:
+    Smart file sender that mirrors index.js logic:
     1. Wrap unsupported extensions in ZIP
-    2. VIDEO files > CHUNK_SIZE: ffmpeg time-based split — each chunk is a
-       fully playable MP4 (no cat needed, no corrupt playback)
-    3. Non-video files > CHUNK_SIZE: raw byte-split with cat instructions
-    Returns True if all parts sent successfully.
+    2. If > CHUNK_SIZE, split into .part1ofN chunks
+    3. Send each chunk with correct endpoint
+    Returns True if all chunks sent successfully.
     """
     if not data:
         log.error("smart_send: empty data for %s", filename)
@@ -393,56 +325,25 @@ def smart_send(chat_id, data: bytes, filename: str,
 
     total_size = len(data)
 
-    # Step 2: Small enough to send in one shot
+    # Step 2: Send in one shot if small enough
     if total_size <= CHUNK_SIZE:
         return _send_one_chunk(chat_id, data, filename, caption, media_type)
 
-    # Step 3: Large video → ffmpeg time-based split (each chunk = playable MP4)
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    is_video_ext = ext in {"mp4", "mkv", "avi", "mov", "webm", "m4v"}
-    is_video = media_type == "video" or is_video_ext
-
-    if is_video and is_video_ext:
-        import shutil as _sh
-        ffmpeg_dir = str(Path(_sh.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
-        chunks = _split_video_ffmpeg(data, filename, ffmpeg_dir, max_mb=18.5)
-
-        # Only use ffmpeg result if it actually split (not the fallback tuple)
-        if not (len(chunks) == 1 and chunks[0][0] is data):
-            n = len(chunks)
-            send_message(chat_id,
-                         f"📤 ویدیو بزرگ است — ارسال در *{n} بخش* (هر بخش مستقلاً قابل پخش)…",
-                         parse_mode="Markdown")
-            all_ok = True
-            for i, (chunk_data, chunk_name) in enumerate(chunks):
-                chunk_mb = len(chunk_data) / 1024 / 1024
-                send_message(chat_id, f"📤 ارسال بخش {i+1} از {n} ({chunk_mb:.1f}MB)…")
-                ok = _send_one_chunk(chat_id, chunk_data, chunk_name,
-                                     caption="", media_type="video")
-                if not ok:
-                    send_message(chat_id, f"❌ ارسال بخش {i+1} ناموفق بود.")
-                    all_ok = False
-                    break
-            if all_ok:
-                send_message(chat_id,
-                             f"✅ همه {n} بخش ارسال شدند (هر بخش مستقلاً قابل پخش است).")
-            return all_ok
-
-    # Step 4: Non-video (or ffmpeg fallback) → byte split with cat instructions
+    # Step 3: Chunk it
     total_chunks = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
-    base  = filename.rsplit(".", 1)[0] if "." in filename else filename
-    ext2  = ("." + filename.rsplit(".", 1)[1]) if "." in filename else ""
-    log.info("smart_send: byte-splitting into %d chunks", total_chunks)
+    base = filename.rsplit(".", 1)[0] if "." in filename else filename
+    ext  = ("." + filename.rsplit(".", 1)[1]) if "." in filename else ""
+    log.info("smart_send: splitting into %d chunks", total_chunks)
     send_message(chat_id,
                  f"📤 فایل بزرگ است — ارسال در *{total_chunks} بخش*…",
                  parse_mode="Markdown")
     all_ok = True
     for i in range(total_chunks):
-        start  = i * CHUNK_SIZE
-        end    = min(start + CHUNK_SIZE, total_size)
-        chunk  = data[start:end]
-        chunk_name = f"{base}.part{i+1}of{total_chunks}{ext2}"
-        chunk_mb   = len(chunk) / 1024 / 1024
+        start = i * CHUNK_SIZE
+        end   = min(start + CHUNK_SIZE, total_size)
+        chunk = data[start:end]
+        chunk_name = f"{base}.part{i+1}of{total_chunks}{ext}"
+        chunk_mb = len(chunk) / 1024 / 1024
         send_message(chat_id,
                      f"📤 ارسال بخش {i+1} از {total_chunks} ({chunk_mb:.1f}MB)…")
         ok = _send_one_chunk(chat_id, chunk, chunk_name, caption="", media_type="document")
@@ -454,7 +355,7 @@ def smart_send(chat_id, data: bytes, filename: str,
         send_message(chat_id,
                      f"✅ همه {total_chunks} بخش ارسال شدند!\n\n"
                      f"برای ترکیب:\n"
-                     f"`cat {base}.part*of{total_chunks}{ext2} > {filename}`",
+                     f"`cat {base}.part*of{total_chunks}{ext} > {filename}`",
                      parse_mode="Markdown")
     return all_ok
 
@@ -1278,48 +1179,148 @@ def youtube_search(query: str, max_results=8) -> list[dict]:
         log.error("youtube_search: %s", e, exc_info=True)
         return []
 
+def _yt_probe_format(url: str, client: str, audio_only: bool,
+                     cookies_file: str, max_height: int = 720) -> Optional[str]:
+    """
+    Run yt-dlp -j to get available formats for this URL+client, then pick
+    the best matching format_id directly — like the GH Actions workflow does.
+    Returns a format_id string, or None if probe failed.
+
+    This avoids "Requested format not available" errors that happen when you
+    blindly specify format selectors without knowing what streams exist.
+    Videos that only have DASH streams (no pre-muxed mp4) will always fail
+    with b[ext=mp4] — probing first lets us fall back to DASH+mux gracefully.
+    """
+    probe_cmd = [
+        YTDLP_BIN, "-j",
+        "--no-playlist", "--no-warnings", "--no-check-certificate",
+        "--socket-timeout", "20",
+        "--extractor-args", f"youtube:player_client={client}",
+    ]
+    if cookies_file:
+        probe_cmd += ["--cookies", cookies_file]
+    if WARP_PROXY:
+        probe_cmd += ["--proxy", WARP_PROXY]
+    probe_cmd.append(url)
+
+    try:
+        proc = subprocess.run(probe_cmd, capture_output=True, timeout=30)
+        if proc.returncode != 0:
+            log.debug("_yt_probe_format: client=%s rc=%d", client, proc.returncode)
+            return None
+        info = json.loads(proc.stdout.decode(errors="replace"))
+        formats = info.get("formats", [])
+        if not formats:
+            return None
+
+        if audio_only:
+            # Best audio-only stream by bitrate (like GH: ba[format_note*=original]/ba)
+            audio_fmts = [f for f in formats
+                          if f.get("vcodec") == "none" and f.get("acodec") != "none"
+                          and f.get("acodec") not in (None, "none")]
+            if not audio_fmts:
+                # fallback: any format with audio
+                audio_fmts = [f for f in formats if f.get("acodec") not in (None, "none")]
+            if not audio_fmts:
+                return None
+            # Prefer "original" quality flag (GH uses format_note*=original), else highest abr
+            original = [f for f in audio_fmts
+                        if "original" in (f.get("format_note") or "").lower()]
+            pool = original if original else audio_fmts
+            best = max(pool, key=lambda f: f.get("abr") or f.get("tbr") or 0)
+            log.debug("_yt_probe_format: audio fmt=%s abr=%s client=%s",
+                      best["format_id"], best.get("abr"), client)
+            return best["format_id"]
+        else:
+            # Combined streams (vcodec+acodec both present) — best height ≤ max_height
+            combined = [f for f in formats
+                        if f.get("vcodec") not in (None, "none")
+                        and f.get("acodec") not in (None, "none")
+                        and (f.get("height") or 0) <= max_height]
+            if combined:
+                # Pick by height desc, then fps desc (GH: max_by(.height, .fps))
+                best = max(combined, key=lambda f: ((f.get("height") or 0),
+                                                     (f.get("fps") or 0)))
+                log.debug("_yt_probe_format: combined fmt=%s h=%s fps=%s client=%s",
+                          best["format_id"], best.get("height"), best.get("fps"), client)
+                return best["format_id"]
+
+            # No combined — build video+audio merge spec (DASH)
+            video_fmts = [f for f in formats
+                          if f.get("vcodec") not in (None, "none")
+                          and f.get("acodec") in (None, "none")
+                          and (f.get("height") or 0) <= max_height]
+            audio_fmts = [f for f in formats
+                          if f.get("vcodec") == "none"
+                          and f.get("acodec") not in (None, "none")]
+            if video_fmts and audio_fmts:
+                best_v = max(video_fmts, key=lambda f: ((f.get("height") or 0),
+                                                         (f.get("fps") or 0)))
+                # Prefer original audio quality flag (GH: ba[format_note*=original]/ba)
+                orig_a = [f for f in audio_fmts
+                          if "original" in (f.get("format_note") or "").lower()]
+                best_a = max(orig_a or audio_fmts,
+                             key=lambda f: f.get("abr") or f.get("tbr") or 0)
+                fmt_spec = f"{best_v['format_id']}+{best_a['format_id']}"
+                log.debug("_yt_probe_format: DASH merge=%s client=%s", fmt_spec, client)
+                return fmt_spec
+
+            return None
+    except Exception as e:
+        log.debug("_yt_probe_format: client=%s error=%s", client, e)
+        return None
+
+
 def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
     """Download YouTube video/audio.
 
-    Strategy order:
-      0. Cobalt API (self-hosted) — fastest, handles PO token internally
-      1-3. yt-dlp android/ios/tv_embedded — pre-muxed mp4, most reliable
-           on datacenter IPs; tv_embedded bypasses embed restrictions
-      4-5. yt-dlp android/ios with merged streams — higher quality fallback
+    Strategy:
+      0. Cobalt API (self-hosted) — fastest, no format negotiation needed
+      1. Probe-then-download: run yt-dlp -j to inspect real available formats,
+         then download the exact format_id. Tried across 5 clients in order.
+         Inspired by the GH Actions workflow approach that avoids blind format
+         selectors which fail when only DASH streams are available.
+      2. Final safety net: broad format selector with --format-sort fallback.
 
-    Removed: RapidAPI (always 403), mweb/web/web_embedded/android_vr
-             (consistently "Requested format not available" on datacenter IPs),
-             --no-check-formats (was masking real errors).
+    Key fix vs previous version: the old b[ext=mp4][height<=720] selector fails
+    on videos that only serve DASH (separate video+audio) streams because there
+    is no pre-muxed mp4 at all. Probing first with -j lets us see exactly what
+    exists and build the correct format spec (combined OR video_id+audio_id).
     """
     log.info("youtube_download: url=%r audio=%s", url, audio_only)
     import shutil
     ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
-    cookies_file = YOUTUBE_COOKIES_FILE
-    has_cookies = bool(cookies_file and Path(cookies_file).exists())
+    cookies_file = YOUTUBE_COOKIES_FILE if (YOUTUBE_COOKIES_FILE and
+                   Path(YOUTUBE_COOKIES_FILE).exists()) else ""
 
-    def _build_base(player_client: str) -> list:
-        base = [
-            YTDLP_BIN,
-            "--no-playlist", "--no-warnings", "--no-check-certificate",
-            "--ffmpeg-location", ffmpeg_dir,
-            "--socket-timeout", "30", "--retries", "2",
-            "--extractor-args", f"youtube:player_client={player_client}",
-        ]
-        if has_cookies:
-            base += ["--cookies", cookies_file]
-        if WARP_PROXY:
-            base += ["--proxy", WARP_PROXY]
-        return base
+    if cookies_file:
+        log.info("youtube_download: using cookies from %s", cookies_file)
+    else:
+        log.warning("youtube_download: no cookies file — bot-detection likely")
 
-    def _run(base_cmd, extra_args, target_url) -> Optional[tuple[bytes,str]]:
+    def _run(client: str, fmt_spec: str) -> Optional[tuple[bytes, str]]:
+        """Download a specific format spec with a given player client."""
         with tempfile.TemporaryDirectory() as tmp:
-            out_tpl = os.path.join(tmp, "%(title).60s.%(ext)s")
-            cmd = base_cmd + ["-o", out_tpl] + extra_args + [target_url]
+            cmd = [
+                YTDLP_BIN,
+                "--no-playlist", "--no-warnings", "--no-check-certificate",
+                "--ffmpeg-location", ffmpeg_dir,
+                "--socket-timeout", "30", "--retries", "2",
+                "--extractor-args", f"youtube:player_client={client}",
+                "-f", fmt_spec,
+                "--merge-output-format", "mp4",
+                "-o", os.path.join(tmp, "%(title).60s.%(ext)s"),
+            ]
+            if cookies_file:
+                cmd += ["--cookies", cookies_file]
+            if WARP_PROXY:
+                cmd += ["--proxy", WARP_PROXY]
+            cmd.append(url)
             log.debug("yt-dlp cmd: %s", " ".join(cmd))
             proc = subprocess.run(cmd, capture_output=True, timeout=300)
-            stderr = proc.stderr.decode(errors="replace")
             if proc.returncode != 0:
-                log.error("yt-dlp rc=%d stderr=%s", proc.returncode, stderr[:300])
+                log.error("yt-dlp rc=%d stderr=%s", proc.returncode,
+                          proc.stderr.decode(errors="replace")[:300])
                 return None
             files = [f for f in Path(tmp).glob("*") if f.stat().st_size > 100]
             if not files:
@@ -1329,44 +1330,105 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
             log.info("yt-dlp OK: %s  %.1fMB", f.name, len(data)/1024/1024)
             return data, f.name
 
-    if has_cookies:
-        log.info("youtube_download: using cookies from %s", cookies_file)
-    else:
-        log.warning("youtube_download: no cookies file — bot-detection likely")
-
-    # Strategy 0: Cobalt API (self-hosted)
+    # ── Strategy 0: Cobalt API ────────────────────────────────────────────────
     cobalt_result = _youtube_cobalt(url, audio_only=audio_only)
     if cobalt_result:
         return cobalt_result
 
-    if audio_only:
-        for client in ("android", "ios", "tv_embedded"):
-            base = _build_base(client)
-            for args in [
-                ["-x", "--audio-format", "mp3", "--audio-quality", "5"],
-                ["-x", "--audio-format", "mp3"],
-                ["-x"],
-            ]:
-                result = _run(base, args, url)
-                if result:
-                    return result
-        return None
-    else:
-        # Prefer pre-muxed mp4 (b[ext=mp4]) to avoid merge failures on datacenter IPs.
-        # tv_embedded bypasses embed-disabled restrictions without needing cookies.
-        strategies = [
-            ("android",     "b[ext=mp4][height<=720]/b[height<=720]/b"),
-            ("ios",         "b[ext=mp4][height<=720]/b[height<=720]/b"),
-            ("tv_embedded", "b[ext=mp4][height<=720]/b[height<=720]/b"),
-            ("android",     "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[height<=720]"),
-            ("ios",         "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[height<=720]"),
-        ]
-        for client, fmt in strategies:
-            base = _build_base(client)
-            result = _run(base, ["-f", fmt, "--merge-output-format", "mp4"], url)
+    # ── Strategy 1: Probe-then-download across 5 clients ─────────────────────
+    # Client order follows GH Actions workflow:
+    #   default  — yt-dlp's own best-effort selection
+    #   android  — pre-muxed mp4, reliable for many videos
+    #   ios      — pre-muxed mp4, good fallback
+    #   tv_embedded — bypasses embed restrictions, no cookies needed
+    #   web_music,web,tv — combined multi-client probe (GH fallback 4 approach)
+    probe_clients = [
+        "default",
+        "android",
+        "ios",
+        "tv_embedded",
+        "web_music,web,tv,web_embedded",  # multi-client probe
+    ]
+
+    for client in probe_clients:
+        log.info("youtube_download: probing client=%s", client)
+        fmt_spec = _yt_probe_format(url, client, audio_only, cookies_file, max_height=720)
+        if not fmt_spec:
+            log.debug("youtube_download: no format found for client=%s", client)
+            continue
+        log.info("youtube_download: trying fmt=%s client=%s", fmt_spec, client)
+
+        if audio_only:
+            # For audio, use -x to extract+convert to mp3
+            with tempfile.TemporaryDirectory() as tmp:
+                cmd = [
+                    YTDLP_BIN,
+                    "--no-playlist", "--no-warnings", "--no-check-certificate",
+                    "--ffmpeg-location", ffmpeg_dir,
+                    "--socket-timeout", "30", "--retries", "2",
+                    "--extractor-args", f"youtube:player_client={client}",
+                    "-f", fmt_spec,
+                    "-x", "--audio-format", "mp3", "--audio-quality", "0",
+                    "-o", os.path.join(tmp, "%(title).60s.%(ext)s"),
+                ]
+                if cookies_file:
+                    cmd += ["--cookies", cookies_file]
+                if WARP_PROXY:
+                    cmd += ["--proxy", WARP_PROXY]
+                cmd.append(url)
+                log.debug("yt-dlp audio cmd: %s", " ".join(cmd))
+                proc = subprocess.run(cmd, capture_output=True, timeout=300)
+                if proc.returncode == 0:
+                    files = [f for f in Path(tmp).glob("*") if f.stat().st_size > 1000]
+                    if files:
+                        f = files[0]
+                        data = f.read_bytes()
+                        log.info("yt-dlp audio OK: %s  %.1fMB", f.name, len(data)/1024/1024)
+                        return data, f.name
+                log.error("yt-dlp audio rc=%d: %s", proc.returncode,
+                          proc.stderr.decode(errors="replace")[:200])
+        else:
+            result = _run(client, fmt_spec)
             if result:
                 return result
-        return None
+
+    # ── Strategy 2: Safety-net broad selector (no probe) ─────────────────────
+    # If all probes failed (e.g. network hiccup during -j), try a very permissive
+    # selector that lets yt-dlp decide entirely with --format-sort.
+    log.warning("youtube_download: all probes failed, trying broad safety-net")
+    for client in ("android", "ios", "tv_embedded"):
+        with tempfile.TemporaryDirectory() as tmp:
+            cmd = [
+                YTDLP_BIN,
+                "--no-playlist", "--no-warnings", "--no-check-certificate",
+                "--ffmpeg-location", ffmpeg_dir,
+                "--socket-timeout", "30", "--retries", "2",
+                "--extractor-args", f"youtube:player_client={client}",
+                "-S", "height:720,ext:mp4:m4a",   # format-sort: prefer 720p mp4
+                "--merge-output-format", "mp4",
+                "-o", os.path.join(tmp, "%(title).60s.%(ext)s"),
+            ]
+            if cookies_file:
+                cmd += ["--cookies", cookies_file]
+            if WARP_PROXY:
+                cmd += ["--proxy", WARP_PROXY]
+            if audio_only:
+                cmd += ["-x", "--audio-format", "mp3"]
+            cmd.append(url)
+            log.debug("yt-dlp safety-net cmd: %s", " ".join(cmd))
+            proc = subprocess.run(cmd, capture_output=True, timeout=300)
+            if proc.returncode == 0:
+                files = [f for f in Path(tmp).glob("*") if f.stat().st_size > 100]
+                if files:
+                    f = sorted(files, key=lambda x: x.stat().st_size, reverse=True)[0]
+                    data = f.read_bytes()
+                    log.info("yt-dlp safety-net OK: %s  %.1fMB", f.name, len(data)/1024/1024)
+                    return data, f.name
+            log.error("safety-net rc=%d client=%s: %s", proc.returncode, client,
+                      proc.stderr.decode(errors="replace")[:200])
+
+    log.error("youtube_download: all strategies exhausted for %s", url)
+    return None
 
 
 def _cobalt_download(url: str, audio_only: bool = False,
@@ -1600,7 +1662,7 @@ def music_download_ytdlp(url: str, source: str = "auto") -> Optional[tuple[bytes
                 if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).exists():
                     base += ["--cookies", YOUTUBE_COOKIES_FILE]
                 base += ["--extractor-args",
-                         "youtube:player_client=android,android_vr,ios,mweb,web"]
+                         "youtube:player_client=android,ios,tv_embedded,web_music,web"]
             if WARP_PROXY:
                 base += ["--proxy", WARP_PROXY]
             cmd = base + extra_args + [url]
