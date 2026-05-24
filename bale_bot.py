@@ -1307,6 +1307,8 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
                 "--ffmpeg-location", ffmpeg_dir,
                 "--socket-timeout", "30", "--retries", "2",
                 "--extractor-args", f"youtube:player_client={client}",
+                "--remote-components", "ejs:github",
+                "--js-runtimes", "node",
                 "-f", fmt_spec,
                 "--merge-output-format", "mp4",
                 "-o", os.path.join(tmp, "%(title).60s.%(ext)s"),
@@ -1367,6 +1369,8 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
                     "--ffmpeg-location", ffmpeg_dir,
                     "--socket-timeout", "30", "--retries", "2",
                     "--extractor-args", f"youtube:player_client={client}",
+                    "--remote-components", "ejs:github",  # <--- ADD THIS
+                    "--js-runtimes", "node",
                     "-f", fmt_spec,
                     "-x", "--audio-format", "mp3", "--audio-quality", "0",
                     "-o", os.path.join(tmp, "%(title).60s.%(ext)s"),
@@ -1404,6 +1408,8 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
                 "--ffmpeg-location", ffmpeg_dir,
                 "--socket-timeout", "30", "--retries", "2",
                 "--extractor-args", f"youtube:player_client={client}",
+                "--remote-components", "ejs:github",  # <--- ADD THIS
+                "--js-runtimes", "node",
                 "-S", "height:720,ext:mp4:m4a",   # format-sort: prefer 720p mp4
                 "--merge-output-format", "mp4",
                 "-o", os.path.join(tmp, "%(title).60s.%(ext)s"),
