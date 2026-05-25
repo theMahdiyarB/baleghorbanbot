@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.17)
+بله قربان — Bale Bot  (v1.18)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -1324,6 +1324,9 @@ def _yt_probe_format(url: str, client: str, audio_only: bool,
         "--no-playlist", "--no-warnings", "--no-check-certificate",
         "--socket-timeout", "20",
         "--extractor-args", f"youtube:player_client={client}",
+        "--remote-components", "ejs:github",
+        "--js-runtimes", "node",
+        "--geo-bypass-country", "US",
     ]
     if cookies_file:
         probe_cmd += ["--cookies", cookies_file]
@@ -1334,7 +1337,8 @@ def _yt_probe_format(url: str, client: str, audio_only: bool,
     try:
         proc = subprocess.run(probe_cmd, capture_output=True, timeout=30)
         if proc.returncode != 0:
-            log.debug("_yt_probe_format: client=%s rc=%d", client, proc.returncode)
+            log.debug("_yt_probe_format: client=%s rc=%d stderr=%s",
+                      client, proc.returncode, proc.stderr.decode(errors="replace")[:200])
             return None
         info = json.loads(proc.stdout.decode(errors="replace"))
         formats = info.get("formats", [])
@@ -1428,6 +1432,9 @@ def youtube_get_formats(url: str) -> dict:
             "--no-playlist", "--no-warnings", "--no-check-certificate",
             "--socket-timeout", "20",
             "--extractor-args", f"youtube:player_client={client}",
+            "--remote-components", "ejs:github",
+            "--js-runtimes", "node",
+            "--geo-bypass-country", "US",
         ]
         if cookies_file:
             probe_cmd += ["--cookies", cookies_file]
@@ -1436,7 +1443,11 @@ def youtube_get_formats(url: str) -> dict:
         probe_cmd.append(url)
         try:
             proc = subprocess.run(probe_cmd, capture_output=True, timeout=40)
-            if proc.returncode == 0 and proc.stdout.strip():
+            if proc.returncode != 0:
+                log.debug("youtube_get_formats: client=%s rc=%d stderr=%s",
+                          client, proc.returncode, proc.stderr.decode(errors="replace")[:200])
+                continue
+            if proc.stdout.strip():
                 info = json.loads(proc.stdout.decode(errors="replace"))
                 used_client = client
                 log.debug("youtube_get_formats: got info via client=%s", client)
