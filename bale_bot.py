@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.14)
+بله قربان — Bale Bot  (v1.15)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -298,55 +298,162 @@ def _send_one_chunk(chat_id, data_bytes: bytes, filename: str,
     else:
         return _post_file("sendDocument", "document", filename, data_bytes, extra)
 
+
+def _split_video_ffmpeg(data: bytes, filename: str, max_mb: float = 18.0) -> list:
+    """Split a video into time-based chunks using ffmpeg.
+
+    Each chunk is a fully self-contained, independently playable MP4 file.
+    Uses -c copy (no re-encode, fast) + -movflags +faststart so the moov atom
+    is at the start of every part — playable immediately without downloading all.
+
+    Returns list of (chunk_bytes, chunk_filename).
+    Returns [(data, filename)] unchanged if ffmpeg fails.
+    """
+    import shutil as _sh
+    ffmpeg  = _sh.which("ffmpeg")  or "/usr/bin/ffmpeg"
+    ffprobe = _sh.which("ffprobe") or "/usr/bin/ffprobe"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src_path = Path(tmp) / filename
+        src_path.write_bytes(data)
+
+        # 1. Get duration
+        try:
+            probe = subprocess.run(
+                [ffprobe, "-v", "error",
+                 "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1",
+                 str(src_path)],
+                capture_output=True, text=True, timeout=30)
+            duration = float(probe.stdout.strip() or "0")
+        except Exception as e:
+            log.error("_split_video_ffmpeg: ffprobe failed: %s", e)
+            return [(data, filename)]
+
+        if duration <= 0:
+            log.warning("_split_video_ffmpeg: zero duration, cannot split")
+            return [(data, filename)]
+
+        # 2. Calculate number of parts
+        total_mb = len(data) / 1024 / 1024
+        n        = max(2, int(total_mb / max_mb) + 1)
+        seg_dur  = duration / n
+        base     = filename.rsplit(".", 1)[0] if "." in filename else filename
+        ext      = ("." + filename.rsplit(".", 1)[1]) if "." in filename else ".mp4"
+
+        log.info("_split_video_ffmpeg: %.1fMB / %.1fs -> %d parts x %.1fs each",
+                 total_mb, duration, n, seg_dur)
+
+        # 3. Split with ffmpeg
+        chunks = []
+        for i in range(n):
+            out_path = Path(tmp) / f"{base}.part{i+1}of{n}{ext}"
+            cmd = [
+                ffmpeg, "-y",
+                "-ss", str(i * seg_dur),       # seek to start of this part
+                "-i", str(src_path),
+                "-t", str(seg_dur),            # duration of this part
+                "-c", "copy",                  # stream copy — no re-encode, instant
+                "-movflags", "+faststart",     # moov atom at front = immediately playable
+                str(out_path),
+            ]
+            proc = subprocess.run(cmd, capture_output=True, timeout=300)
+            if proc.returncode != 0 or not out_path.exists() or out_path.stat().st_size < 1000:
+                log.error("_split_video_ffmpeg: part %d failed rc=%d: %s",
+                          i + 1, proc.returncode,
+                          proc.stderr.decode(errors="replace")[:300])
+                return [(data, filename)]   # fallback: return unsplit
+            cb = out_path.read_bytes()
+            chunks.append((cb, out_path.name))
+            log.info("_split_video_ffmpeg: part %d/%d -> %.1fMB", i+1, n, len(cb)/1024/1024)
+
+        return chunks
+
+
 def smart_send(chat_id, data: bytes, filename: str,
                caption="", media_type="auto") -> bool:
     """
-    Smart file sender that mirrors index.js logic:
-    1. Wrap unsupported extensions in ZIP
-    2. If > CHUNK_SIZE, split into .part1ofN chunks
-    3. Send each chunk with correct endpoint
-    Returns True if all chunks sent successfully.
+    Smart file sender:
+    - Non-exempt extension        -> ZIP-wrap first
+    - file <= CHUNK_SIZE          -> send in one shot
+    - video file > CHUNK_SIZE     -> ffmpeg time-split; each part is playable MP4
+    - other file > CHUNK_SIZE     -> raw byte-split (for ZIPs/docs) + cat instructions
+    Returns True if everything sent OK.
     """
     if not data:
         log.error("smart_send: empty data for %s", filename)
         return False
 
-    total_mb = len(data) / 1024 / 1024
-    log.info("smart_send: %s  %.1fMB  type=%s", filename, total_mb, media_type)
+    log.info("smart_send: %s  %.1fMB  type=%s",
+             filename, len(data)/1024/1024, media_type)
 
-    # Step 1: ZIP wrap if needed (skip for chunks and exempt types)
+    # Step 1: ZIP-wrap unsupported extensions (skip if already a part file)
     import re as _re
-    is_chunk = bool(_re.search(r'\.part\d+of\d+\.', filename))
-    if not is_chunk and _should_wrap(filename):
+    is_part = bool(_re.search(r'\.part\d+of\d+\.', filename))
+    if not is_part and _should_wrap(filename):
         log.info("smart_send: wrapping %s in ZIP", filename)
-        send_message(chat_id, f"📦 در حال زیپ کردن `{filename}`…", parse_mode="Markdown")
+        send_message(chat_id, f"ر در حال زیپ کردن `{filename}`…", parse_mode="Markdown")
         data, filename = _wrap_zip(data, filename)
-        log.info("smart_send: zipped → %s  %.1fMB", filename, len(data)/1024/1024)
+        log.info("smart_send: zipped -> %s  %.1fMB", filename, len(data)/1024/1024)
 
     total_size = len(data)
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    is_video = media_type == "video" or ext in {"mp4","mkv","avi","mov","webm","m4v"}
 
-    # Step 2: Send in one shot if small enough
+    # Step 2: Small enough — send in one shot
     if total_size <= CHUNK_SIZE:
         return _send_one_chunk(chat_id, data, filename, caption, media_type)
 
-    # Step 3: Chunk it
+    # Step 3: Large video -> ffmpeg time-split (each part = playable MP4)
+    if is_video and ext in {"mp4","mkv","avi","mov","webm","m4v"}:
+        send_message(chat_id, "⧗ در حال تقسیم ویدیو با ffmpeg…")
+        parts = _split_video_ffmpeg(data, filename, max_mb=18.0)
+
+        if len(parts) > 1:
+            n = len(parts)
+            send_message(chat_id,
+                         f"\ud83d\udce4 ویدیو بزرگ است — ارسال در *{n} بخش*\n"
+                         f"_(هر بخش مستقلاً قابل پخش است)_",
+                         parse_mode="Markdown")
+            all_ok = True
+            for i, (part_data, part_name) in enumerate(parts):
+                send_message(chat_id,
+                             f"\ud83d\udce4 ارسال بخش {i+1} از {n} "
+                             f"({len(part_data)/1024/1024:.1f}MB)…")
+                ok = _send_one_chunk(chat_id, part_data, part_name,
+                                     caption=(caption if i == 0 else ""),
+                                     media_type="video")
+                if not ok:
+                    send_message(chat_id, f"❌ ارسال بخش {i+1} ناموفق بود.")
+                    all_ok = False
+                    break
+            if all_ok:
+                send_message(chat_id,
+                             f"✅ همه {n} بخش ارسال شدند.\n"
+                             f"_(هر بخش را مستقیم پخش کنید)_",
+                             parse_mode="Markdown")
+            return all_ok
+        # ffmpeg returned unsplit -> fall through to byte-split
+
+    # Step 4: Large non-video (or ffmpeg fallback) -> raw byte-split
     total_chunks = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
-    base = filename.rsplit(".", 1)[0] if "." in filename else filename
-    ext  = ("." + filename.rsplit(".", 1)[1]) if "." in filename else ""
-    log.info("smart_send: splitting into %d chunks", total_chunks)
+    base2 = filename.rsplit(".", 1)[0] if "." in filename else filename
+    ext2  = ("." + filename.rsplit(".", 1)[1]) if "." in filename else ""
+    log.info("smart_send: byte-splitting %s into %d chunks", filename, total_chunks)
     send_message(chat_id,
-                 f"📤 فایل بزرگ است — ارسال در *{total_chunks} بخش*…",
+                 f"\ud83d\udce4 فایل بزرگ است — ارسال در *{total_chunks} بخش*…",
                  parse_mode="Markdown")
     all_ok = True
     for i in range(total_chunks):
         start = i * CHUNK_SIZE
         end   = min(start + CHUNK_SIZE, total_size)
         chunk = data[start:end]
-        chunk_name = f"{base}.part{i+1}of{total_chunks}{ext}"
-        chunk_mb = len(chunk) / 1024 / 1024
+        chunk_name = f"{base2}.part{i+1}of{total_chunks}{ext2}"
         send_message(chat_id,
-                     f"📤 ارسال بخش {i+1} از {total_chunks} ({chunk_mb:.1f}MB)…")
-        ok = _send_one_chunk(chat_id, chunk, chunk_name, caption="", media_type="document")
+                     f"\ud83d\udce4 ارسال بخش {i+1} از {total_chunks} "
+                     f"({len(chunk)/1024/1024:.1f}MB)…")
+        ok = _send_one_chunk(chat_id, chunk, chunk_name,
+                             caption="", media_type="document")
         if not ok:
             send_message(chat_id, f"❌ ارسال بخش {i+1} ناموفق بود.")
             all_ok = False
@@ -355,9 +462,10 @@ def smart_send(chat_id, data: bytes, filename: str,
         send_message(chat_id,
                      f"✅ همه {total_chunks} بخش ارسال شدند!\n\n"
                      f"برای ترکیب:\n"
-                     f"`cat {base}.part*of{total_chunks}{ext} > {filename}`",
+                     f"`cat {base2}.part*of{total_chunks}{ext2} > {filename}`",
                      parse_mode="Markdown")
     return all_ok
+
 
 # Convenience wrappers (keep old call sites working)
 def send_document(chat_id, file_bytes: bytes, filename: str,
@@ -2746,7 +2854,7 @@ def images_pinterest(query: str, max_results=8) -> list[dict]:
                     r'"(https://i\.pinimg\.com/originals/[^"]+\.(?:jpg|jpeg|png|webp))"',
                     r'"(https://i\.pinimg\.com/736x/[^"]+\.(?:jpg|jpeg|png|webp))"']:
             for u in re.findall(pat, r2.text):
-                u = u.replace("\\u002F","/")
+                u = u.replace("\u002F","/")
                 if u not in seen:
                     seen.add(u)
                     results.append({"url":u,"title":query})
@@ -2842,7 +2950,7 @@ def images_wikimedia(query: str, max_results=8) -> list[dict]:
 def translate_text(text: str, target: str, source="auto") -> str:
     log.info("translate_text: target=%s len=%d", target, len(text))
     import html as html_mod
-    has_fa = bool(re.search(r'[\u0600-\u06FF]', text))
+    has_fa = bool(re.search(r'[؀-ۿ]', text))
     if source == "auto":
         source = "fa" if has_fa else "en"
     if source == target:
