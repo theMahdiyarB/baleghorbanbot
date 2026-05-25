@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.16)
+بله قربان — Bale Bot  (v1.17)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -1399,23 +1399,160 @@ def _yt_probe_format(url: str, client: str, audio_only: bool,
         return None
 
 
-def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
+def youtube_get_formats(url: str) -> dict:
+    """
+    Probe a YouTube URL and return available video qualities and subtitle tracks.
+
+    Returns:
+      {
+        "formats": [{"label": "1080p 60fps", "height": 1080, "fps": 60,
+                     "fmt_spec": "137+251", "client": "tv_embedded"}, …],
+        "subtitles": [{"code": "en", "name": "English"}, …],
+        "title": "Video Title",
+        "thumbnail": "https://…",
+        "duration": "10:30",
+      }
+    """
+    log.info("youtube_get_formats: %s", url)
+    import shutil
+    cookies_file = YOUTUBE_COOKIES_FILE if (YOUTUBE_COOKIES_FILE and
+                   Path(YOUTUBE_COOKIES_FILE).exists()) else ""
+
+    probe_clients = ["tv_embedded", "android", "ios", "web_music,web,tv,web_embedded"]
+    info = None
+    used_client = None
+
+    for client in probe_clients:
+        probe_cmd = [
+            YTDLP_BIN, "-j",
+            "--no-playlist", "--no-warnings", "--no-check-certificate",
+            "--socket-timeout", "20",
+            "--extractor-args", f"youtube:player_client={client}",
+        ]
+        if cookies_file:
+            probe_cmd += ["--cookies", cookies_file]
+        if WARP_PROXY:
+            probe_cmd += ["--proxy", WARP_PROXY]
+        probe_cmd.append(url)
+        try:
+            proc = subprocess.run(probe_cmd, capture_output=True, timeout=40)
+            if proc.returncode == 0 and proc.stdout.strip():
+                info = json.loads(proc.stdout.decode(errors="replace"))
+                used_client = client
+                log.debug("youtube_get_formats: got info via client=%s", client)
+                break
+        except Exception as e:
+            log.debug("youtube_get_formats: client=%s error=%s", client, e)
+            continue
+
+    if not info:
+        log.warning("youtube_get_formats: all clients failed")
+        return {}
+
+    formats_raw = info.get("formats", [])
+
+    # ── Build quality list ────────────────────────────────────────────────────
+    # Group by height — pick best (highest bitrate) video+audio pair per height
+    seen_heights: dict[int, dict] = {}
+
+    video_fmts = [f for f in formats_raw
+                  if f.get("vcodec") not in (None, "none")
+                  and (f.get("height") or 0) > 0]
+    audio_fmts = [f for f in formats_raw
+                  if f.get("vcodec") == "none"
+                  and f.get("acodec") not in (None, "none")]
+
+    # Best audio stream (prefer "original" flag)
+    orig_a = [f for f in audio_fmts
+              if "original" in (f.get("format_note") or "").lower()]
+    best_audio = max(orig_a or audio_fmts,
+                     key=lambda f: f.get("abr") or f.get("tbr") or 0,
+                     default=None)
+
+    for vf in video_fmts:
+        h = vf.get("height", 0)
+        fps = vf.get("fps") or 0
+        # combined (pre-muxed) preferred, else DASH+best_audio
+        has_audio = vf.get("acodec") not in (None, "none")
+        if has_audio:
+            fmt_spec = vf["format_id"]
+        elif best_audio:
+            fmt_spec = f"{vf['format_id']}+{best_audio['format_id']}"
+        else:
+            continue  # no audio available — skip
+
+        tbr = vf.get("tbr") or vf.get("vbr") or 0
+        key = h
+        existing = seen_heights.get(key)
+        if existing is None or tbr > existing["_tbr"]:
+            fps_label = f" {int(fps)}fps" if fps and fps > 30 else ""
+            seen_heights[key] = {
+                "label":    f"{h}p{fps_label}",
+                "height":   h,
+                "fps":      fps,
+                "fmt_spec": fmt_spec,
+                "client":   used_client,
+                "_tbr":     tbr,
+            }
+
+    quality_list = sorted(seen_heights.values(),
+                          key=lambda x: x["height"], reverse=True)
+    # Remove internal _tbr key
+    for q in quality_list:
+        q.pop("_tbr", None)
+
+    # ── Subtitles ─────────────────────────────────────────────────────────────
+    subs_raw = {}
+    subs_raw.update(info.get("subtitles", {}))
+    subs_raw.update(info.get("automatic_captions", {}))  # auto-generated too
+
+    LANG_NAMES = {
+        "en": "English", "fa": "فارسی", "ar": "العربية",
+        "de": "Deutsch", "fr": "Français", "es": "Español",
+        "ru": "Русский", "zh": "中文", "ja": "日本語",
+        "ko": "한국어", "tr": "Türkçe", "it": "Italiano",
+        "pt": "Português", "nl": "Nederlands", "pl": "Polski",
+        "hi": "हिन्दी", "ur": "اردو",
+    }
+    subtitle_list = []
+    for code in sorted(subs_raw.keys()):
+        base = code.split("-")[0]
+        name = LANG_NAMES.get(base) or LANG_NAMES.get(code) or code.upper()
+        is_auto = code in info.get("automatic_captions", {})
+        subtitle_list.append({
+            "code": code,
+            "name": f"{name} {'(auto)' if is_auto else ''}".strip(),
+        })
+
+    return {
+        "formats":   quality_list,
+        "subtitles": subtitle_list[:20],  # cap at 20 languages
+        "title":     info.get("title", ""),
+        "thumbnail": info.get("thumbnail", ""),
+        "duration":  info.get("duration_string", ""),
+        "client":    used_client,
+    }
+
+
+def youtube_download(url: str, audio_only=False,
+                     fmt_spec: str = "", sub_code: str = "",
+                     yt_client: str = "") -> Optional[tuple[bytes, str]]:
     """Download YouTube video/audio.
 
-    Strategy:
-      0. Cobalt API (self-hosted) — fastest, no format negotiation needed
+    Strategy (yt-dlp first, Cobalt as final fallback):
       1. Probe-then-download: run yt-dlp -j to inspect real available formats,
          then download the exact format_id. Tried across 5 clients in order.
          Inspired by the GH Actions workflow approach that avoids blind format
          selectors which fail when only DASH streams are available.
-      2. Final safety net: broad format selector with --format-sort fallback.
+      2. Safety-net: broad format selector with --format-sort.
+      3. Cobalt API (self-hosted) — last resort fallback.
 
-    Key fix vs previous version: the old b[ext=mp4][height<=720] selector fails
-    on videos that only serve DASH (separate video+audio) streams because there
-    is no pre-muxed mp4 at all. Probing first with -j lets us see exactly what
-    exists and build the correct format spec (combined OR video_id+audio_id).
+    fmt_spec: pre-chosen format spec from youtube_get_formats (skips probe).
+    sub_code: subtitle language code to embed (e.g. "en", "fa").
+    yt_client: player client to use when fmt_spec is given.
     """
-    log.info("youtube_download: url=%r audio=%s", url, audio_only)
+    log.info("youtube_download: url=%r audio=%s fmt=%r sub=%r",
+             url, audio_only, fmt_spec, sub_code)
     import shutil
     ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
     cookies_file = YOUTUBE_COOKIES_FILE if (YOUTUBE_COOKIES_FILE and
@@ -1425,6 +1562,18 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
         log.info("youtube_download: using cookies from %s", cookies_file)
     else:
         log.warning("youtube_download: no cookies file — bot-detection likely")
+
+    def _subtitle_args(code: str) -> list:
+        """Build yt-dlp args to embed a specific subtitle track."""
+        if not code:
+            return []
+        return [
+            "--write-subs", "--write-auto-subs",
+            "--sub-langs", code,
+            "--sub-format", "srt",
+            "--embed-subs",
+            "--convert-subs", "srt",
+        ]
 
     def _run(client: str, fmt_spec: str) -> Optional[tuple[bytes, str]]:
         """Download a specific format spec with a given player client."""
@@ -1439,14 +1588,16 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
                 "--js-runtimes", "node",
                 "-f", fmt_spec,
                 "--merge-output-format", "mp4",
-                "--split-chapters", 
-                "--max-filesize", "19M", 
+                "--split-chapters",
+                "--max-filesize", "19M",
                 "-o", os.path.join(tmp, "%(title)s.%(ext)s"),
             ]
             if cookies_file:
                 cmd += ["--cookies", cookies_file]
             if WARP_PROXY:
                 cmd += ["--proxy", WARP_PROXY]
+            if sub_code:
+                cmd += _subtitle_args(sub_code)
             cmd.append(url)
             log.debug("yt-dlp cmd: %s", " ".join(cmd))
             proc = subprocess.run(cmd, capture_output=True, timeout=300)
@@ -1454,7 +1605,8 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
                 log.error("yt-dlp rc=%d stderr=%s", proc.returncode,
                           proc.stderr.decode(errors="replace")[:300])
                 return None
-            files = [f for f in Path(tmp).glob("*") if f.stat().st_size > 100]
+            files = [f for f in Path(tmp).glob("*")
+                     if f.stat().st_size > 100 and not f.suffix == ".srt"]
             if not files:
                 return None
             f = sorted(files, key=lambda x: x.stat().st_size, reverse=True)[0]
@@ -1462,10 +1614,41 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
             log.info("yt-dlp OK: %s  %.1fMB", f.name, len(data)/1024/1024)
             return data, f.name
 
-    # ── Strategy 0: Cobalt API ────────────────────────────────────────────────
-    cobalt_result = _youtube_cobalt(url, audio_only=audio_only)
-    if cobalt_result:
-        return cobalt_result
+    # ── Fast path: caller already probed and chose a format ──────────────────
+    if fmt_spec:
+        client = yt_client or "tv_embedded"
+        if audio_only:
+            with tempfile.TemporaryDirectory() as tmp:
+                cmd = [
+                    YTDLP_BIN,
+                    "--no-playlist", "--no-warnings", "--no-check-certificate",
+                    "--ffmpeg-location", ffmpeg_dir,
+                    "--socket-timeout", "30", "--retries", "2",
+                    "--extractor-args", f"youtube:player_client={client}",
+                    "--remote-components", "ejs:github",
+                    "--js-runtimes", "node",
+                    "-f", fmt_spec,
+                    "-x", "--audio-format", "mp3", "--audio-quality", "0",
+                    "--split-chapters",
+                    "--max-filesize", "19M",
+                    "-o", os.path.join(tmp, "%(title)s.%(ext)s"),
+                ]
+                if cookies_file:
+                    cmd += ["--cookies", cookies_file]
+                if WARP_PROXY:
+                    cmd += ["--proxy", WARP_PROXY]
+                cmd.append(url)
+                proc = subprocess.run(cmd, capture_output=True, timeout=300)
+                if proc.returncode == 0:
+                    files = [f for f in Path(tmp).glob("*") if f.stat().st_size > 1000]
+                    if files:
+                        f = files[0]
+                        return f.read_bytes(), f.name
+        else:
+            result = _run(client, fmt_spec)
+            if result:
+                return result
+        log.warning("youtube_download: fast-path failed, falling through to full probe")
 
     # ── Strategy 1: Probe-then-download across 5 clients ─────────────────────
     # Client order follows GH Actions workflow:
@@ -1499,12 +1682,12 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
                     "--ffmpeg-location", ffmpeg_dir,
                     "--socket-timeout", "30", "--retries", "2",
                     "--extractor-args", f"youtube:player_client={client}",
-                    "--remote-components", "ejs:github",  # <--- ADD THIS
+                    "--remote-components", "ejs:github",
                     "--js-runtimes", "node",
                     "-f", fmt_spec,
                     "-x", "--audio-format", "mp3", "--audio-quality", "0",
-                    "--split-chapters", 
-                    "--max-filesize", "19M", 
+                    "--split-chapters",
+                    "--max-filesize", "19M",
                     "-o", os.path.join(tmp, "%(title)s.%(ext)s"),
                 ]
                 if cookies_file:
@@ -1540,12 +1723,12 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
                 "--ffmpeg-location", ffmpeg_dir,
                 "--socket-timeout", "30", "--retries", "2",
                 "--extractor-args", f"youtube:player_client={client}",
-                "--remote-components", "ejs:github",  # <--- ADD THIS
+                "--remote-components", "ejs:github",
                 "--js-runtimes", "node",
-                "-S", "height:720,ext:mp4:m4a",   # format-sort: prefer 720p mp4
+                "-S", "height:720,ext:mp4:m4a",
                 "--merge-output-format", "mp4",
-                "--split-chapters", 
-                "--max-filesize", "19M", 
+                "--split-chapters",
+                "--max-filesize", "19M",
                 "-o", os.path.join(tmp, "%(title)s.%(ext)s"),
             ]
             if cookies_file:
@@ -1554,11 +1737,14 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
                 cmd += ["--proxy", WARP_PROXY]
             if audio_only:
                 cmd += ["-x", "--audio-format", "mp3"]
+            if sub_code:
+                cmd += _subtitle_args(sub_code)
             cmd.append(url)
             log.debug("yt-dlp safety-net cmd: %s", " ".join(cmd))
             proc = subprocess.run(cmd, capture_output=True, timeout=300)
             if proc.returncode == 0:
-                files = [f for f in Path(tmp).glob("*") if f.stat().st_size > 100]
+                files = [f for f in Path(tmp).glob("*")
+                         if f.stat().st_size > 100 and f.suffix != ".srt"]
                 if files:
                     f = sorted(files, key=lambda x: x.stat().st_size, reverse=True)[0]
                     data = f.read_bytes()
@@ -1566,6 +1752,12 @@ def youtube_download(url: str, audio_only=False) -> Optional[tuple[bytes,str]]:
                     return data, f.name
             log.error("safety-net rc=%d client=%s: %s", proc.returncode, client,
                       proc.stderr.decode(errors="replace")[:200])
+
+    # ── Strategy 3: Cobalt API fallback ───────────────────────────────────────
+    log.warning("youtube_download: yt-dlp exhausted, trying Cobalt fallback")
+    cobalt_result = _youtube_cobalt(url, audio_only=audio_only)
+    if cobalt_result:
+        return cobalt_result
 
     log.error("youtube_download: all strategies exhausted for %s", url)
     return None
@@ -3843,14 +4035,131 @@ def do_youtube_search_cmd(cid: int, query: str, page=0):
     send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
 
 def do_youtube_dl(cid: int, url: str):
+    """Entry point for direct YouTube URL download — shows quality picker."""
     bump(cid, "downloads")
     if not ("youtu.be" in url or "youtube.com" in url):
         send_message(cid, "❌ لینک یوتیوب معتبر وارد کنید.", reply_markup=home_kb())
         return
-    send_message(cid, "⏳ در حال دانلود ویدیو… (ممکن است چند دقیقه طول بکشد)")
-    chat_action(cid, "upload_video")
-    result = youtube_download(url, audio_only=False)
+    _youtube_quality_picker(cid, url)
+
+
+def _youtube_quality_picker(cid: int, url: str, audio_only: bool = False):
+    """Probe available formats and show quality selection keyboard to user."""
+    send_message(cid, "⏳ در حال بررسی کیفیت‌های موجود…")
+    chat_action(cid)
+    info = youtube_get_formats(url)
+    if not info:
+        # Probe failed — fall back to direct download
+        send_message(cid, "⚠️ بررسی کیفیت ممکن نبود. در حال دانلود با بهترین کیفیت…")
+        chat_action(cid, "upload_video")
+        result = youtube_download(url, audio_only=audio_only)
+        _finish_video(cid, result)
+        return
+
+    # Cache info so callback can retrieve it
+    url_key = store_url(url)
+    info_key = f"ytinfo_{url_key}"
+    cache_set(info_key, [info])  # wrapped in list so cache_get works
+
+    formats   = info.get("formats", [])
+    subtitles = info.get("subtitles", [])
+    title     = info.get("title", "")[:50]
+
+    if audio_only or not formats:
+        # Audio mode or no video formats found — skip quality picker
+        set_state(cid, mode="yt_sub_pick", yt_url_key=url_key,
+                  yt_info_key=info_key, yt_audio_only=True,
+                  yt_fmt_spec="", yt_client="")
+        _youtube_sub_picker(cid, url_key, info_key, fmt_spec="",
+                            client="", audio_only=True)
+        return
+
+    # Build quality keyboard
+    rows = []
+    for i, fmt in enumerate(formats[:8]):  # cap at 8 rows
+        label = fmt["label"]
+        rows.append([{"text": f"📹 {label}",
+                      "callback_data": f"yt_qual_{url_key}_{info_key}_{i}"}])
+
+    rows.append([{"text": "🎵 فقط صدا (MP3)",
+                  "callback_data": f"yt_qual_audio_{url_key}_{info_key}"}])
+    rows.append([{"text": "❌ لغو", "callback_data": "home"}])
+
+    text = f"📺 *{title}*\n\nکیفیت دانلود را انتخاب کنید:"
+    send_message(cid, text, parse_mode="Markdown",
+                 reply_markup={"inline_keyboard": rows})
+
+def _youtube_sub_picker(cid: int, url_key: str, info_key: str,
+                         fmt_spec: str, client: str, audio_only: bool = False):
+    """Show subtitle selection keyboard (or skip straight to download if none)."""
+    info_list = cache_get(info_key)
+    info = info_list[0] if info_list else {}
+    subtitles = info.get("subtitles", [])
+    title = info.get("title", "")[:50]
+
+    if not subtitles:
+        # No subtitles — download immediately
+        _youtube_execute_download(cid, url_key, info_key,
+                                  fmt_spec, client, audio_only, sub_code="")
+        return
+
+    rows = []
+    for sub in subtitles[:10]:
+        code = sub["code"]
+        name = sub["name"]
+        rows.append([{"text": f"💬 {name}",
+                      "callback_data": f"yt_sub_{url_key}_{info_key}_{code}_{int(audio_only)}_{_safe_fmt(fmt_spec)}_{client}"}])
+
+    rows.append([{"text": "⏭ بدون زیرنویس",
+                  "callback_data": f"yt_sub_{url_key}_{info_key}_NONE_{int(audio_only)}_{_safe_fmt(fmt_spec)}_{client}"}])
+    rows.append([{"text": "❌ لغو", "callback_data": "home"}])
+
+    send_message(cid,
+                 f"💬 *{title}*\n\nزیرنویس دلخواه را انتخاب کنید:",
+                 parse_mode="Markdown",
+                 reply_markup={"inline_keyboard": rows})
+
+
+def _safe_fmt(fmt_spec: str) -> str:
+    """Encode fmt_spec for use in callback_data (replace + with ~, spaces with _)."""
+    return fmt_spec.replace("+", "~").replace(" ", "_")
+
+
+def _decode_fmt(encoded: str) -> str:
+    """Reverse _safe_fmt encoding."""
+    return encoded.replace("~", "+").replace("_", " ")
+
+
+def _youtube_execute_download(cid: int, url_key: str, info_key: str,
+                               fmt_spec: str, client: str,
+                               audio_only: bool, sub_code: str):
+    """Final step: perform the actual download and send to user."""
+    url = url_cache.get(url_key, "")
+    if not url:
+        send_message(cid, "❌ لینک منقضی شده. دوباره امتحان کنید.", reply_markup=home_kb())
+        return
+
+    info_list = cache_get(info_key)
+    info = info_list[0] if info_list else {}
+    title = info.get("title", "")
+
+    sub_label = f" + زیرنویس ({sub_code})" if sub_code else ""
+    label = "🎵 صدا" if audio_only else "📺 ویدیو"
+    send_message(cid,
+                 f"⏳ در حال دانلود {label}{sub_label}…\n"
+                 f"_(ممکن است چند دقیقه طول بکشد)_",
+                 parse_mode="Markdown")
+    chat_action(cid, "upload_video" if not audio_only else "upload_voice")
+
+    result = youtube_download(
+        url,
+        audio_only=audio_only,
+        fmt_spec=fmt_spec,
+        sub_code=sub_code if sub_code != "NONE" else "",
+        yt_client=client,
+    )
     _finish_video(cid, result)
+
 
 def _finish_video(cid: int, result):
     if not result:
@@ -3862,13 +4171,14 @@ def _finish_video(cid: int, result):
         return
     data, fname = result
     fname = Path(fname).name
-    size_mb = len(data)/1024/1024
+    size_mb = len(data) / 1024 / 1024
     log.info("_finish_video: %s  %.1fMB", fname, size_mb)
     if smart_send(cid, data, fname, caption="", media_type="video"):
         send_message(cid, f"✅ ارسال شد ({size_mb:.1f}MB).", reply_markup=home_kb())
     else:
         send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
     clear_state(cid)
+
 
 def do_music(cid: int, query: str):
     """
@@ -4987,10 +5297,10 @@ def handle_callback(cb: dict):
         cache_set(dl_key, [vid])
 
         kb = {"inline_keyboard": [
-            [{"text": "📥 دانلود ویدیو", "callback_data": f"yt_do_dl_{dl_key}"},
-             {"text": "🎵 دانلود صدا",   "callback_data": f"yt_do_audio_{dl_key}"}],
-            [{"text": "🔙 برگشت",        "callback_data": f"yt_back_{key}"},
-             {"text": "🏠 منوی اصلی",    "callback_data": "home"}],
+            [{"text": "📥 انتخاب کیفیت ویدیو", "callback_data": f"yt_do_dl_{dl_key}"},
+             {"text": "🎵 دانلود صدا",          "callback_data": f"yt_do_audio_{dl_key}"}],
+            [{"text": "🔙 برگشت",               "callback_data": f"yt_back_{key}"},
+             {"text": "🏠 منوی اصلی",           "callback_data": "home"}],
         ]}
 
         # Send thumbnail + info card
@@ -5002,7 +5312,7 @@ def handle_callback(cb: dict):
             send_message(cid, info_text, parse_mode="Markdown", reply_markup=kb)
         return
 
-    # YouTube download from info card
+    # YouTube download from info card → quality picker
     m = re.match(r"yt_do_(dl|audio)_(\w+)$", data)
     if m:
         dl_type, dl_key = m.group(1), m.group(2)
@@ -5011,12 +5321,61 @@ def handle_callback(cb: dict):
             send_message(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید."); return
         vid = vids[0]
         audio_only = (dl_type == "audio")
-        label = "🎵 صدا" if audio_only else "📺 ویدیو"
-        send_message(cid, f"⏳ در حال دانلود {label}: _{vid['title']}_…",
-                     parse_mode="Markdown")
-        chat_action(cid, "upload_video" if not audio_only else "upload_voice")
-        result = youtube_download(vid["url"], audio_only=audio_only)
-        _finish_video(cid, result); return
+        url = vid.get("url", "")
+        if audio_only:
+            # Audio: skip quality picker, go straight to subtitle (or download)
+            url_key = store_url(url)
+            info_key = f"ytinfo_{url_key}"
+            cache_set(info_key, [{"title": vid.get("title",""), "subtitles": [],
+                                   "formats": [], "thumbnail": vid.get("thumbnail","")}])
+            _youtube_execute_download(cid, url_key, info_key,
+                                      fmt_spec="", client="",
+                                      audio_only=True, sub_code="")
+        else:
+            _youtube_quality_picker(cid, url, audio_only=False)
+        return
+
+    # ── YouTube quality selection ─────────────────────────────────────────────
+    # yt_qual_{url_key}_{info_key}_{fmt_idx}
+    m = re.match(r"yt_qual_(\w+)_(\w+)_(\d+)$", data)
+    if m:
+        url_key, info_key, fmt_idx = m.group(1), m.group(2), int(m.group(3))
+        info_list = cache_get(info_key)
+        if not info_list:
+            send_message(cid, "❌ اطلاعات منقضی. دوباره امتحان کنید."); return
+        info = info_list[0]
+        formats = info.get("formats", [])
+        if fmt_idx >= len(formats):
+            send_message(cid, "❌ کیفیت انتخابی موجود نیست."); return
+        chosen = formats[fmt_idx]
+        fmt_spec = chosen["fmt_spec"]
+        client   = chosen.get("client", "tv_embedded")
+        _youtube_sub_picker(cid, url_key, info_key, fmt_spec, client, audio_only=False)
+        return
+
+    # yt_qual_audio_{url_key}_{info_key}
+    m = re.match(r"yt_qual_audio_(\w+)_(\w+)$", data)
+    if m:
+        url_key, info_key = m.group(1), m.group(2)
+        _youtube_execute_download(cid, url_key, info_key,
+                                  fmt_spec="", client="",
+                                  audio_only=True, sub_code="")
+        return
+
+    # ── YouTube subtitle selection ────────────────────────────────────────────
+    # yt_sub_{url_key}_{info_key}_{sub_code}_{audio_only}_{fmt_spec}_{client}
+    m = re.match(r"yt_sub_(\w+)_(\w+)_([^_]+)_([01])_([^_]*)_([^_]*)$", data)
+    if m:
+        url_key  = m.group(1)
+        info_key = m.group(2)
+        sub_code = m.group(3)   # "NONE" or actual code
+        audio_only = m.group(4) == "1"
+        fmt_spec = _decode_fmt(m.group(5))
+        client   = m.group(6)
+        _youtube_execute_download(cid, url_key, info_key,
+                                  fmt_spec, client, audio_only,
+                                  sub_code if sub_code != "NONE" else "")
+        return
 
     # YouTube back to search results
     m = re.match(r"yt_back_(\w+)$", data)

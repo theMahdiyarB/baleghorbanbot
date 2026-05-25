@@ -12,7 +12,7 @@
 | 🌐 **مشاهده سایت** | اسکرین‌شات ۱۹۲۰×۱۰۸۰ + دکمه‌های متن / HTML / ZIP / PDF |
 | 📚 **مقاله علمی** | جستجوی Google Scholar با صفحه‌بندی و نتایج قابل کلیک |
 | 📖 **ویکی‌پدیا** | جستجو + خواندن مقاله کامل (فارسی و انگلیسی) |
-| 📺 **یوتیوب** | جستجو با تامبنیل، دانلود ویدیو/صوت، ۵ استراتژی bypass + RapidAPI fallback |
+| 📺 **یوتیوب** | جستجو با تامبنیل، **انتخاب کیفیت ویدیو** (360p–1080p+)، **انتخاب زیرنویس**، دانلود صدا، ۳ استراتژی yt-dlp + Cobalt fallback |
 | 🎵 **موسیقی MP3** | دانلود صوتی از YouTube Music / SoundCloud / Spotify |
 | 🖼 **دانلود عکس** | Bing / Pinterest / Pixabay / Wikimedia با «دانلود بیشتر» |
 | 🐙 **GitHub** | جستجوی مخازن + دانلود ZIP + دانلود Release |
@@ -27,15 +27,23 @@
 | 🖼 **OCR** | استخراج متن از عکس + خروجی PDF |
 | 🌐 **IP / دامنه** | موقعیت، اپراتور، منطقه زمانی |
 | 🔒 **حریم خصوصی** | توضیح کامل نحوه عدم ذخیره داده |
-| 🔗 **کوتاه‌سازی لینک** | کوتاه کردن URL با TinyURL |
-| 📋 **Paste** | آپلود متن به paste.rs و دریافت لینک |
-| 🔍 **Expand URL** | باز کردن ریدایرکت‌های پنهان |
-| 🔐 **QR Code** | ساخت QR Code از هر متن یا لینک |
-| 💱 **تبدیل ارز** | نرخ لحظه‌ای ارز (مثل `100 USD to IRR`) |
+
+### 📺 دانلود یوتیوب — جزئیات
+
+فرآیند دانلود سه مرحله‌ای است:
+
+1. **انتخاب کیفیت** — ربات فرمت‌های واقعی موجود برای ویدیو را بررسی کرده و به‌صورت دکمه نمایش می‌دهد (مثلاً 1080p 60fps / 720p / 480p / 360p). گزینه «فقط صدا (MP3)» هم همیشه موجود است.
+2. **انتخاب زیرنویس** — اگر زیرنویس (دستی یا خودکار) موجود باشد، لیست زبان‌ها نمایش داده می‌شود. گزینه «بدون زیرنویس» هم موجود است.
+3. **دانلود** — با فرمت دقیق انتخابی دانلود می‌شود.
+
+**ترتیب استراتژی‌ها:**
+- استراتژی ۱: probe + دانلود با ۵ player client مختلف (yt-dlp)
+- استراتژی ۲: broad safety-net selector (yt-dlp)
+- استراتژی ۳: Cobalt API — فقط اگر هر دو استراتژی yt-dlp شکست بخورند
 
 ### 🔗 تشخیص خودکار لینک
 فقط لینک بفرستید — ربات خودکار تشخیص می‌دهد:
-- `youtube.com` / `youtu.be` → دانلود ویدیو
+- `youtube.com` / `youtu.be` → انتخاب کیفیت + دانلود
 - `tiktok.com` / `vm.tiktok.com` → دانلود ویدیو
 - `twitter.com` / `x.com` → دانلود رسانه
 - `instagram.com` → دانلود پست/ریل
@@ -82,9 +90,15 @@ export BALE_TOKEN="توکن_ربات_شما"
 yt-dlp --cookies-from-browser chrome --cookies /path/yt_cookies.txt https://youtube.com
 export YOUTUBE_COOKIES_FILE=/path/yt_cookies.txt
 
-# RapidAPI — fallback دانلود یوتیوب وقتی yt-dlp با 403 fail می‌شود
-# ثبت‌نام رایگان: https://rapidapi.com → جستجوی "youtube-search-download3"
-export RAPIDAPI_KEY=your_rapidapi_key_here
+# WARP Proxy — Cloudflare proxy برای دور زدن بلاک دیتاسنتر (اختیاری)
+# نصب: https://pkg.cloudflareclient.com/
+# warp-cli set-mode proxy && warp-cli connect
+export WARP_PROXY=socks5://127.0.0.1:40000
+
+# Cobalt API — fallback نهایی بعد از شکست تمام استراتژی‌های yt-dlp
+# self-host: https://github.com/imputnet/cobalt
+# برای غیرفعال کردن: خالی بگذارید
+export COBALT_URL=http://localhost:9000
 
 # GitHub — افزایش rate limit API
 export GITHUB_TOKEN=your_github_personal_token
@@ -160,6 +174,8 @@ WantedBy=multi-user.target
 BALE_TOKEN=your_token_here
 YOUTUBE_COOKIES_FILE=/path/yt_cookies.txt
 GITHUB_TOKEN=optional_token
+# WARP_PROXY=socks5://127.0.0.1:40000
+# COBALT_URL=http://localhost:9000
 ```
 
 ```bash
@@ -174,8 +190,9 @@ sudo journalctl -u bale-bot -f   # مشاهده لاگ
 ## 🔧 ساختار فایل
 
 ```
-bale_bot.py        ← فایل اصلی ربات (۳۱۰۰+ خط)
+bale_bot.py        ← فایل اصلی ربات (۵۵۰۰+ خط)
 requirements.txt   ← کتابخانه‌های مورد نیاز
+env.example        ← نمونه تنظیمات محیطی
 README.md          ← این فایل
 bale_bot.log       ← فایل لاگ (ایجاد می‌شود)
 tg_session.session ← نشست Telethon (ایجاد می‌شود)
@@ -187,10 +204,12 @@ tg_session.session ← نشست Telethon (ایجاد می‌شود)
 
 - **Long Polling** — بدون نیاز به IP ثابت یا دامنه
 - **result_cache** — نتایج جستجو ذخیره موقت برای دکمه‌های callback
-- **url_cache** — ذخیره URL برای دکمه‌های site-view
+- **url_cache** — ذخیره URL برای دکمه‌های site-view و download
 - **smart_send** — ارسال هوشمند با chunking 19MB (مطابق index.js)
 - **127+ log statement** — لاگ DEBUG کامل در stdout + فایل
-- **۵ استراتژی YouTube** — cookies، player_client bypass، yt-dlp formats، RapidAPI fallback
+- **YouTube ۳ مرحله** — انتخاب کیفیت → انتخاب زیرنویس → دانلود
+- **YouTube ۳ استراتژی** — probe+download (5 client) → safety-net → Cobalt fallback
+- **youtube_get_formats** — probe واقعی فرمت‌های موجود برای نمایش picker دقیق
 - **Instagram ۳ استراتژی** — instaloader → yt-dlp (با کوکی) → Cobalt API
 - **APK ۴ استراتژی** — APKPure → APKMirror → Aptoide → F-Droid
 - **همه پیام‌ها فارسی** — تمام متن‌های ارسالی به کاربر به زبان فارسی است
