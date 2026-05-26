@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.19)
+بله قربان — Bale Bot  (v1.20)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -3494,153 +3494,306 @@ def apk_download(app_id: str) -> Optional[tuple[bytes, str]]:
 
 
 def _zlib_run(coro):
-    """Run an async coroutine synchronously (for use from sync bot handlers)."""
+    """Run an async coroutine in a fresh event loop (thread-safe).
+
+    Since the bot runs updates in a ThreadPoolExecutor, there is never a
+    running event loop in the worker threads — asyncio.run() is correct.
+    We explicitly avoid asyncio.get_event_loop() which raises RuntimeError
+    in threads that don't own a loop.
+    """
     import asyncio
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, coro)
-                return future.result()
-        return loop.run_until_complete(coro)
-    except RuntimeError:
-        return asyncio.run(coro)
+    return asyncio.run(coro)
 
 
-async def _zlib_get_client():
-    """Get or create a logged-in AsyncZlib client (sertraline/zlibrary API)."""
+def _zlib_get_cookies() -> dict:
+    """Login to Z-Library and return session cookies for direct HTTP use.
+
+    Uses the zlibrary library only for authentication (which works fine).
+    We avoid the library's HTML parser (paginator) entirely because it
+    raises ParseError against the current site layout.
+    Returns cookies dict or {} on failure.
+    """
     global _zlib_client
-    if _zlib_client is not None:
-        return _zlib_client
     if not ZLIB_EMAIL or not ZLIB_PASSWORD:
-        log.error("_zlib_get_client: ZLIB_EMAIL/ZLIB_PASSWORD not set")
-        return None
+        log.error("_zlib_get_cookies: ZLIB_EMAIL/ZLIB_PASSWORD not set")
+        return {}
+
+    # Return cached cookies from previous login
+    if _zlib_client is not None:
+        try:
+            raw = _zlib_client._r.cookies if hasattr(_zlib_client, "_r") else {}
+            cookies = dict(raw)
+            if cookies:
+                log.debug("_zlib_get_cookies: using cached cookies (%d keys)", len(cookies))
+                return cookies
+        except Exception:
+            pass
+
+    async def _login():
+        global _zlib_client
+        try:
+            from zlibrary import AsyncZlib
+            client = AsyncZlib()
+            await client.login(ZLIB_EMAIL, ZLIB_PASSWORD)
+            _zlib_client = client
+            mirror = getattr(client, "mirror", ZLIB_DOMAINS[0])
+            log.info("Z-Library: logged in as %s  mirror=%s", ZLIB_EMAIL, mirror)
+            return client
+        except Exception as e:
+            log.error("_zlib_get_cookies: login failed: %s", e)
+            _zlib_client = None
+            return None
+
+    client = _zlib_run(_login())
+    if not client:
+        return {}
     try:
-        from zlibrary import AsyncZlib
-        client = AsyncZlib()
-        await client.login(ZLIB_EMAIL, ZLIB_PASSWORD)
-        _zlib_client = client
-        log.info("Z-Library: logged in as %s  mirror=%s", ZLIB_EMAIL,
-                 getattr(client, "mirror", "?"))
-        return client
+        cookies = dict(client._r.cookies)
+        log.debug("_zlib_get_cookies: got %d cookies after login", len(cookies))
+        return cookies
     except Exception as e:
-        log.error("_zlib_get_client: login failed: %s", e)
-        _zlib_client = None
-        return None
+        log.error("_zlib_get_cookies: could not extract cookies: %s", e)
+        return {}
+
+
+def _zlib_mirror() -> str:
+    """Return the active Z-Library mirror URL."""
+    if _zlib_client is not None:
+        return getattr(_zlib_client, "mirror", ZLIB_DOMAINS[0])
+    return ZLIB_DOMAINS[0]
 
 
 def zlib_search(query: str, count: int = 10,
                 extensions: list = None, exact: bool = False) -> list[dict]:
-    """Search Z-Library using sertraline/zlibrary library."""
+    """Search Z-Library by scraping with authenticated session cookies.
+
+    Login is done via the zlibrary library (works fine).
+    Search HTML parsing is done by us (library parser is broken vs current layout).
+    """
     log.info("zlib_search: %r  ext=%s", query, extensions)
     if not query or not query.strip():
         return []
 
-    async def _search():
-        client = await _zlib_get_client()
-        if not client:
+    cookies = _zlib_get_cookies()
+    if not cookies:
+        log.error("zlib_search: no cookies — login failed")
+        return []
+
+    mirror = _zlib_mirror()
+    import urllib.parse as up
+
+    ext_param = ""
+    if extensions:
+        ext_param = "&extensions[]=" + "&extensions[]=".join(e.upper() for e in extensions)
+
+    search_url = f"{mirror}/s/{up.quote(query)}?page=1{ext_param}"
+    log.info("zlib_search: GET %s", search_url)
+
+    try:
+        r = WEB.get(search_url,
+                    cookies=cookies,
+                    headers={"User-Agent": UA_DESK,
+                             "Accept": "text/html,application/xhtml+xml",
+                             "Accept-Language": "en-US,en;q=0.9",
+                             "Referer": mirror},
+                    timeout=20)
+        log.debug("zlib_search: status=%d  len=%d", r.status_code, len(r.text))
+        if r.status_code != 200:
+            log.error("zlib_search: HTTP %d", r.status_code)
             return []
+    except Exception as e:
+        log.error("zlib_search: request failed: %s", e)
+        return []
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    results = []
+
+    # Z-Library uses z-bookcard web components (new layout) or .book-item (old)
+    cards = soup.select("z-bookcard")
+    if not cards:
+        cards = soup.select(".book-item, .bookRow, .resItemBox, [itemtype*='Book']")
+    log.debug("zlib_search: found %d raw cards", len(cards))
+
+    for card in cards:
+        if len(results) >= count:
+            break
         try:
-            from zlibrary.const import Extension
-            ext_objs = []
-            if extensions:
-                ext_map = {e.value.upper(): e for e in Extension}
-                for ext in extensions:
-                    obj = ext_map.get(ext.upper())
-                    if obj:
-                        ext_objs.append(obj)
+            # ── title + URL ──────────────────────────────────────────────
+            # z-bookcard: href attribute on the component itself
+            href = card.get("href", "") or card.get("url", "")
+            name = card.get("title", "") or card.get("name", "")
 
-            paginator = await client.search(
-                q=query, count=count, exact=exact,
-                extensions=ext_objs or None,
-            )
-            await paginator.next()
-            results = []
-            for book in paginator.result:
-                results.append({
-                    "id":        book.get("id", ""),
-                    "name":      book.get("name", "نامشخص"),
-                    "authors":   book.get("authors", []),
-                    "year":      book.get("year", ""),
-                    "publisher": book.get("publisher", ""),
-                    "language":  book.get("language", ""),
-                    "extension": book.get("extension", ""),
-                    "size":      book.get("size", ""),
-                    "cover":     book.get("cover", ""),
-                    "url":       book.get("url", ""),
-                    "rating":    book.get("rating", ""),
-                })
-            log.info("zlib_search: %d results", len(results))
-            return results
-        except Exception as e:
-            log.error("zlib_search: library error: %s", e, exc_info=True)
-            # Reset client so next call re-authenticates
-            global _zlib_client
-            _zlib_client = None
-            return []
+            # fallback: find inner <a> with /book/ in href
+            if not href:
+                a = card.select_one("a[href*='/book/']") or card.select_one("h3 a, h2 a, .title a")
+                if a:
+                    href = a.get("href", "")
+                    if not name:
+                        name = a.get_text(strip=True)
+            if not href:
+                continue
+            url = href if href.startswith("http") else f"{mirror}{href}"
+            if not name:
+                name = href.rstrip("/").split("/")[-1].replace("-", " ").title()
 
-    return _zlib_run(_search()) or []
+            # ── authors ──────────────────────────────────────────────────
+            authors_raw = card.get("authors", "")
+            if authors_raw:
+                authors = [a.strip() for a in authors_raw.split(",") if a.strip()]
+            else:
+                a_el = card.select_one(".authors, [itemprop='author'], a[href*='/author/']")
+                authors = [a_el.get_text(strip=True)] if a_el else []
+
+            # ── year ─────────────────────────────────────────────────────
+            year = (card.get("year") or card.get("date") or
+                    (card.select_one(".year, [itemprop='datePublished'], .property_year .property_value") or
+                     type("", (), {"get_text": lambda *a, **kw: ""})()).get_text(strip=True))
+
+            # ── extension / format ────────────────────────────────────────
+            ext = (card.get("extension") or card.get("format") or "")
+            if not ext:
+                ext_el = card.select_one(".extension, .format, [class*='ext'], z-badge")
+                ext = ext_el.get_text(strip=True) if ext_el else ""
+
+            # ── cover ─────────────────────────────────────────────────────
+            cover = card.get("cover") or card.get("image") or ""
+            if not cover:
+                img = card.select_one("img[src], img[data-src]")
+                if img:
+                    cover = img.get("src") or img.get("data-src", "")
+            if cover and not cover.startswith("http"):
+                cover = f"{mirror}{cover}"
+
+            # ── size / language / rating ──────────────────────────────────
+            size     = card.get("size", "")
+            language = card.get("language", "")
+            rating   = card.get("rating", "")
+
+            results.append({
+                "id":        url.rstrip("/").split("/")[-1],
+                "name":      name,
+                "authors":   authors,
+                "year":      str(year),
+                "publisher": "",
+                "language":  language,
+                "extension": ext.lower(),
+                "size":      size,
+                "cover":     cover,
+                "url":       url,
+                "rating":    rating,
+            })
+        except Exception as exc:
+            log.debug("zlib_search: card parse error: %s", exc)
+            continue
+
+    log.info("zlib_search: %d results parsed", len(results))
+    return results
 
 
 def zlib_download(book_url: str) -> Optional[tuple[bytes, str]]:
-    """Download a book from Z-Library using sertraline/zlibrary API."""
+    """Download a book from Z-Library using authenticated cookies.
+
+    Strategy:
+      1. Load the book page with auth cookies → find /dl/ download link
+      2. Follow the download link with cookies → get file bytes
+    """
     log.info("zlib_download: %s", book_url)
 
-    async def _dl():
-        client = await _zlib_get_client()
-        if not client:
+    cookies = _zlib_get_cookies()
+    if not cookies:
+        log.error("zlib_download: no cookies — cannot download")
+        return None
+
+    mirror = _zlib_mirror()
+    hdrs = {"User-Agent": UA_DESK,
+            "Accept": "text/html,application/xhtml+xml,*/*",
+            "Referer": mirror}
+
+    # ── Step 1: fetch book page ───────────────────────────────────────────
+    try:
+        r = WEB.get(book_url, cookies=cookies, headers=hdrs, timeout=20)
+        log.debug("zlib_download: book page status=%d len=%d", r.status_code, len(r.text))
+        if r.status_code != 200:
+            log.error("zlib_download: book page HTTP %d", r.status_code)
             return None
-        try:
-            from zlibrary.abs import BookItem
-            # BookItem needs the internal request helper and mirror URL
-            book = BookItem(client._r, client.mirror)
-            book["url"] = book_url
-            parsed = await book.fetch()
-            log.debug("zlib_download: parsed=%s", {k: v for k, v in parsed.items()
-                                                     if k != "description"})
+    except Exception as e:
+        log.error("zlib_download: book page request failed: %s", e)
+        return None
 
-            dl_url = parsed.get("download_url", "")
-            if not dl_url or "unavailable" in dl_url.lower():
-                log.error("zlib_download: no valid download_url — parsed=%s", parsed)
-                return None
-            log.info("zlib_download: dl_url=%s", dl_url)
+    soup = BeautifulSoup(r.text, "html.parser")
 
-            # Download via the authenticated session
-            r = await client._r.get(dl_url)
-            data = r if isinstance(r, bytes) else (r.content if hasattr(r, "content") else None)
+    # ── Extract title / extension from page for filename ─────────────────
+    title_el = soup.select_one("h1[itemprop='name'], .book-title, h1")
+    page_title = title_el.get_text(strip=True) if title_el else ""
+    ext_el  = soup.select_one(".property_files .property_value, .extension, z-badge")
+    page_ext = ext_el.get_text(strip=True).lower().strip(".") if ext_el else "pdf"
 
-            # Fallback: requests with session cookies
-            if not data or len(data) < 100:
-                log.warning("zlib_download: async get returned no data, trying requests fallback")
-                cookies = {}
-                try:
-                    cookies = dict(client._r.cookies) if hasattr(client._r, "cookies") else {}
-                except Exception:
-                    pass
-                resp = WEB.get(dl_url, cookies=cookies,
-                               headers={"User-Agent": UA_DESK,
-                                        "Referer": client.mirror}, timeout=120)
-                if resp.status_code == 200 and len(resp.content) > 100:
-                    data = resp.content
-                else:
-                    log.error("zlib_download: requests fallback failed status=%d",
-                              resp.status_code)
-                    return None
+    # ── Step 2: find download link ────────────────────────────────────────
+    # Z-Library puts a /dl/{id}/{hash}/ link on the book page
+    dl_link = ""
 
-            name  = parsed.get("name", "book").replace("/", "_")[:80]
-            ext   = (parsed.get("extension") or "pdf").lower().strip(".")
-            fname = f"{name}.{ext}"
-            log.info("zlib_download OK: %s  %.1fMB", fname, len(data)/1024/1024)
-            return data, fname
+    # Primary: <a href="/dl/..."> or <a class="*download*">
+    for sel in (
+        "a[href*='/dl/']",
+        "a.btn.btn-primary.dlButton",
+        "a[class*='download']",
+        "a[href*='download']",
+        ".download-buttons a",
+    ):
+        el = soup.select_one(sel)
+        if el and el.get("href"):
+            dl_link = el["href"]
+            break
 
-        except Exception as e:
-            log.error("zlib_download: %s", e, exc_info=True)
-            global _zlib_client
-            _zlib_client = None   # force re-login on next attempt
+    if not dl_link:
+        log.error("zlib_download: no download link found on page %s", book_url)
+        log.debug("zlib_download: page snippet: %s", r.text[:500])
+        return None
+
+    if not dl_link.startswith("http"):
+        dl_link = f"{mirror}{dl_link}"
+    log.info("zlib_download: dl_link=%s", dl_link)
+
+    # ── Step 3: download file ─────────────────────────────────────────────
+    try:
+        hdrs2 = {**hdrs, "Referer": book_url}
+        resp = WEB.get(dl_link, cookies=cookies, headers=hdrs2,
+                       timeout=120, allow_redirects=True)
+        log.debug("zlib_download: file response status=%d  len=%d  ct=%s",
+                  resp.status_code, len(resp.content),
+                  resp.headers.get("Content-Type", ""))
+        if resp.status_code != 200 or len(resp.content) < 500:
+            log.error("zlib_download: file download failed status=%d size=%d",
+                      resp.status_code, len(resp.content))
             return None
+    except Exception as e:
+        log.error("zlib_download: file download exception: %s", e)
+        return None
 
-    return _zlib_run(_dl())
+    # ── Derive filename ───────────────────────────────────────────────────
+    # Try Content-Disposition header first
+    cd = resp.headers.get("Content-Disposition", "")
+    fname = ""
+    if "filename=" in cd:
+        import re as _re
+        m = _re.search("filename[^;=]+=([^ ;,]+)", cd)
+        if m:
+            fname = m.group(1).strip().strip(chr(34)+chr(39)).strip()
+    if not fname:
+        # Derive from Content-Type extension
+        ct = resp.headers.get("Content-Type", "")
+        ct_ext_map = {
+            "application/pdf": "pdf", "application/epub+zip": "epub",
+            "application/x-mobipocket-ebook": "mobi",
+            "application/x-fictionbook": "fb2",
+            "application/octet-stream": page_ext,
+        }
+        inferred_ext = next((v for k, v in ct_ext_map.items() if k in ct), page_ext)
+        safe_title = re.sub(r"[/\]", "_", page_title or "book")[:80]
+        fname = f"{safe_title}.{inferred_ext}"
+
+    log.info("zlib_download OK: %s  %.1fMB", fname, len(resp.content)/1024/1024)
+    return resp.content, fname
 
 
 # ─── RSS ───────────────────────────────────────────────────────────────────────
