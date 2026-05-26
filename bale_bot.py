@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.18)
+بله قربان — Bale Bot  (v1.19)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -71,7 +71,6 @@ ZLIB_DOMAINS = [
     "https://z-lib.fm",
     "https://z-lib.id",
     "https://zlibrary.to",
-    "https://singlelogin.re",
 ]
 ZLIB_EMAIL    = os.getenv("ZLIB_EMAIL", "")
 ZLIB_PASSWORD = os.getenv("ZLIB_PASSWORD", "")
@@ -124,8 +123,14 @@ def _get_web(use_warp: bool = False) -> requests.Session:
     return WEB
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STATE
+# STATE  (thread-safe — all access via lock)
 # ═══════════════════════════════════════════════════════════════════════════════
+import threading as _threading
+_state_lock  = _threading.Lock()
+_cache_lock  = _threading.Lock()
+_stats_lock  = _threading.Lock()
+_url_lock    = _threading.Lock()
+
 user_state: dict[int, dict] = {}
 user_stats: dict[int, dict] = {}
 # Cache pending search results so callback buttons can refer to them
@@ -574,15 +579,17 @@ def answer_cb(cb_id: str, text=""):
 import hashlib
 
 def cache_set(key: str, data: list):
-    result_cache[key] = data
-    # Prune if too large
-    if len(result_cache) > 500:
-        oldest = list(result_cache.keys())[:100]
-        for k in oldest:
-            result_cache.pop(k, None)
+    with _cache_lock:
+        result_cache[key] = data
+        # Prune if too large
+        if len(result_cache) > 500:
+            oldest = list(result_cache.keys())[:100]
+            for k in oldest:
+                result_cache.pop(k, None)
 
 def cache_get(key: str) -> list:
-    return result_cache.get(key, [])
+    with _cache_lock:
+        return result_cache.get(key, [])
 
 def make_cache_key(prefix: str, query: str, page: int) -> str:
     h = hashlib.md5(f"{prefix}:{query}:{page}".encode()).hexdigest()[:8]
@@ -783,8 +790,7 @@ def social_results_kb(results: list, cache_key: str, platform: str) -> dict:
 
 def social_post_kb(url: str, platform: str, has_media: bool) -> dict:
     """Buttons under a displayed post."""
-    url_key = hashlib.md5(url.encode()).hexdigest()[:10]
-    url_cache[url_key] = url
+    url_key = store_url(url)
     rows = []
     if has_media:
         rows.append([{"text": "📥 دانلود رسانه", "callback_data": f"soc_dl_{platform}_{url_key}"}])
@@ -3503,52 +3509,33 @@ def _zlib_run(coro):
 
 
 async def _zlib_get_client():
-    """Get or create a logged-in AsyncZlib client, trying all known domains."""
+    """Get or create a logged-in AsyncZlib client (sertraline/zlibrary API)."""
     global _zlib_client
     if _zlib_client is not None:
         return _zlib_client
     if not ZLIB_EMAIL or not ZLIB_PASSWORD:
-        log.error("ZLIB_EMAIL / ZLIB_PASSWORD not set")
+        log.error("_zlib_get_client: ZLIB_EMAIL/ZLIB_PASSWORD not set")
         return None
     try:
         from zlibrary import AsyncZlib
-        from zlibrary.exception import LoginFailed, NoDomainError
-        # Try each domain in order
-        for domain in ZLIB_DOMAINS:
-            try:
-                client = AsyncZlib()
-                # Some versions of zlibrary accept a domain parameter
-                try:
-                    await client.login(ZLIB_EMAIL, ZLIB_PASSWORD, domain=domain)
-                except TypeError:
-                    await client.login(ZLIB_EMAIL, ZLIB_PASSWORD)
-                _zlib_client = client
-                log.info("Z-Library: logged in as %s via %s", ZLIB_EMAIL, domain)
-                return client
-            except (LoginFailed, NoDomainError) as e:
-                log.warning("Z-Library login via %s failed: %s", domain, e)
-                continue
-            except Exception as e:
-                log.warning("Z-Library login via %s error: %s", domain, e)
-                continue
-        log.error("Z-Library: all domains failed")
-        return None
+        client = AsyncZlib()
+        await client.login(ZLIB_EMAIL, ZLIB_PASSWORD)
+        _zlib_client = client
+        log.info("Z-Library: logged in as %s  mirror=%s", ZLIB_EMAIL,
+                 getattr(client, "mirror", "?"))
+        return client
     except Exception as e:
-        log.error("Z-Library login failed: %s", e)
+        log.error("_zlib_get_client: login failed: %s", e)
         _zlib_client = None
         return None
 
 
 def zlib_search(query: str, count: int = 10,
                 extensions: list = None, exact: bool = False) -> list[dict]:
-    """
-    جستجو در Z-Library.
-    بازمی‌گرداند: list of {name, authors, year, publisher, language,
-                           extension, size, cover, url, id}
-    Strategy 1: zlibrary Python library
-    Strategy 2: Direct HTTP scrape (when library parser breaks due to site changes)
-    """
+    """Search Z-Library using sertraline/zlibrary library."""
     log.info("zlib_search: %r  ext=%s", query, extensions)
+    if not query or not query.strip():
+        return []
 
     async def _search():
         client = await _zlib_get_client()
@@ -3556,11 +3543,6 @@ def zlib_search(query: str, count: int = 10,
             return []
         try:
             from zlibrary.const import Extension
-            from zlibrary.exception import EmptyQueryError, NoProfileError, ParseError
-
-            if not query or not query.strip():
-                return []
-
             ext_objs = []
             if extensions:
                 ext_map = {e.value.upper(): e for e in Extension}
@@ -3570,7 +3552,8 @@ def zlib_search(query: str, count: int = 10,
                         ext_objs.append(obj)
 
             paginator = await client.search(
-                q=query, count=count, exact=exact, extensions=ext_objs,
+                q=query, count=count, exact=exact,
+                extensions=ext_objs or None,
             )
             await paginator.next()
             results = []
@@ -3588,123 +3571,20 @@ def zlib_search(query: str, count: int = 10,
                     "url":       book.get("url", ""),
                     "rating":    book.get("rating", ""),
                 })
-            log.info("zlib_search lib: %d results", len(results))
+            log.info("zlib_search: %d results", len(results))
             return results
         except Exception as e:
-            log.warning("zlib_search lib error: %s — trying direct scrape", e)
-            return None  # Signal to try fallback
+            log.error("zlib_search: library error: %s", e, exc_info=True)
+            # Reset client so next call re-authenticates
+            global _zlib_client
+            _zlib_client = None
+            return []
 
-    results = _zlib_run(_search())
-
-    # Fallback: direct HTTP scrape (handles parser breakage from site changes)
-    if results is None:
-        results = _zlib_scrape_search(query, count, extensions)
-
-    return results or []
-
-
-def _zlib_scrape_search(query: str, count: int = 10,
-                        extensions: list = None) -> list[dict]:
-    """Direct HTTP scrape of Z-Library search — tries multiple domains as fallback."""
-    log.info("_zlib_scrape_search: %r", query)
-    import urllib.parse as up
-
-    for base_domain in ZLIB_DOMAINS:
-        try:
-            search_url = f"{base_domain}/s/{up.quote(query)}"
-            r = WEB.get(search_url,
-                        params={"page": 1},
-                        headers={"User-Agent": UA_DESK,
-                                 "Accept": "text/html",
-                                 "Accept-Language": "en-US,en;q=0.9"},
-                        timeout=15)
-            log.debug("zlib scrape %s: status=%d len=%d",
-                      base_domain, r.status_code, len(r.text))
-            if r.status_code not in (200, 301, 302):
-                continue
-
-            soup = BeautifulSoup(r.text, "html.parser")
-            results = []
-            for item in soup.select(
-                ".book-item, .bookRow, z-bookcard, "
-                "[itemtype*='Book'], .resItemBox"
-            ):
-                try:
-                    title_el = (
-                        item.select_one(
-                            "h3 a, .title a, [itemprop='name'] a, "
-                            "h2 a, a[href*='/book/']"
-                        )
-                    )
-                    if not title_el:
-                        continue
-                    name = title_el.get_text(strip=True)
-                    href = title_el.get("href", "")
-                    url  = (href if href.startswith("http")
-                            else f"{base_domain}{href}")
-
-                    author_el = item.select_one(
-                        ".authors, [itemprop='author'], .book-author, "
-                        "a[href*='/author/']"
-                    )
-                    authors = ([author_el.get_text(strip=True)]
-                               if author_el else [])
-
-                    year_el = item.select_one(
-                        ".year, [itemprop='datePublished'], .property_year .property_value"
-                    )
-                    year = year_el.get_text(strip=True) if year_el else ""
-
-                    ext_el = item.select_one(
-                        ".extension, .format, [class*='ext'], "
-                        ".property_files .property_value"
-                    )
-                    ext = ext_el.get_text(strip=True).lower() if ext_el else ""
-
-                    cover_el = item.select_one("img[src*='cover'], img[src*='book'], img[data-src]")
-                    cover = ""
-                    if cover_el:
-                        cover = cover_el.get("src") or cover_el.get("data-src", "")
-                        if cover and not cover.startswith("http"):
-                            cover = f"{base_domain}{cover}"
-
-                    if name and url:
-                        results.append({
-                            "id":        url.rstrip("/").split("/")[-1],
-                            "name":      name,
-                            "authors":   authors,
-                            "year":      year,
-                            "publisher": "",
-                            "language":  "",
-                            "extension": ext,
-                            "size":      "",
-                            "cover":     cover,
-                            "url":       url,
-                            "rating":    "",
-                        })
-                    if len(results) >= count:
-                        break
-                except Exception:
-                    continue
-
-            if results:
-                log.info("_zlib_scrape_search: %d results from %s",
-                         len(results), base_domain)
-                return results
-            log.warning("_zlib_scrape_search: 0 results from %s", base_domain)
-
-        except Exception as e:
-            log.warning("_zlib_scrape_search %s: %s", base_domain, e)
-
-    log.error("_zlib_scrape_search: all domains failed")
-    return []
+    return _zlib_run(_search()) or []
 
 
 def zlib_download(book_url: str) -> Optional[tuple[bytes, str]]:
-    """
-    دانلود فایل کتاب از Z-Library.
-    بازمی‌گرداند: (file_bytes, filename) یا None
-    """
+    """Download a book from Z-Library using sertraline/zlibrary API."""
     log.info("zlib_download: %s", book_url)
 
     async def _dl():
@@ -3713,52 +3593,51 @@ def zlib_download(book_url: str) -> Optional[tuple[bytes, str]]:
             return None
         try:
             from zlibrary.abs import BookItem
-            from zlibrary.exception import NoProfileError, ParseError
-            
-            # Create a BookItem and fetch its details (gets download_url)
+            # BookItem needs the internal request helper and mirror URL
             book = BookItem(client._r, client.mirror)
             book["url"] = book_url
             parsed = await book.fetch()
+            log.debug("zlib_download: parsed=%s", {k: v for k, v in parsed.items()
+                                                     if k != "description"})
+
             dl_url = parsed.get("download_url", "")
-            if not dl_url or "Unavailable" in dl_url:
-                log.error("zlib_download: no download_url in parsed: %s", parsed)
+            if not dl_url or "unavailable" in dl_url.lower():
+                log.error("zlib_download: no valid download_url — parsed=%s", parsed)
                 return None
             log.info("zlib_download: dl_url=%s", dl_url)
-            # Download the file
-            data = await _async_download(dl_url, client)
-            if not data:
-                return None
-            # Determine filename
-            name = parsed.get("name", "book").replace("/", "_")[:60]
-            ext  = parsed.get("extension", "pdf").lower()
+
+            # Download via the authenticated session
+            r = await client._r.get(dl_url)
+            data = r if isinstance(r, bytes) else (r.content if hasattr(r, "content") else None)
+
+            # Fallback: requests with session cookies
+            if not data or len(data) < 100:
+                log.warning("zlib_download: async get returned no data, trying requests fallback")
+                cookies = {}
+                try:
+                    cookies = dict(client._r.cookies) if hasattr(client._r, "cookies") else {}
+                except Exception:
+                    pass
+                resp = WEB.get(dl_url, cookies=cookies,
+                               headers={"User-Agent": UA_DESK,
+                                        "Referer": client.mirror}, timeout=120)
+                if resp.status_code == 200 and len(resp.content) > 100:
+                    data = resp.content
+                else:
+                    log.error("zlib_download: requests fallback failed status=%d",
+                              resp.status_code)
+                    return None
+
+            name  = parsed.get("name", "book").replace("/", "_")[:80]
+            ext   = (parsed.get("extension") or "pdf").lower().strip(".")
             fname = f"{name}.{ext}"
-            log.info("zlib_download: %s  %.1fMB", fname, len(data)/1024/1024)
+            log.info("zlib_download OK: %s  %.1fMB", fname, len(data)/1024/1024)
             return data, fname
-        except NoProfileError as e:
-            log.error("zlib_download: not authenticated - %s", e)
-            return None
-        except ParseError as e:
-            log.error("zlib_download: Could not parse book details from Z-Library: %s", e)
-            return None
+
         except Exception as e:
             log.error("zlib_download: %s", e, exc_info=True)
-            return None
-
-    async def _async_download(url: str, client) -> Optional[bytes]:
-        """Download file using the same session as zlibrary client."""
-        from zlibrary.util import GET_request
-        try:
-            data = await GET_request(url, cookies=client.cookies)
-            if data:
-                return data if isinstance(data, bytes) else data.encode()
-            return None
-        except Exception as e:
-            log.error("_async_download: %s", e)
-            # Fallback: use requests
-            r = WEB.get(url, cookies=client.cookies,
-                        headers={"User-Agent": UA_DESK}, timeout=120)
-            if r.status_code == 200:
-                return r.content
+            global _zlib_client
+            _zlib_client = None   # force re-login on next attempt
             return None
 
     return _zlib_run(_dl())
@@ -3871,17 +3750,21 @@ def init_user(cid: int):
 
 def bump(cid: int, key="requests"):
     init_user(cid)
-    user_stats[cid]["requests"] = user_stats[cid].get("requests",0)+1
-    user_stats[cid][key]        = user_stats[cid].get(key,0)+1
+    with _stats_lock:
+        user_stats[cid]["requests"] = user_stats[cid].get("requests", 0) + 1
+        user_stats[cid][key]        = user_stats[cid].get(key, 0) + 1
 
 def get_state(cid: int) -> dict:
-    return user_state.get(cid, {})
+    with _state_lock:
+        return dict(user_state.get(cid, {}))  # return a copy — safe to read outside lock
 
 def set_state(cid: int, **kw):
-    user_state[cid] = kw
+    with _state_lock:
+        user_state[cid] = kw
 
 def clear_state(cid: int):
-    user_state[cid] = {"mode": None}
+    with _state_lock:
+        user_state[cid] = {"mode": None}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STATIC TEXTS
@@ -3938,11 +3821,13 @@ url_cache: dict[str, str] = {}   # short_key → full_url
 
 def store_url(url: str) -> str:
     key = hashlib.md5(url.encode()).hexdigest()[:10]
-    url_cache[key] = url
+    with _url_lock:
+        url_cache[key] = url
     return key
 
 def get_url(key: str) -> Optional[str]:
-    return url_cache.get(key)
+    with _url_lock:
+        return url_cache.get(key)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DO_ HANDLERS
@@ -4067,9 +3952,10 @@ def _youtube_quality_picker(cid: int, url: str, audio_only: bool = False):
         _finish_video(cid, result)
         return
 
-    # Cache info so callback can retrieve it
+    # Cache info so callback can retrieve it.
+    # info_key = "yti" + url_key (no underscores between fields in callback_data)
     url_key = store_url(url)
-    info_key = f"ytinfo_{url_key}"
+    info_key = "yti" + url_key          # e.g. "ytibdc4d2d4ad" — no internal _
     cache_set(info_key, [info])  # wrapped in list so cache_get works
 
     formats   = info.get("formats", [])
@@ -4078,14 +3964,12 @@ def _youtube_quality_picker(cid: int, url: str, audio_only: bool = False):
 
     if audio_only or not formats:
         # Audio mode or no video formats found — skip quality picker
-        set_state(cid, mode="yt_sub_pick", yt_url_key=url_key,
-                  yt_info_key=info_key, yt_audio_only=True,
-                  yt_fmt_spec="", yt_client="")
         _youtube_sub_picker(cid, url_key, info_key, fmt_spec="",
                             client="", audio_only=True)
         return
 
-    # Build quality keyboard
+    # Build quality keyboard — callback: yt_qual_{url_key}_{info_key}_{idx}
+    # url_key and info_key are pure hex (no underscores), idx is digits — safe to split
     rows = []
     for i, fmt in enumerate(formats[:8]):  # cap at 8 rows
         label = fmt["label"]
@@ -4093,7 +3977,7 @@ def _youtube_quality_picker(cid: int, url: str, audio_only: bool = False):
                       "callback_data": f"yt_qual_{url_key}_{info_key}_{i}"}])
 
     rows.append([{"text": "🎵 فقط صدا (MP3)",
-                  "callback_data": f"yt_qual_audio_{url_key}_{info_key}"}])
+                  "callback_data": f"yt_qualA_{url_key}_{info_key}"}])
     rows.append([{"text": "❌ لغو", "callback_data": "home"}])
 
     text = f"📺 *{title}*\n\nکیفیت دانلود را انتخاب کنید:"
@@ -4145,7 +4029,7 @@ def _youtube_execute_download(cid: int, url_key: str, info_key: str,
                                fmt_spec: str, client: str,
                                audio_only: bool, sub_code: str):
     """Final step: perform the actual download and send to user."""
-    url = url_cache.get(url_key, "")
+    url = get_url(url_key) or ""
     if not url:
         send_message(cid, "❌ لینک منقضی شده. دوباره امتحان کنید.", reply_markup=home_kb())
         return
@@ -4505,13 +4389,9 @@ def do_zlib_search(cid: int, query: str, extensions: list = None):
     """جستجوی کتاب در Z-Library و نمایش نتایج به‌صورت دکمه."""
     bump(cid, "searches")
     if not ZLIB_EMAIL or not ZLIB_PASSWORD:
-        send_message(cid,
-            "❌ Z-Library پیکربندی نشده.\n\n"
-            "۱. در https://z-library.sk/login ثبت‌نام کنید\n"
-            "۲. متغیرهای محیطی تنظیم کنید:\n"
-            "`export ZLIB_EMAIL=your@email.com`\n"
-            "`export ZLIB_PASSWORD=yourpassword`",
-            parse_mode="Markdown", reply_markup=home_kb())
+        log.error("do_zlib_search: ZLIB_EMAIL/PASSWORD not configured")
+        send_message(cid, "❌ جستجوی کتاب در حال حاضر در دسترس نیست.",
+                     reply_markup=home_kb())
         return
 
     send_message(cid, f"⏳ در حال جستجو در Z-Library: _{query}_…",
@@ -4520,12 +4400,9 @@ def do_zlib_search(cid: int, query: str, extensions: list = None):
     results = zlib_search(query, count=10, extensions=extensions)
 
     if not results:
-        send_message(cid,
-            "❌ نتیجه‌ای یافت نشد.\n"
-            "• کلمات دیگری امتحان کنید\n"
-            "• اگر خطای لاگین است، مطمئن شوید ZLIB_EMAIL/PASSWORD درست است\n"
-            "• دامنه‌های جایگزین: z-lib.fm / z-lib.id / singlelogin.re",
-            reply_markup=home_kb())
+        log.warning("do_zlib_search: no results for %r", query)
+        send_message(cid, "❌ نتیجه‌ای یافت نشد. کلمات دیگری امتحان کنید.",
+                     reply_markup=home_kb())
         return
 
     key = make_cache_key("zl", query, 0)
@@ -4577,9 +4454,7 @@ def do_zlib_show_book(cid: int, book: dict):
     if rating:    lines.append(f"⭐ امتیاز: {rating}")
 
     # کلید دانلود با URL کتاب
-    url_key = hashlib.md5(url.encode()).hexdigest()[:10] if url else ""
-    if url_key:
-        url_cache[url_key] = url
+    url_key = store_url(url) if url else ""
 
     send_message(cid, "\n".join(lines), parse_mode="Markdown",
                  reply_markup=zlib_book_kb(url_key) if url_key else home_kb())
@@ -4594,11 +4469,9 @@ def do_zlib_download(cid: int, book_url: str):
 
     result = zlib_download(book_url)
     if not result:
-        send_message(cid,
-            "❌ دانلود ناموفق بود.\n"
-            "• ممکن است این کتاب نیاز به اشتراک ویژه داشته باشد\n"
-            "• یا لاگین منقضی شده — ربات را ری‌استارت کنید",
-            reply_markup=home_kb())
+        log.error("do_zlib_download: download failed for %s", book_url)
+        send_message(cid, "❌ دانلود ناموفق بود. دوباره امتحان کنید.",
+                     reply_markup=home_kb())
         return
 
     data, fname = result
@@ -5334,9 +5207,9 @@ def handle_callback(cb: dict):
         audio_only = (dl_type == "audio")
         url = vid.get("url", "")
         if audio_only:
-            # Audio: skip quality picker, go straight to subtitle (or download)
+            # Audio: skip quality picker, go straight to download
             url_key = store_url(url)
-            info_key = f"ytinfo_{url_key}"
+            info_key = "yti" + url_key
             cache_set(info_key, [{"title": vid.get("title",""), "subtitles": [],
                                    "formats": [], "thumbnail": vid.get("thumbnail","")}])
             _youtube_execute_download(cid, url_key, info_key,
@@ -5348,7 +5221,8 @@ def handle_callback(cb: dict):
 
     # ── YouTube quality selection ─────────────────────────────────────────────
     # yt_qual_{url_key}_{info_key}_{fmt_idx}
-    m = re.match(r"yt_qual_(\w+)_(\w+)_(\d+)$", data)
+    # url_key = 10-char hex, info_key = "yti" + 10-char hex — no internal underscores
+    m = re.match(r"yt_qual_([0-9a-f]+)_(yti[0-9a-f]+)_(\d+)$", data)
     if m:
         url_key, info_key, fmt_idx = m.group(1), m.group(2), int(m.group(3))
         info_list = cache_get(info_key)
@@ -5364,8 +5238,8 @@ def handle_callback(cb: dict):
         _youtube_sub_picker(cid, url_key, info_key, fmt_spec, client, audio_only=False)
         return
 
-    # yt_qual_audio_{url_key}_{info_key}
-    m = re.match(r"yt_qual_audio_(\w+)_(\w+)$", data)
+    # yt_qualA_{url_key}_{info_key}  (audio-only)
+    m = re.match(r"yt_qualA_([0-9a-f]+)_(yti[0-9a-f]+)$", data)
     if m:
         url_key, info_key = m.group(1), m.group(2)
         _youtube_execute_download(cid, url_key, info_key,
@@ -5375,7 +5249,8 @@ def handle_callback(cb: dict):
 
     # ── YouTube subtitle selection ────────────────────────────────────────────
     # yt_sub_{url_key}_{info_key}_{sub_code}_{audio_only}_{fmt_spec}_{client}
-    m = re.match(r"yt_sub_(\w+)_(\w+)_([^_]+)_([01])_([^_]*)_([^_]*)$", data)
+    # url_key = hex, info_key = "yti"+hex — anchoring on these avoids ambiguity
+    m = re.match(r"yt_sub_([0-9a-f]+)_(yti[0-9a-f]+)_([^_]+)_([01])_([^_]*)_([^_]*)$", data)
     if m:
         url_key  = m.group(1)
         info_key = m.group(2)
@@ -5626,7 +5501,7 @@ def handle_callback(cb: dict):
     m = re.match(r"zlib_dl_(\w+)$", data)
     if m:
         url_key  = m.group(1)
-        book_url = url_cache.get(url_key, "")
+        book_url = (get_url(url_key) or "")
         if not book_url:
             send_message(cid, "❌ لینک منقضی."); return
         do_zlib_download(cid, book_url); return
@@ -5779,14 +5654,9 @@ def handle_callback(cb: dict):
 
     if data == "tg_read_mtproto":
         if not TG_API_ID or not TG_API_HASH:
-            send_message(cid,
-                "❌ MTProto پیکربندی نشده.\n\n"
-                "برای فعال‌سازی:\n"
-                "1. به https://my.telegram.org بروید\n"
-                "2. API_ID و API_HASH بگیرید\n"
-                "`export TG_API_ID=12345`\n"
-                "`export TG_API_HASH=abc123`",
-                parse_mode="Markdown", reply_markup=home_kb()); return
+            log.error("tg_read_mtproto: TG_API_ID/TG_API_HASH not configured")
+            send_message(cid, "❌ این قابلیت در حال حاضر در دسترس نیست.",
+                         reply_markup=home_kb()); return
         set_state(cid, mode="tg_mtproto")
         send_message(cid,
             "✈️ نام کانال را وارد کنید (عمومی یا خصوصی):",
@@ -5927,7 +5797,7 @@ def handle_callback(cb: dict):
     m = re.match(r"soc_dl_(tg|tw|ig|tt)_(\w+)$", data)
     if m:
         platform, url_key = m.group(1), m.group(2)
-        url = url_cache.get(url_key, "")
+        url = (get_url(url_key) or "")
         if not url:
             send_message(cid, "❌ لینک منقضی."); return
         if platform == "tg":
@@ -5985,11 +5855,33 @@ _orig_dispatch_key = "images_query"
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN DISPATCH
 # ═══════════════════════════════════════════════════════════════════════════════
+# Thread pool for concurrent update handling — allows multiple users simultaneously
+# Each update gets its own daemon thread so slow downloads don't block others.
+from concurrent.futures import ThreadPoolExecutor
+_update_executor = ThreadPoolExecutor(max_workers=20, thread_name_prefix="upd")
+
+
+def _handle_update_safe(update: dict):
+    """Wrap handle_update with full error handling (runs inside thread pool)."""
+    try:
+        handle_update(update)
+    except Exception as e:
+        log.error("handle_update: %s", e, exc_info=True)
+        try:
+            cid = None
+            if "message" in update:
+                cid = update["message"]["chat"]["id"]
+            elif "callback_query" in update:
+                cid = update["callback_query"]["message"]["chat"]["id"]
+            if cid:
+                _notify_bale_error(cid)
+        except Exception:
+            pass
+
+
 def handle_update(update: dict):
-    print(f"DEBUG: Received update: {update}")
     if "message" in update:
-        msg = update["message"]
-        handle_message(msg)
+        handle_message(update["message"])
     elif "callback_query" in update:
         handle_callback(update["callback_query"])
 
@@ -6000,6 +5892,7 @@ def run():
         return
     offset = 0
     consecutive_failures = 0
+    log.info("Thread pool started — max_workers=20")
     while True:
         try:
             resp = api("getUpdates", _retries=2, offset=offset, timeout=30)
@@ -6007,30 +5900,18 @@ def run():
                 consecutive_failures += 1
                 log.warning("getUpdates not ok (failure #%d): %s",
                             consecutive_failures, resp)
-                # Back off progressively when Bale is down
                 sleep_time = min(5 * consecutive_failures, 60)
                 time.sleep(sleep_time)
                 continue
             consecutive_failures = 0
             for update in resp.get("result", []):
                 offset = update["update_id"] + 1
-                try:
-                    handle_update(update)
-                except Exception as e:
-                    log.error("handle_update: %s", e, exc_info=True)
-                    # Try to notify user if we know who they are
-                    try:
-                        cid = None
-                        if "message" in update:
-                            cid = update["message"]["chat"]["id"]
-                        elif "callback_query" in update:
-                            cid = update["callback_query"]["message"]["chat"]["id"]
-                        if cid:
-                            _notify_bale_error(cid)
-                    except Exception:
-                        pass
+                # Submit each update to the thread pool — non-blocking
+                _update_executor.submit(_handle_update_safe, update)
         except KeyboardInterrupt:
-            log.info("Bot stopped."); break
+            log.info("Bot stopped — shutting down thread pool…")
+            _update_executor.shutdown(wait=False)
+            break
         except Exception as e:
             consecutive_failures += 1
             log.error("Polling error (failure #%d): %s", consecutive_failures, e,
