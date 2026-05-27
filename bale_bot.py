@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v1.20)
-Full-featured web assistant for Bale messenger.
+بله قربان — Bale Bot  (v2.0)
+Full-featured web assistant for Bale messenger & Telegram.
 """
 
 import os, re, io, json, time, zipfile, logging, tempfile, hashlib
@@ -21,8 +21,25 @@ load_dotenv()
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
-TOKEN          = os.getenv("BALE_TOKEN", "YOUR_BOT_TOKEN_HERE")
-BASE_URL       = f"https://tapi.bale.ai/bot{TOKEN}"
+# ── Platform selection ──────────────────────────────────────────────────────
+# Set PLATFORM=telegram to run on Telegram, or PLATFORM=bale (default) for Bale.
+PLATFORM = os.getenv("PLATFORM", "bale").lower().strip()
+
+if PLATFORM == "telegram":
+    TOKEN    = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_TOKEN_HERE")
+    BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
+    # Telegram limits: 8 rows × 8 columns per inline keyboard message
+    KB_MAX_ROWS    = 8
+    KB_MAX_COLS    = 3
+    KB_MAX_BUTTONS = KB_MAX_ROWS * KB_MAX_COLS   # 24
+else:
+    TOKEN    = os.getenv("BALE_TOKEN", "YOUR_BOT_TOKEN_HERE")
+    BASE_URL = f"https://tapi.bale.ai/bot{TOKEN}"
+    # Bale limits: practical safe limit is ~10 rows, 3 cols
+    KB_MAX_ROWS    = 10
+    KB_MAX_COLS    = 3
+    KB_MAX_BUTTONS = KB_MAX_ROWS * KB_MAX_COLS   # 30
+
 MAX_FILE_SIZE  = 20 * 1024 * 1024
 
 # yt-dlp binary — resolved from PATH at runtime
@@ -202,7 +219,7 @@ def _safe_json(r: requests.Response) -> dict:
         return {"ok": False, "_raw": r.text[:200]}
 
 def api(method: str, _retries: int = 4, **kwargs) -> dict:
-    """Call Bale Bot API with exponential backoff retry."""
+    """Call Bot API (Bale or Telegram) with exponential backoff retry."""
     delay = 2
     last_err = None
     for attempt in range(_retries):
@@ -239,16 +256,16 @@ def api(method: str, _retries: int = 4, **kwargs) -> dict:
 
 
 def _notify_bale_error(chat_id: int):
-    """Send a user-facing message when Bale server is unresponsive."""
+    """Send a user-facing message when the server is unresponsive."""
     try:
         requests.post(
             f"{BASE_URL}/sendMessage",
             json={"chat_id": chat_id,
-                  "text": "⚠️ سرور بله در حال حاضر پاسخ نمی‌دهد. لطفاً چند دقیقه دیگر دوباره امتحان کنید."},
+                  "text": "⚠️ سرور در حال حاضر پاسخ نمی‌دهد. لطفاً چند دقیقه دیگر دوباره امتحان کنید."},
             timeout=15,
         )
     except Exception:
-        pass  # Nothing we can do if Bale is truly down
+        pass
 
 def send_message(chat_id, text, reply_markup=None,
                  reply_to_message_id=None, parse_mode=None) -> dict:
@@ -3494,180 +3511,120 @@ def apk_download(app_id: str) -> Optional[tuple[bytes, str]]:
 
 
 def _zlib_run(coro):
-    """Run an async coroutine in a fresh event loop (thread-safe).
-
-    Since the bot runs updates in a ThreadPoolExecutor, there is never a
-    running event loop in the worker threads — asyncio.run() is correct.
-    We explicitly avoid asyncio.get_event_loop() which raises RuntimeError
-    in threads that don't own a loop.
-    """
+    """Run async coroutine in a fresh loop — safe from ThreadPoolExecutor threads."""
     import asyncio
     return asyncio.run(coro)
 
 
-def _zlib_get_cookies() -> dict:
-    """Login to Z-Library and return session cookies for direct HTTP use.
+def _zlib_login() -> "AsyncZlib | None":
+    """Login and return an AsyncZlib client with .cookies dict and .mirror set.
 
-    Uses the zlibrary library only for authentication (which works fine).
-    We avoid the library's HTML parser (paginator) entirely because it
-    raises ParseError against the current site layout.
-    Returns cookies dict or {} on failure.
+    After login the library sets:
+      client.cookies  → dict  e.g. {'remix_userid': '...', 'remix_userkey': '...', ...}
+      client.mirror   → str   e.g. 'https://z-library.sk'
+    _r is an async *method*, not a session — we use requests+cookies for HTTP.
     """
     global _zlib_client
+    if _zlib_client is not None and _zlib_client.cookies:
+        return _zlib_client
+
     if not ZLIB_EMAIL or not ZLIB_PASSWORD:
-        log.error("_zlib_get_cookies: ZLIB_EMAIL/ZLIB_PASSWORD not set")
-        return {}
+        log.error("_zlib_login: ZLIB_EMAIL/ZLIB_PASSWORD not set")
+        return None
 
-    # Return cached cookies from previous login
-    if _zlib_client is not None:
-        try:
-            raw = _zlib_client._r.cookies if hasattr(_zlib_client, "_r") else {}
-            cookies = dict(raw)
-            if cookies:
-                log.debug("_zlib_get_cookies: using cached cookies (%d keys)", len(cookies))
-                return cookies
-        except Exception:
-            pass
+    async def _do_login():
+        from zlibrary import AsyncZlib
+        client = AsyncZlib()
+        await client.login(ZLIB_EMAIL, ZLIB_PASSWORD)
+        return client
 
-    async def _login():
-        global _zlib_client
-        try:
-            from zlibrary import AsyncZlib
-            client = AsyncZlib()
-            await client.login(ZLIB_EMAIL, ZLIB_PASSWORD)
-            _zlib_client = client
-            mirror = getattr(client, "mirror", ZLIB_DOMAINS[0])
-            log.info("Z-Library: logged in as %s  mirror=%s", ZLIB_EMAIL, mirror)
-            return client
-        except Exception as e:
-            log.error("_zlib_get_cookies: login failed: %s", e)
-            _zlib_client = None
-            return None
-
-    client = _zlib_run(_login())
-    if not client:
-        return {}
     try:
-        cookies = dict(client._r.cookies)
-        log.debug("_zlib_get_cookies: got %d cookies after login", len(cookies))
-        return cookies
+        client = _zlib_run(_do_login())
+        _zlib_client = client
+        log.info("_zlib_login: OK  mirror=%s  cookies=%s",
+                 client.mirror, list(client.cookies.keys()))
+        return client
     except Exception as e:
-        log.error("_zlib_get_cookies: could not extract cookies: %s", e)
-        return {}
-
-
-def _zlib_mirror() -> str:
-    """Return the active Z-Library mirror URL."""
-    if _zlib_client is not None:
-        return getattr(_zlib_client, "mirror", ZLIB_DOMAINS[0])
-    return ZLIB_DOMAINS[0]
+        log.error("_zlib_login: failed: %s", e)
+        _zlib_client = None
+        return None
 
 
 def zlib_search(query: str, count: int = 10,
                 extensions: list = None, exact: bool = False) -> list[dict]:
-    """Search Z-Library by scraping with authenticated session cookies.
-
-    Login is done via the zlibrary library (works fine).
-    Search HTML parsing is done by us (library parser is broken vs current layout).
-    """
+    """Search Z-Library.  Login via zlibrary lib, HTTP+parse done by us."""
     log.info("zlib_search: %r  ext=%s", query, extensions)
     if not query or not query.strip():
         return []
 
-    cookies = _zlib_get_cookies()
-    if not cookies:
-        log.error("zlib_search: no cookies — login failed")
+    client = _zlib_login()
+    if not client:
+        log.error("zlib_search: login failed")
         return []
 
-    mirror = _zlib_mirror()
+    cookies = client.cookies          # plain dict — correct attribute
+    mirror  = client.mirror.rstrip("/")
+
     import urllib.parse as up
-
-    ext_param = ""
+    params = f"?page=1"
+    if exact:
+        params += "&e=1"
     if extensions:
-        ext_param = "&extensions[]=" + "&extensions[]=".join(e.upper() for e in extensions)
-
-    search_url = f"{mirror}/s/{up.quote(query)}?page=1{ext_param}"
+        for ext in extensions:
+            params += f"&extensions%5B%5D={ext.upper()}"
+    search_url = f"{mirror}/s/{up.quote(query)}{params}"
     log.info("zlib_search: GET %s", search_url)
 
     try:
-        r = WEB.get(search_url,
-                    cookies=cookies,
+        r = WEB.get(search_url, cookies=cookies,
                     headers={"User-Agent": UA_DESK,
-                             "Accept": "text/html,application/xhtml+xml",
-                             "Accept-Language": "en-US,en;q=0.9",
+                             "Accept": "text/html",
                              "Referer": mirror},
                     timeout=20)
         log.debug("zlib_search: status=%d  len=%d", r.status_code, len(r.text))
-        if r.status_code != 200:
-            log.error("zlib_search: HTTP %d", r.status_code)
-            return []
     except Exception as e:
-        log.error("zlib_search: request failed: %s", e)
+        log.error("zlib_search: request error: %s", e)
+        return []
+
+    if r.status_code != 200:
+        log.error("zlib_search: HTTP %d", r.status_code)
+        _zlib_client = None   # force re-login next time
         return []
 
     soup = BeautifulSoup(r.text, "html.parser")
     results = []
 
-    # Z-Library uses z-bookcard web components (new layout) or .book-item (old)
+    # Z-Library uses <z-bookcard> web components (current layout)
     cards = soup.select("z-bookcard")
     if not cards:
-        cards = soup.select(".book-item, .bookRow, .resItemBox, [itemtype*='Book']")
-    log.debug("zlib_search: found %d raw cards", len(cards))
+        # Fallback: old layout
+        cards = soup.select(".book-item, .bookRow, .resItemBox")
+    log.debug("zlib_search: %d cards found", len(cards))
 
     for card in cards:
         if len(results) >= count:
             break
         try:
-            # ── title + URL ──────────────────────────────────────────────
-            # z-bookcard: href attribute on the component itself
-            href = card.get("href", "") or card.get("url", "")
-            name = card.get("title", "") or card.get("name", "")
-
-            # fallback: find inner <a> with /book/ in href
+            href  = card.get("href") or card.get("url") or ""
+            name  = card.get("title") or card.get("name") or ""
             if not href:
-                a = card.select_one("a[href*='/book/']") or card.select_one("h3 a, h2 a, .title a")
+                a = card.select_one("a[href*='/book/']") or card.select_one("h3 a,h2 a")
                 if a:
                     href = a.get("href", "")
-                    if not name:
-                        name = a.get_text(strip=True)
+                    name = name or a.get_text(strip=True)
             if not href:
                 continue
             url = href if href.startswith("http") else f"{mirror}{href}"
-            if not name:
-                name = href.rstrip("/").split("/")[-1].replace("-", " ").title()
+            name = name or url.rstrip("/").split("/")[-1].replace("-", " ").title()
 
-            # ── authors ──────────────────────────────────────────────────
             authors_raw = card.get("authors", "")
-            if authors_raw:
-                authors = [a.strip() for a in authors_raw.split(",") if a.strip()]
-            else:
-                a_el = card.select_one(".authors, [itemprop='author'], a[href*='/author/']")
-                authors = [a_el.get_text(strip=True)] if a_el else []
+            authors = [a.strip() for a in authors_raw.split(",") if a.strip()] if authors_raw else []
 
-            # ── year ─────────────────────────────────────────────────────
-            year = (card.get("year") or card.get("date") or
-                    (card.select_one(".year, [itemprop='datePublished'], .property_year .property_value") or
-                     type("", (), {"get_text": lambda *a, **kw: ""})()).get_text(strip=True))
-
-            # ── extension / format ────────────────────────────────────────
-            ext = (card.get("extension") or card.get("format") or "")
-            if not ext:
-                ext_el = card.select_one(".extension, .format, [class*='ext'], z-badge")
-                ext = ext_el.get_text(strip=True) if ext_el else ""
-
-            # ── cover ─────────────────────────────────────────────────────
+            year = card.get("year") or card.get("date") or ""
+            ext  = (card.get("extension") or card.get("format") or "").lower()
             cover = card.get("cover") or card.get("image") or ""
-            if not cover:
-                img = card.select_one("img[src], img[data-src]")
-                if img:
-                    cover = img.get("src") or img.get("data-src", "")
             if cover and not cover.startswith("http"):
                 cover = f"{mirror}{cover}"
-
-            # ── size / language / rating ──────────────────────────────────
-            size     = card.get("size", "")
-            language = card.get("language", "")
-            rating   = card.get("rating", "")
 
             results.append({
                 "id":        url.rstrip("/").split("/")[-1],
@@ -3675,122 +3632,107 @@ def zlib_search(query: str, count: int = 10,
                 "authors":   authors,
                 "year":      str(year),
                 "publisher": "",
-                "language":  language,
-                "extension": ext.lower(),
-                "size":      size,
+                "language":  card.get("language", ""),
+                "extension": ext,
+                "size":      card.get("size", ""),
                 "cover":     cover,
                 "url":       url,
-                "rating":    rating,
+                "rating":    card.get("rating", ""),
             })
         except Exception as exc:
-            log.debug("zlib_search: card parse error: %s", exc)
+            log.debug("zlib_search: card error: %s", exc)
             continue
 
-    log.info("zlib_search: %d results parsed", len(results))
+    log.info("zlib_search: %d results", len(results))
     return results
 
 
-def zlib_download(book_url: str) -> Optional[tuple[bytes, str]]:
-    """Download a book from Z-Library using authenticated cookies.
-
-    Strategy:
-      1. Load the book page with auth cookies → find /dl/ download link
-      2. Follow the download link with cookies → get file bytes
-    """
+def zlib_download(book_url: str) -> "tuple[bytes,str] | None":
+    """Download a book.  Fetches book page → finds /dl/ link → downloads."""
     log.info("zlib_download: %s", book_url)
 
-    cookies = _zlib_get_cookies()
-    if not cookies:
-        log.error("zlib_download: no cookies — cannot download")
+    client = _zlib_login()
+    if not client:
+        log.error("zlib_download: login failed")
         return None
 
-    mirror = _zlib_mirror()
-    hdrs = {"User-Agent": UA_DESK,
-            "Accept": "text/html,application/xhtml+xml,*/*",
-            "Referer": mirror}
+    cookies = client.cookies
+    mirror  = client.mirror.rstrip("/")
+    hdrs    = {"User-Agent": UA_DESK, "Referer": mirror}
 
-    # ── Step 1: fetch book page ───────────────────────────────────────────
+    # ── 1. Fetch book page ────────────────────────────────────────────────
     try:
         r = WEB.get(book_url, cookies=cookies, headers=hdrs, timeout=20)
         log.debug("zlib_download: book page status=%d len=%d", r.status_code, len(r.text))
-        if r.status_code != 200:
-            log.error("zlib_download: book page HTTP %d", r.status_code)
-            return None
     except Exception as e:
-        log.error("zlib_download: book page request failed: %s", e)
+        log.error("zlib_download: book page error: %s", e)
+        return None
+    if r.status_code != 200:
+        log.error("zlib_download: book page HTTP %d", r.status_code)
         return None
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # ── Extract title / extension from page for filename ─────────────────
+    # ── 2. Extract title/ext for filename ────────────────────────────────
     title_el = soup.select_one("h1[itemprop='name'], .book-title, h1")
     page_title = title_el.get_text(strip=True) if title_el else ""
-    ext_el  = soup.select_one(".property_files .property_value, .extension, z-badge")
-    page_ext = ext_el.get_text(strip=True).lower().strip(".") if ext_el else "pdf"
+    ext_el = soup.select_one(".property__file, .property_files .property_value")
+    page_ext = "pdf"
+    if ext_el:
+        raw = ext_el.get_text(strip=True).split(",")[0].strip().lower().lstrip("\n")
+        if raw:
+            page_ext = raw
 
-    # ── Step 2: find download link ────────────────────────────────────────
-    # Z-Library puts a /dl/{id}/{hash}/ link on the book page
-    dl_link = ""
-
-    # Primary: <a href="/dl/..."> or <a class="*download*">
-    for sel in (
-        "a[href*='/dl/']",
-        "a.btn.btn-primary.dlButton",
-        "a[class*='download']",
-        "a[href*='download']",
-        ".download-buttons a",
-    ):
-        el = soup.select_one(sel)
-        if el and el.get("href"):
-            dl_link = el["href"]
-            break
-
-    if not dl_link:
-        log.error("zlib_download: no download link found on page %s", book_url)
-        log.debug("zlib_download: page snippet: %s", r.text[:500])
+    # ── 3. Find download link ─────────────────────────────────────────────
+    # Library source shows: a.btn.btn-default.addDownloadedBook  → href="/dl/..."
+    dl_el = (
+        soup.select_one("a.btn.btn-default.addDownloadedBook") or
+        soup.select_one("a[href*='/dl/']") or
+        soup.select_one("a[class*='download']") or
+        soup.select_one(".download-buttons a")
+    )
+    if not dl_el or not dl_el.get("href"):
+        log.error("zlib_download: no download link on %s", book_url)
         return None
 
-    if not dl_link.startswith("http"):
-        dl_link = f"{mirror}{dl_link}"
-    log.info("zlib_download: dl_link=%s", dl_link)
+    dl_href = dl_el["href"]
+    dl_url  = dl_href if dl_href.startswith("http") else f"{mirror}{dl_href}"
+    log.info("zlib_download: dl_url=%s", dl_url)
 
-    # ── Step 3: download file ─────────────────────────────────────────────
+    # ── 4. Download file ──────────────────────────────────────────────────
     try:
-        hdrs2 = {**hdrs, "Referer": book_url}
-        resp = WEB.get(dl_link, cookies=cookies, headers=hdrs2,
+        resp = WEB.get(dl_url, cookies=cookies,
+                       headers={**hdrs, "Referer": book_url},
                        timeout=120, allow_redirects=True)
-        log.debug("zlib_download: file response status=%d  len=%d  ct=%s",
+        log.debug("zlib_download: file status=%d  size=%d  ct=%s",
                   resp.status_code, len(resp.content),
                   resp.headers.get("Content-Type", ""))
-        if resp.status_code != 200 or len(resp.content) < 500:
-            log.error("zlib_download: file download failed status=%d size=%d",
-                      resp.status_code, len(resp.content))
-            return None
     except Exception as e:
-        log.error("zlib_download: file download exception: %s", e)
+        log.error("zlib_download: file download error: %s", e)
         return None
 
-    # ── Derive filename ───────────────────────────────────────────────────
-    # Try Content-Disposition header first
+    if resp.status_code != 200 or len(resp.content) < 500:
+        log.error("zlib_download: bad response status=%d size=%d",
+                  resp.status_code, len(resp.content))
+        return None
+
+    # ── 5. Build filename ─────────────────────────────────────────────────
     cd = resp.headers.get("Content-Disposition", "")
     fname = ""
     if "filename=" in cd:
         import re as _re
-        m = _re.search("filename[^;=]+=([^ ;,]+)", cd)
+        m = _re.search(r"filename=([^\s;]+)", cd)
         if m:
-            fname = m.group(1).strip().strip(chr(34)+chr(39)).strip()
+            fname = m.group(1).strip('"').strip("'").strip()
     if not fname:
-        # Derive from Content-Type extension
         ct = resp.headers.get("Content-Type", "")
-        ct_ext_map = {
-            "application/pdf": "pdf", "application/epub+zip": "epub",
-            "application/x-mobipocket-ebook": "mobi",
-            "application/x-fictionbook": "fb2",
-            "application/octet-stream": page_ext,
-        }
-        inferred_ext = next((v for k, v in ct_ext_map.items() if k in ct), page_ext)
-        safe_title = re.sub(r"[/\]", "_", page_title or "book")[:80]
-        fname = f"{safe_title}.{inferred_ext}"
+        ct_ext = {"application/pdf": "pdf", "application/epub+zip": "epub",
+                  "application/x-mobipocket-ebook": "mobi",
+                  "application/x-fictionbook+xml": "fb2",
+                  "application/octet-stream": page_ext}
+        inferred = next((v for k, v in ct_ext.items() if k in ct), page_ext)
+        safe = re.sub(r"[^\w\s\-.]", "_", page_title or "book")[:80]
+        fname = f"{safe}.{inferred}"
 
     log.info("zlib_download OK: %s  %.1fMB", fname, len(resp.content)/1024/1024)
     return resp.content, fname
@@ -4138,32 +4080,69 @@ def _youtube_quality_picker(cid: int, url: str, audio_only: bool = False):
                  reply_markup={"inline_keyboard": rows})
 
 def _youtube_sub_picker(cid: int, url_key: str, info_key: str,
-                         fmt_spec: str, client: str, audio_only: bool = False):
-    """Show subtitle selection keyboard (or skip straight to download if none)."""
+                         fmt_spec: str, client: str, audio_only: bool = False,
+                         page: int = 0):
+    """Show subtitle selection keyboard — 3-col, priority order, paginated."""
     info_list = cache_get(info_key)
     info = info_list[0] if info_list else {}
     subtitles = info.get("subtitles", [])
     title = info.get("title", "")[:50]
 
     if not subtitles:
-        # No subtitles — download immediately
         _youtube_execute_download(cid, url_key, info_key,
                                   fmt_spec, client, audio_only, sub_code="")
         return
 
+    # Sort: fa first, en second, then alphabetical
+    def _sub_priority(s):
+        c = s["code"].split("-")[0]
+        if c == "fa": return "0"
+        if c == "en": return "1"
+        return "2" + c
+    subs_sorted = sorted(subtitles, key=_sub_priority)
+
+    # Pagination: fit (KB_MAX_ROWS - 2) full rows of KB_MAX_COLS per page
+    per_page = (KB_MAX_ROWS - 2) * KB_MAX_COLS
+    total = len(subs_sorted)
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(0, min(page, pages - 1))
+    page_subs = subs_sorted[page * per_page: (page + 1) * per_page]
+
+    def _sub_cb(code):
+        sfmt    = _safe_fmt(fmt_spec)
+        enc_cli = client.replace("_", "~~")  # encode underscores in client name
+        return f"yt_sub_{url_key}_{info_key}_{code}_{int(audio_only)}_{sfmt}_{enc_cli}"
+
+    # Build 3-column rows
     rows = []
-    for sub in subtitles[:10]:
-        code = sub["code"]
-        name = sub["name"]
-        rows.append([{"text": f"💬 {name}",
-                      "callback_data": f"yt_sub_{url_key}_{info_key}_{code}_{int(audio_only)}_{_safe_fmt(fmt_spec)}_{client}"}])
+    row = []
+    for sub in page_subs:
+        row.append({"text": f"💬 {sub['name']}", "callback_data": _sub_cb(sub["code"])})
+        if len(row) == KB_MAX_COLS:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
 
-    rows.append([{"text": "⏭ بدون زیرنویس",
-                  "callback_data": f"yt_sub_{url_key}_{info_key}_NONE_{int(audio_only)}_{_safe_fmt(fmt_spec)}_{client}"}])
-    rows.append([{"text": "❌ لغو", "callback_data": "home"}])
+    # Pagination nav row
+    nav = []
+    if page > 0:
+        nav.append({"text": "◀ قبلی",
+                    "callback_data": f"yt_subpg_{url_key}_{info_key}_{page-1}_{int(audio_only)}_{_safe_fmt(fmt_spec)}_{client.replace(chr(95), chr(126)*2)}"})
+    if page < pages - 1:
+        nav.append({"text": f"بعدی ▶ ({page+1}/{pages})",
+                    "callback_data": f"yt_subpg_{url_key}_{info_key}_{page+1}_{int(audio_only)}_{_safe_fmt(fmt_spec)}_{client.replace(chr(95), chr(126)*2)}"})
+    if nav:
+        rows.append(nav)
 
+    # Fixed bottom row: no-sub + cancel
+    rows.append([
+        {"text": "⏭ بدون زیرنویس", "callback_data": _sub_cb("NONE")},
+        {"text": "❌ لغو",           "callback_data": "home"},
+    ])
+
+    pg_label = f" (صفحه {page+1}/{pages})" if pages > 1 else ""
     send_message(cid,
-                 f"💬 *{title}*\n\nزیرنویس دلخواه را انتخاب کنید:",
+                 f"💬 *{title}*\n\nزیرنویس دلخواه را انتخاب کنید{pg_label}:",
                  parse_mode="Markdown",
                  reply_markup={"inline_keyboard": rows})
 
@@ -4418,37 +4397,72 @@ def do_github_zip(cid: int, url: str):
         send_message(cid, "❌ ارسال ناموفق.", reply_markup=home_kb())
     clear_state(cid)
 
-def do_github_release(cid: int, repo_full: str):
+def do_github_release(cid: int, repo_full: str, page: int = 0):
+    """Show GitHub release assets with full pagination — no asset left behind."""
     bump(cid, "downloads")
     chat_action(cid)
     rel = github_latest_release(repo_full)
     if not rel:
         send_message(cid, "❌ هیچ Release‌ای یافت نشد.", reply_markup=home_kb())
         return
-    tag = rel.get("tag_name","")
-    body = rel.get("body","")[:500]
-    assets = rel.get("assets",[])
-    lines = [f"📦 *آخرین Release: {repo_full}*",
-             f"🏷 نسخه: `{tag}`",
-             f"📅 تاریخ: {rel.get('published_at','')[:10]}",
-             f"\n{body}" if body else ""]
-    if assets:
-        lines.append("\n*فایل‌های قابل دانلود:*")
-        for i, a in enumerate(assets[:8]):
-            size_mb = a.get("size",0)//1024//1024
-            lines.append(f"{i+1}. {a['name']} ({size_mb}MB)")
-    # Build asset download buttons
-    rows = []
-    for i, a in enumerate(assets[:6]):
-        safe_repo = repo_full.replace("/","__")
-        rows.append([{"text": f"⬇️ {a['name'][:40]}",
-                       "callback_data": f"ghrel_dl_{safe_repo}_{i}"}])
-    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
-    # cache assets
-    akey = f"ghrel_{repo_full.replace('/','__')}"
+
+    tag    = rel.get("tag_name", "")
+    body   = (rel.get("body") or "")[:400]
+    assets = rel.get("assets", [])
+
+    # Cache all assets
+    safe_repo = repo_full.replace("/", "__")
+    akey = f"ghrel_{safe_repo}"
     cache_set(akey, assets)
-    send_message(cid, "\n".join(lines), parse_mode="Markdown",
+
+    # Build info text (only on page 0)
+    if page == 0:
+        lines_txt = [
+            f"📦 *آخرین Release: {repo_full}*",
+            f"🏷 نسخه: `{tag}`",
+            f"📅 تاریخ: {rel.get('published_at', '')[:10]}",
+        ]
+        if body:
+            lines_txt.append(f"\n{body}")
+        if assets:
+            lines_txt.append(f"\n*{len(assets)} فایل قابل دانلود:*")
+            for i, a in enumerate(assets):
+                size_mb = a.get("size", 0) // 1024 // 1024
+                lines_txt.append(f"{i+1}. {a['name']} ({size_mb}MB)")
+        info_text = "\n".join(lines_txt)
+    else:
+        info_text = f"📦 *{repo_full}* — {tag}\n\nانتخاب فایل برای دانلود:"
+
+    # Pagination: (KB_MAX_ROWS - 2) assets per page, 1 per row
+    per_page = KB_MAX_ROWS - 2
+    total  = len(assets)
+    pages  = max(1, (total + per_page - 1) // per_page)
+    page   = max(0, min(page, pages - 1))
+    page_assets = assets[page * per_page: (page + 1) * per_page]
+
+    rows = []
+    for i, a in enumerate(page_assets):
+        real_idx = page * per_page + i
+        size_mb  = a.get("size", 0) / 1024 / 1024
+        rows.append([{"text": f"⬇️ {a['name'][:38]} ({size_mb:.0f}MB)",
+                      "callback_data": f"ghrel_dl_{safe_repo}_{real_idx}"}])
+
+    # Navigation row
+    nav = []
+    if page > 0:
+        nav.append({"text": "◀ قبلی",
+                    "callback_data": f"ghrel_pg_{safe_repo}_{page-1}"})
+    if page < pages - 1:
+        nav.append({"text": f"بعدی ▶ ({page+1}/{pages})",
+                    "callback_data": f"ghrel_pg_{safe_repo}_{page+1}"})
+    if nav:
+        rows.append(nav)
+
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+
+    send_message(cid, info_text, parse_mode="Markdown",
                  reply_markup={"inline_keyboard": rows})
+
 
 def do_ocr_photo(cid: int, photos: list, reply_id=None):
     bump(cid, "ocr")
@@ -5401,19 +5415,31 @@ def handle_callback(cb: dict):
         return
 
     # ── YouTube subtitle selection ────────────────────────────────────────────
-    # yt_sub_{url_key}_{info_key}_{sub_code}_{audio_only}_{fmt_spec}_{client}
-    # url_key = hex, info_key = "yti"+hex — anchoring on these avoids ambiguity
-    m = re.match(r"yt_sub_([0-9a-f]+)_(yti[0-9a-f]+)_([^_]+)_([01])_([^_]*)_([^_]*)$", data)
+    # yt_sub_{url_key}_{info_key}_{sub_code}_{audio_only}_{fmt_spec_encoded}_{client_encoded}
+    # client is encoded: tv_embedded -> tv~embedded (underscores replaced with ~~ )
+    m = re.match(r"yt_sub_([0-9a-f]+)_(yti[0-9a-f]+)_([^_]+)_([01])_([^_]*)_(.*)$", data)
     if m:
-        url_key  = m.group(1)
-        info_key = m.group(2)
-        sub_code = m.group(3)   # "NONE" or actual code
+        url_key    = m.group(1)
+        info_key   = m.group(2)
+        sub_code   = m.group(3)   # "NONE" or language code
         audio_only = m.group(4) == "1"
-        fmt_spec = _decode_fmt(m.group(5))
-        client   = m.group(6)
+        fmt_spec   = _decode_fmt(m.group(5))
+        client     = m.group(6).replace("~~", "_")  # restore underscores in client
         _youtube_execute_download(cid, url_key, info_key,
                                   fmt_spec, client, audio_only,
-                                  sub_code if sub_code != "NONE" else "")
+                                  "" if sub_code == "NONE" else sub_code)
+        return
+
+    # ── YouTube subtitle page navigation ──────────────────────────────────────
+    m = re.match(r"yt_subpg_([0-9a-f]+)_(yti[0-9a-f]+)_(\d+)_([01])_([^_]*)_(.*)$", data)
+    if m:
+        url_key    = m.group(1)
+        info_key   = m.group(2)
+        page       = int(m.group(3))
+        audio_only = m.group(4) == "1"
+        fmt_spec   = _decode_fmt(m.group(5))
+        client     = m.group(6).replace("~~", "_")
+        _youtube_sub_picker(cid, url_key, info_key, fmt_spec, client, audio_only, page)
         return
 
     # YouTube back to search results
@@ -5525,6 +5551,15 @@ def handle_callback(cb: dict):
             send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
         else:
             send_message(cid, "❌ دانلود ناموفق.", reply_markup=home_kb())
+        return
+
+
+    # GitHub release page navigation
+    m = re.match(r"ghrel_pg_(.+)_(\d+)$", data)
+    if m:
+        repo = m.group(1).replace("__", "/")
+        page = int(m.group(2))
+        do_github_release(cid, repo, page=page)
         return
 
     # ── Images ────────────────────────────────────────────────────────────
@@ -6039,8 +6074,12 @@ def handle_update(update: dict):
         handle_callback(update["callback_query"])
 
 def run():
-    log.info("Bot starting — token ends with …%s", TOKEN[-6:] if len(TOKEN)>6 else "???")
-    if TOKEN == "YOUR_BOT_TOKEN_HERE":
+    log.info("Bot starting — platform=%s  token ends with …%s",
+             PLATFORM, TOKEN[-6:] if len(TOKEN) > 6 else "???")
+    if PLATFORM == "telegram" and TOKEN == "YOUR_TELEGRAM_TOKEN_HERE":
+        log.critical("TELEGRAM_TOKEN not set! Run: export TELEGRAM_TOKEN=your_token")
+        return
+    if PLATFORM != "telegram" and TOKEN == "YOUR_BOT_TOKEN_HERE":
         log.critical("BALE_TOKEN not set! Run: export BALE_TOKEN=your_token")
         return
     offset = 0
