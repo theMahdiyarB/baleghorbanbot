@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.1)
+بله قربان — Bale Bot  (v2.2)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -31,26 +31,45 @@ BALE_TOKEN     = os.getenv("BALE_TOKEN", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 
 # Per-platform constants (used by whichever platform is active in the thread)
+def _make_session() -> requests.Session:
+    """Create a requests.Session with connection pooling and retry adapter."""
+    from requests.adapters import HTTPAdapter
+    s = requests.Session()
+    adapter = HTTPAdapter(
+        pool_connections=4,
+        pool_maxsize=20,
+        max_retries=0,   # we do our own retry logic in api()
+    )
+    s.mount("https://", adapter)
+    s.mount("http://",  adapter)
+    return s
+
 _PLATFORM_CFG = {
     "bale": {
         "base_url":   f"https://tapi.bale.ai/bot{BALE_TOKEN}",
         "kb_rows":    10,
         "kb_cols":    3,
+        "chunk_size": 19 * 1024 * 1024,   # Bale: 20MB limit → 19MB chunks
+        "session":    _make_session(),
     },
     "telegram": {
         "base_url":   f"https://api.telegram.org/bot{TELEGRAM_TOKEN}",
         "kb_rows":    8,
         "kb_cols":    3,
+        "chunk_size": 49 * 1024 * 1024,   # Telegram: 50MB limit → 49MB chunks
+        "session":    _make_session(),
     },
 }
 
 def _set_platform_ctx(platform: str):
-    """Called at the start of each polling thread to configure thread-local context."""
+    """Called at the start of each polling/handler thread — sets thread-local context."""
     cfg = _PLATFORM_CFG[platform]
-    _ctx.platform = platform
-    _ctx.base_url = cfg["base_url"]
-    _ctx.kb_rows  = cfg["kb_rows"]
-    _ctx.kb_cols  = cfg["kb_cols"]
+    _ctx.platform    = platform
+    _ctx.base_url    = cfg["base_url"]
+    _ctx.kb_rows     = cfg["kb_rows"]
+    _ctx.kb_cols     = cfg["kb_cols"]
+    _ctx.chunk_size  = cfg["chunk_size"]
+    _ctx.session     = cfg["session"]   # shared persistent Session (thread-safe reads)
 
 # Helpers to read thread-local context — fall back to Bale defaults
 def _base_url() -> str:
@@ -58,6 +77,12 @@ def _base_url() -> str:
 
 def _platform() -> str:
     return getattr(_ctx, "platform", "bale")
+
+def _session() -> requests.Session:
+    return getattr(_ctx, "session", _PLATFORM_CFG["bale"]["session"])
+
+def _chunk_size() -> int:
+    return getattr(_ctx, "chunk_size", 19 * 1024 * 1024)
 
 # Keyboard limit helpers — use thread-local per-platform values
 @property
@@ -255,7 +280,7 @@ def api(method: str, _retries: int = 4, **kwargs) -> dict:
     last_err = None
     for attempt in range(_retries):
         try:
-            r = requests.post(f"{_base_url()}/{method}", json=kwargs, timeout=30)
+            r = _session().post(f"{_base_url()}/{method}", json=kwargs, timeout=30)
             result = _safe_json(r)
             if result.get("ok"):
                 return result
@@ -289,7 +314,7 @@ def api(method: str, _retries: int = 4, **kwargs) -> dict:
 def _notify_bale_error(chat_id: int):
     """Send a user-facing message when the server is unresponsive."""
     try:
-        requests.post(
+        _session().post(
             f"{_base_url()}/sendMessage",
             json={"chat_id": chat_id,
                   "text": "⚠️ سرور در حال حاضر پاسخ نمی‌دهد. لطفاً چند دقیقه دیگر دوباره امتحان کنید."},
@@ -319,7 +344,7 @@ def _post_file(endpoint: str, field: str, filename: str,
     for attempt in range(_retries):
         files = {field: (filename, io.BytesIO(data_bytes), _mime(filename))}
         try:
-            r = requests.post(f"{_base_url()}/{endpoint}", data=extra_data,
+            r = _session().post(f"{_base_url()}/{endpoint}", data=extra_data,
                               files=files, timeout=180)
             resp = _safe_json(r)
             ok = resp.get("ok", False)
@@ -475,12 +500,16 @@ def smart_send(chat_id, data: bytes, filename: str,
     total_size = len(data)
 
     # Step 2: Small enough — send in one shot
-    if total_size <= CHUNK_SIZE:
+    chunk_limit = _chunk_size()
+    if total_size <= chunk_limit:
         return _send_one_chunk(chat_id, data, filename, caption, media_type)
 
     # Step 3: Large video → ffmpeg time-split (each part = self-contained playable MP4)
     if is_video:
         send_message(chat_id, "⏳ در حال تقسیم ویدیو…")
+        # Telegram supports 50MB — only split on Bale
+        if _platform() == "telegram":
+            return _send_one_chunk(chat_id, data, filename, caption, media_type)
         parts = _split_video_ffmpeg(data, filename, max_mb=18.0)
 
         if len(parts) > 1:
@@ -560,7 +589,7 @@ def send_photo(chat_id, img_bytes: bytes, caption="", reply_markup=None) -> bool
     for attempt in range(3):
         try:
             files = {"photo": (f"image.{ext}", io.BytesIO(img_bytes), "image/jpeg")}
-            r = requests.post(f"{_base_url()}/sendPhoto", data=data,
+            r = _session().post(f"{_base_url()}/sendPhoto", data=data,
                               files=files, timeout=60)
             resp = _safe_json(r)
             if resp.get("ok"):
@@ -586,7 +615,7 @@ def chat_action(chat_id, action="typing"):
     if not chat_id or chat_id == 0:
         return
     try:
-        requests.post(f"{_base_url()}/sendChatAction",
+        _session().post(f"{_base_url()}/sendChatAction",
                       json={"chat_id": chat_id, "action": action},
                       timeout=5)
     except Exception:
@@ -6108,14 +6137,28 @@ def handle_update(update: dict):
 
 
 def _poll_platform(platform: str, token: str):
-    """Long-poll loop for one platform — runs in its own thread."""
-    _set_platform_ctx(platform)   # so api() in THIS thread uses the right URL
-    log.info("[%s] Polling started — token …%s", platform, token[-6:])
-    offset = 0
+    """Long-poll loop for one platform — runs in its own thread.
+
+    Uses a persistent requests.Session for TCP keep-alive (big speed win on
+    Telegram). getUpdates long-poll timeout=25s is the Telegram recommendation
+    — a read timeout on the poll itself is not an error, just retry immediately.
+    Handler errors do NOT increment the failure counter so a bad update doesn't
+    back off the whole polling loop.
+    """
+    _set_platform_ctx(platform)
+    sess     = _session()          # persistent session for this platform
+    base_url = _base_url()
+    log.info("[%s] Polling started — token …%s  url=%s", platform, token[-6:], base_url)
+    offset   = 0
     failures = 0
     while True:
         try:
-            resp = api("getUpdates", _retries=2, offset=offset, timeout=30)
+            r = sess.post(
+                f"{base_url}/getUpdates",
+                json={"offset": offset, "timeout": 25, "limit": 100},
+                timeout=35,   # slightly over long-poll timeout so TCP doesn't cut early
+            )
+            resp = _safe_json(r)
             if not resp.get("ok"):
                 failures += 1
                 log.warning("[%s] getUpdates not ok (#%d): %s", platform, failures, resp)
@@ -6125,6 +6168,14 @@ def _poll_platform(platform: str, token: str):
             for update in resp.get("result", []):
                 offset = update["update_id"] + 1
                 _update_executor.submit(_handle_update_safe, platform, update)
+        except requests.exceptions.ReadTimeout:
+            # Normal for long-poll — server held the connection open but no updates
+            pass
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            failures += 1
+            log.warning("[%s] getUpdates connection error (#%d): %s", platform, failures, e)
+            time.sleep(min(3 * failures, 30))
         except Exception as e:
             failures += 1
             log.error("[%s] Polling error (#%d): %s", platform, failures, e, exc_info=True)
