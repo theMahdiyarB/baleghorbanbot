@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.0)
-Full-featured web assistant for Bale messenger & Telegram.
+بله قربان — Bale Bot  (v2.1)
+Full-featured web assistant for Bale messenger.
 """
 
 import os, re, io, json, time, zipfile, logging, tempfile, hashlib
@@ -21,24 +21,55 @@ load_dotenv()
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════════════
-# ── Platform selection ──────────────────────────────────────────────────────
-# Set PLATFORM=telegram to run on Telegram, or PLATFORM=bale (default) for Bale.
-PLATFORM = os.getenv("PLATFORM", "bale").lower().strip()
+# ── Multi-platform config ───────────────────────────────────────────────────
+# Both Bale and Telegram run simultaneously in separate polling threads.
+# Each thread sets _ctx (thread-local) so api/send_* use the right endpoint.
+import threading as _tl_threading
+_ctx = _tl_threading.local()   # _ctx.base_url, _ctx.platform, _ctx.kb_*
 
-if PLATFORM == "telegram":
-    TOKEN    = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_TOKEN_HERE")
-    BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
-    # Telegram limits: 8 rows × 8 columns per inline keyboard message
-    KB_MAX_ROWS    = 8
-    KB_MAX_COLS    = 3
-    KB_MAX_BUTTONS = KB_MAX_ROWS * KB_MAX_COLS   # 24
-else:
-    TOKEN    = os.getenv("BALE_TOKEN", "YOUR_BOT_TOKEN_HERE")
-    BASE_URL = f"https://tapi.bale.ai/bot{TOKEN}"
-    # Bale limits: practical safe limit is ~10 rows, 3 cols
-    KB_MAX_ROWS    = 10
-    KB_MAX_COLS    = 3
-    KB_MAX_BUTTONS = KB_MAX_ROWS * KB_MAX_COLS   # 30
+BALE_TOKEN     = os.getenv("BALE_TOKEN", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+
+# Per-platform constants (used by whichever platform is active in the thread)
+_PLATFORM_CFG = {
+    "bale": {
+        "base_url":   f"https://tapi.bale.ai/bot{BALE_TOKEN}",
+        "kb_rows":    10,
+        "kb_cols":    3,
+    },
+    "telegram": {
+        "base_url":   f"https://api.telegram.org/bot{TELEGRAM_TOKEN}",
+        "kb_rows":    8,
+        "kb_cols":    3,
+    },
+}
+
+def _set_platform_ctx(platform: str):
+    """Called at the start of each polling thread to configure thread-local context."""
+    cfg = _PLATFORM_CFG[platform]
+    _ctx.platform = platform
+    _ctx.base_url = cfg["base_url"]
+    _ctx.kb_rows  = cfg["kb_rows"]
+    _ctx.kb_cols  = cfg["kb_cols"]
+
+# Helpers to read thread-local context — fall back to Bale defaults
+def _base_url() -> str:
+    return getattr(_ctx, "base_url", _PLATFORM_CFG["bale"]["base_url"])
+
+def _platform() -> str:
+    return getattr(_ctx, "platform", "bale")
+
+# Keyboard limit helpers — use thread-local per-platform values
+@property
+def _KB_MAX_ROWS():
+    return getattr(_ctx, "kb_rows", 10)
+
+KB_MAX_ROWS = 10   # default fallback (replaced per-thread via _ctx)
+KB_MAX_COLS = 3
+KB_MAX_BUTTONS = KB_MAX_ROWS * KB_MAX_COLS
+
+# Legacy TOKEN for any remaining single-platform references
+TOKEN = BALE_TOKEN or TELEGRAM_TOKEN
 
 MAX_FILE_SIZE  = 20 * 1024 * 1024
 
@@ -224,7 +255,7 @@ def api(method: str, _retries: int = 4, **kwargs) -> dict:
     last_err = None
     for attempt in range(_retries):
         try:
-            r = requests.post(f"{BASE_URL}/{method}", json=kwargs, timeout=30)
+            r = requests.post(f"{_base_url()}/{method}", json=kwargs, timeout=30)
             result = _safe_json(r)
             if result.get("ok"):
                 return result
@@ -259,7 +290,7 @@ def _notify_bale_error(chat_id: int):
     """Send a user-facing message when the server is unresponsive."""
     try:
         requests.post(
-            f"{BASE_URL}/sendMessage",
+            f"{_base_url()}/sendMessage",
             json={"chat_id": chat_id,
                   "text": "⚠️ سرور در حال حاضر پاسخ نمی‌دهد. لطفاً چند دقیقه دیگر دوباره امتحان کنید."},
             timeout=15,
@@ -288,7 +319,7 @@ def _post_file(endpoint: str, field: str, filename: str,
     for attempt in range(_retries):
         files = {field: (filename, io.BytesIO(data_bytes), _mime(filename))}
         try:
-            r = requests.post(f"{BASE_URL}/{endpoint}", data=extra_data,
+            r = requests.post(f"{_base_url()}/{endpoint}", data=extra_data,
                               files=files, timeout=180)
             resp = _safe_json(r)
             ok = resp.get("ok", False)
@@ -529,7 +560,7 @@ def send_photo(chat_id, img_bytes: bytes, caption="", reply_markup=None) -> bool
     for attempt in range(3):
         try:
             files = {"photo": (f"image.{ext}", io.BytesIO(img_bytes), "image/jpeg")}
-            r = requests.post(f"{BASE_URL}/sendPhoto", data=data,
+            r = requests.post(f"{_base_url()}/sendPhoto", data=data,
                               files=files, timeout=60)
             resp = _safe_json(r)
             if resp.get("ok"):
@@ -555,7 +586,7 @@ def chat_action(chat_id, action="typing"):
     if not chat_id or chat_id == 0:
         return
     try:
-        requests.post(f"{BASE_URL}/sendChatAction",
+        requests.post(f"{_base_url()}/sendChatAction",
                       json={"chat_id": chat_id, "action": action},
                       timeout=5)
     except Exception:
@@ -4102,7 +4133,7 @@ def _youtube_sub_picker(cid: int, url_key: str, info_key: str,
     subs_sorted = sorted(subtitles, key=_sub_priority)
 
     # Pagination: fit (KB_MAX_ROWS - 2) full rows of KB_MAX_COLS per page
-    per_page = (KB_MAX_ROWS - 2) * KB_MAX_COLS
+    per_page = (getattr(_ctx, 'kb_rows', 10) - 2) * KB_MAX_COLS
     total = len(subs_sorted)
     pages = max(1, (total + per_page - 1) // per_page)
     page = max(0, min(page, pages - 1))
@@ -4434,7 +4465,7 @@ def do_github_release(cid: int, repo_full: str, page: int = 0):
         info_text = f"📦 *{repo_full}* — {tag}\n\nانتخاب فایل برای دانلود:"
 
     # Pagination: (KB_MAX_ROWS - 2) assets per page, 1 per row
-    per_page = KB_MAX_ROWS - 2
+    per_page = getattr(_ctx, 'kb_rows', 10) - 2
     total  = len(assets)
     pages  = max(1, (total + per_page - 1) // per_page)
     page   = max(0, min(page, pages - 1))
@@ -6043,18 +6074,20 @@ _orig_dispatch_key = "images_query"
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN DISPATCH
 # ═══════════════════════════════════════════════════════════════════════════════
-# Thread pool for concurrent update handling — allows multiple users simultaneously
-# Each update gets its own daemon thread so slow downloads don't block others.
+# ── Thread pools ─────────────────────────────────────────────────────────────
+# One shared executor for update handlers (downloads, searches, etc.)
+# Each platform has its own polling thread; handler threads are shared.
 from concurrent.futures import ThreadPoolExecutor
-_update_executor = ThreadPoolExecutor(max_workers=20, thread_name_prefix="upd")
+_update_executor = ThreadPoolExecutor(max_workers=40, thread_name_prefix="upd")
 
 
-def _handle_update_safe(update: dict):
-    """Wrap handle_update with full error handling (runs inside thread pool)."""
+def _handle_update_safe(platform: str, update: dict):
+    """Set platform context then dispatch — runs inside the shared thread pool."""
+    _set_platform_ctx(platform)   # make api/send_* use the right endpoint
     try:
         handle_update(update)
     except Exception as e:
-        log.error("handle_update: %s", e, exc_info=True)
+        log.error("[%s] handle_update: %s", platform, e, exc_info=True)
         try:
             cid = None
             if "message" in update:
@@ -6073,42 +6106,77 @@ def handle_update(update: dict):
     elif "callback_query" in update:
         handle_callback(update["callback_query"])
 
-def run():
-    log.info("Bot starting — platform=%s  token ends with …%s",
-             PLATFORM, TOKEN[-6:] if len(TOKEN) > 6 else "???")
-    if PLATFORM == "telegram" and TOKEN == "YOUR_TELEGRAM_TOKEN_HERE":
-        log.critical("TELEGRAM_TOKEN not set! Run: export TELEGRAM_TOKEN=your_token")
-        return
-    if PLATFORM != "telegram" and TOKEN == "YOUR_BOT_TOKEN_HERE":
-        log.critical("BALE_TOKEN not set! Run: export BALE_TOKEN=your_token")
-        return
+
+def _poll_platform(platform: str, token: str):
+    """Long-poll loop for one platform — runs in its own thread."""
+    _set_platform_ctx(platform)   # so api() in THIS thread uses the right URL
+    log.info("[%s] Polling started — token …%s", platform, token[-6:])
     offset = 0
-    consecutive_failures = 0
-    log.info("Thread pool started — max_workers=20")
+    failures = 0
     while True:
         try:
             resp = api("getUpdates", _retries=2, offset=offset, timeout=30)
             if not resp.get("ok"):
-                consecutive_failures += 1
-                log.warning("getUpdates not ok (failure #%d): %s",
-                            consecutive_failures, resp)
-                sleep_time = min(5 * consecutive_failures, 60)
-                time.sleep(sleep_time)
+                failures += 1
+                log.warning("[%s] getUpdates not ok (#%d): %s", platform, failures, resp)
+                time.sleep(min(5 * failures, 60))
                 continue
-            consecutive_failures = 0
+            failures = 0
             for update in resp.get("result", []):
                 offset = update["update_id"] + 1
-                # Submit each update to the thread pool — non-blocking
-                _update_executor.submit(_handle_update_safe, update)
-        except KeyboardInterrupt:
-            log.info("Bot stopped — shutting down thread pool…")
-            _update_executor.shutdown(wait=False)
-            break
+                _update_executor.submit(_handle_update_safe, platform, update)
         except Exception as e:
-            consecutive_failures += 1
-            log.error("Polling error (failure #%d): %s", consecutive_failures, e,
-                      exc_info=True)
-            time.sleep(min(5 * consecutive_failures, 60))
+            failures += 1
+            log.error("[%s] Polling error (#%d): %s", platform, failures, e, exc_info=True)
+            time.sleep(min(5 * failures, 60))
+
+
+def run():
+    threads = []
+
+    if BALE_TOKEN:
+        log.info("Bale platform enabled — token …%s", BALE_TOKEN[-6:])
+        t = _tl_threading.Thread(
+            target=_poll_platform, args=("bale", BALE_TOKEN),
+            name="poll-bale", daemon=True)
+        t.start()
+        threads.append(t)
+    else:
+        log.warning("BALE_TOKEN not set — Bale platform disabled")
+
+    if TELEGRAM_TOKEN:
+        log.info("Telegram platform enabled — token …%s", TELEGRAM_TOKEN[-6:])
+        t = _tl_threading.Thread(
+            target=_poll_platform, args=("telegram", TELEGRAM_TOKEN),
+            name="poll-telegram", daemon=True)
+        t.start()
+        threads.append(t)
+    else:
+        log.warning("TELEGRAM_TOKEN not set — Telegram platform disabled")
+
+    if not threads:
+        log.critical("No tokens set! Set BALE_TOKEN and/or TELEGRAM_TOKEN in .env")
+        return
+
+    log.info("Bot running on %d platform(s). Press Ctrl+C to stop.",  len(threads))
+    try:
+        while True:
+            time.sleep(1)
+            # Restart any dead polling thread
+            for t in threads:
+                if not t.is_alive():
+                    log.error("Polling thread %s died — restarting", t.name)
+                    platform = "bale" if "bale" in t.name else "telegram"
+                    token    = BALE_TOKEN if platform == "bale" else TELEGRAM_TOKEN
+                    new_t = _tl_threading.Thread(
+                        target=_poll_platform, args=(platform, token),
+                        name=t.name, daemon=True)
+                    new_t.start()
+                    threads[threads.index(t)] = new_t
+    except KeyboardInterrupt:
+        log.info("Bot stopped.")
+        _update_executor.shutdown(wait=False)
+
 
 if __name__ == "__main__":
     run()
