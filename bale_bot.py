@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.3)
+بله قربان — Bale Bot  (v2.4)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -682,9 +682,7 @@ def main_menu_kb():
         [{"text": "📚 مقاله علمی",        "callback_data": "mode_scholar"},
          {"text": "📖 ویکی‌پدیا",         "callback_data": "mode_wiki"}],
         [{"text": "📺 یوتیوب",            "callback_data": "mode_youtube"},
-         {"text": "🎵 موسیقی / دانلود",  "callback_data": "mode_music"}],
-        [{"text": "🟢 Spotify",           "callback_data": "mode_spotify"},
-         {"text": "☁️ SoundCloud",        "callback_data": "mode_soundcloud"}],
+         {"text": "🎵 دانلود موزیک",     "callback_data": "mode_music"}],
         [{"text": "🖼 دانلود عکس",        "callback_data": "mode_images"},
          {"text": "🐙 GitHub",            "callback_data": "mode_github"}],
         [{"text": "📱 دانلود APK",        "callback_data": "mode_apk"},
@@ -2463,9 +2461,19 @@ def music_download_with_fallback(
             except Exception: pass
 
     is_url = query_or_url.startswith("http")
-    search_q = f"{artist} {title}".strip() if (artist or title) else query_or_url
 
-    # ── Step 1: Spotify (only if it's a Spotify URL or hint) ─────────────────
+    # Build the cleanest possible search query.
+    # Prefer explicit title/artist over the raw URL or a long video title.
+    if artist and title:
+        search_q = f"{artist} - {title}"
+    elif title:
+        search_q = title
+    elif not is_url:
+        search_q = query_or_url
+    else:
+        search_q = ""   # URL-only call with no title — will be filled in per-step
+
+    # ── Step 1: Spotify (only if it's a Spotify URL) ─────────────────────────
     if is_url and "spotify.com" in query_or_url:
         _cb("🟢 در حال دانلود از Spotify…")
         result = spotify_download(query_or_url)
@@ -2473,28 +2481,26 @@ def music_download_with_fallback(
             log.info("fallback: Spotify OK")
             return result
         log.warning("fallback: Spotify failed, trying YouTube Music")
-        _cb("⚠️ Spotify ناموفق — تلاش با YouTube Music…")
+        _cb("⚠️ Spotify ناموفق — در حال جستجو در یوتیوب موزیک…")
 
-    # ── Step 2: YouTube Music ─────────────────────────────────────────────────
-    if not is_url or "youtube.com" in query_or_url or "youtu.be" in query_or_url or source_hint in ("ytmusic", "youtube", "auto"):
-        if is_url and ("youtube.com" in query_or_url or "youtu.be" in query_or_url):
-            _cb("🎵 در حال دانلود از YouTube Music…")
-            result = music_download_ytdlp(query_or_url, source="youtube")
+    # ── Step 2: YouTube / YouTube Music ──────────────────────────────────────
+    # If we have a direct YouTube URL, try it; otherwise search.
+    if is_url and ("youtube.com" in query_or_url or "youtu.be" in query_or_url):
+        # Already tried once in _do_audio_download; skip to save time
+        pass
+    else:
+        q = search_q or query_or_url
+        _cb("🎵 در حال جستجو در یوتیوب موزیک…")
+        yt_hits = music_search_ytdlp(q, max_results=1, source="ytmusic")
+        if not yt_hits:
+            yt_hits = music_search_ytdlp(q, max_results=1, source="youtube")
+        if yt_hits:
+            result = music_download_ytdlp(yt_hits[0]["url"], source="youtube")
             if result:
-                log.info("fallback: YouTube direct OK")
+                log.info("fallback: YouTube Music search OK")
                 return result
-        else:
-            _cb("🎵 در حال جستجو در YouTube Music…")
-            yt_hits = music_search_ytdlp(search_q, max_results=1, source="ytmusic")
-            if not yt_hits:
-                yt_hits = music_search_ytdlp(search_q, max_results=1, source="youtube")
-            if yt_hits:
-                result = music_download_ytdlp(yt_hits[0]["url"], source="youtube")
-                if result:
-                    log.info("fallback: YouTube Music search OK")
-                    return result
-        log.warning("fallback: YouTube failed, trying SoundCloud")
-        _cb("⚠️ YouTube ناموفق — تلاش با SoundCloud…")
+    log.warning("fallback: YouTube failed, trying SoundCloud")
+    _cb("⚠️ یوتیوب ناموفق — در حال جستجو در SoundCloud…")
 
     # ── Step 3: SoundCloud ────────────────────────────────────────────────────
     if is_url and "soundcloud.com" in query_or_url:
@@ -2504,37 +2510,40 @@ def music_download_with_fallback(
             log.info("fallback: SoundCloud direct OK")
             return result
     else:
+        q = search_q or query_or_url
         _cb("☁️ در حال جستجو در SoundCloud…")
-        sc_hits = music_search_ytdlp(search_q, max_results=1, source="soundcloud")
+        sc_hits = music_search_ytdlp(q, max_results=1, source="soundcloud")
         if sc_hits:
             result = soundcloud_download(sc_hits[0]["url"])
             if result:
                 log.info("fallback: SoundCloud search OK")
                 return result
     log.warning("fallback: SoundCloud failed, trying JioSaavn")
-    _cb("⚠️ SoundCloud ناموفق — تلاش با JioSaavn…")
+    _cb("⚠️ SoundCloud ناموفق — در حال جستجو در JioSaavn…")
 
     # ── Step 4: JioSaavn ─────────────────────────────────────────────────────
-    _cb("🎶 در حال جستجو در JioSaavn…")
-    saavn_hits = jiosaavn_search(search_q, max_results=1)
-    if saavn_hits:
-        result = jiosaavn_download(saavn_hits[0])
-        if result:
-            log.info("fallback: JioSaavn OK")
-            return result
+    if search_q:
+        _cb("🎶 در حال جستجو در JioSaavn…")
+        saavn_hits = jiosaavn_search(search_q, max_results=1)
+        if saavn_hits:
+            result = jiosaavn_download(saavn_hits[0])
+            if result:
+                log.info("fallback: JioSaavn OK")
+                return result
     log.warning("fallback: JioSaavn failed, trying Deezer")
-    _cb("⚠️ JioSaavn ناموفق — تلاش با Deezer…")
+    _cb("⚠️ JioSaavn ناموفق — در حال جستجو در Deezer…")
 
     # ── Step 5: Deezer ────────────────────────────────────────────────────────
-    _cb("🎧 در حال جستجو در Deezer…")
-    dz_hits = deezer_search(search_q, max_results=1)
-    if dz_hits:
-        result = deezer_download(dz_hits[0])
-        if result:
-            log.info("fallback: Deezer OK")
-            return result
+    if search_q:
+        _cb("🎧 در حال جستجو در Deezer…")
+        dz_hits = deezer_search(search_q, max_results=1)
+        if dz_hits:
+            result = deezer_download(dz_hits[0])
+            if result:
+                log.info("fallback: Deezer OK")
+                return result
 
-    log.error("fallback: ALL sources failed for %r", search_q)
+    log.error("fallback: ALL sources failed for %r", search_q or query_or_url)
     return None
 
 
@@ -4626,24 +4635,22 @@ def _finish_video(cid: int, result):
 
 def do_music(cid: int, query: str):
     """
-    Music search — shows results from YouTube Music + SoundCloud as clickable buttons.
-    If query is a Spotify/SoundCloud/YouTube URL, downloads directly.
+    دانلود موزیک — جستجو در همه پلتفرم‌ها یا دانلود مستقیم از لینک.
     """
     bump(cid, "downloads")
 
-    # Direct URL — download immediately
+    # لینک مستقیم — دانلود فوری
     if query.startswith("http"):
         if "spotify.com" in query:
             do_spotify_dl(cid, query); return
-        elif "soundcloud.com" in query:
-            do_soundcloud_dl(cid, query); return
-        elif _is_youtube(query):
-            _do_audio_download(cid, query, source="youtube"); return
+        elif _is_youtube(query) or "soundcloud.com" in query:
+            _do_audio_download(cid, query,
+                               source="soundcloud" if "soundcloud.com" in query else "youtube"); return
         else:
             _do_audio_download(cid, query, source="auto"); return
 
-    # Search query — show results as buttons
-    send_message(cid, f"🔍 در حال جستجو: _{query}_…", parse_mode="Markdown")
+    # جستجو — نمایش نتایج به صورت دکمه
+    send_message(cid, f"🔍 در حال جستجو در همه پلتفرم‌ها: _{query}_…", parse_mode="Markdown")
     chat_action(cid)
     results = music_search_multi(query)
 
@@ -4657,7 +4664,7 @@ def do_music(cid: int, query: str):
 
     rows = []
     for i, r in enumerate(results):
-        title    = r.get("title", f"Track {i+1}")[:35]
+        title    = r.get("title", f"آهنگ {i+1}")[:35]
         uploader = r.get("uploader", "")[:18]
         dur      = r.get("duration", "")
         source   = r.get("source", "")
@@ -4674,9 +4681,9 @@ def do_music(cid: int, query: str):
         label = " ".join(parts)[:60]
         rows.append([{"text": label, "callback_data": f"mu_dl_{key}_{i}"}])
 
-    rows.append([{"text": "🏠 Main menu", "callback_data": "home"}])
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
     send_message(cid,
-        f"🎵 *Music results for:* _{query}_\nTap a track to download:",
+        f"🎵 *نتایج موزیک برای:* _{query}_\nروی آهنگ بزنید تا دانلود شود:",
         parse_mode="Markdown",
         reply_markup={"inline_keyboard": rows})
 
@@ -4684,15 +4691,17 @@ def do_music(cid: int, query: str):
 def _do_audio_download(cid: int, url: str, source: str = "auto",
                         title: str = "", artist: str = "",
                         track_item: dict = None):
-    """Download audio from a URL/query with full platform fallback chain."""
+    """دانلود صدا از URL یا جستجو با زنجیره fallback کامل."""
     bump(cid, "downloads")
-    msg = send_message(cid, "⏳ در حال دانلود صدا…")
+    send_message(cid, "⏳ در حال دانلود آهنگ…")
     chat_action(cid, "record_voice")
 
     def _status(text: str):
         send_message(cid, text)
 
-    # JioSaavn and Deezer items need their own download functions
+    result = None
+
+    # JioSaavn و Deezer نیاز به تابع دانلود اختصاصی دارند
     if source == "jiosaavn" and track_item:
         result = jiosaavn_download(track_item)
         if not result:
@@ -4706,20 +4715,20 @@ def _do_audio_download(cid: int, url: str, source: str = "auto",
                 title or url, title=title, artist=artist,
                 source_hint=source, status_cb=_status)
     else:
-        # For YouTube/SoundCloud/Spotify URLs — try directly first, then fallback
+        # برای YouTube/SoundCloud — یک بار مستقیم امتحان، سپس fallback
         result = music_download_ytdlp(url, source=source)
         if not result:
-            _status("⚠️ دانلود مستقیم ناموفق — در حال امتحان منابع دیگر…")
+            _status("⚠️ دانلود مستقیم ناموفق — در حال جستجو در منابع دیگر…")
             result = music_download_with_fallback(
                 url, title=title, artist=artist,
                 source_hint=source, status_cb=_status)
 
     if not result:
         send_message(cid,
-            "❌ دانلود موسیقی ناموفق بود.\n"
+            "❌ دانلود آهنگ ناموفق بود.\n"
             "• عبارت دیگری جستجو کنید\n"
-            "• ممکن است محتوا محدودیت جغرافیایی داشته باشد",
-            parse_mode="Markdown", reply_markup=home_kb())
+            "• ممکن است محتوا در همه منابع محدودیت داشته باشد",
+            reply_markup=home_kb())
         return
 
     data, fname = result
@@ -4728,7 +4737,7 @@ def _do_audio_download(cid: int, url: str, source: str = "auto",
     if smart_send(cid, data, fname, caption=caption, media_type="audio"):
         send_message(cid, "✅ ارسال شد!", reply_markup=home_kb())
     else:
-        send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+        send_message(cid, "❌ ارسال فایل ناموفق بود.", reply_markup=home_kb())
     clear_state(cid)
 
 
@@ -4738,9 +4747,9 @@ def do_spotify_dl(cid: int, url: str):
     is_track    = "/track/" in url
     is_album    = "/album/" in url
     is_playlist = "/playlist/" in url
-    kind = "track" if is_track else "album" if is_album else "playlist" if is_playlist else "item"
+    kind = "آهنگ" if is_track else "آلبوم" if is_album else "پلیلیست" if is_playlist else "محتوا"
 
-    send_message(cid, f"⏳ در حال دانلود Spotify {kind}…")
+    send_message(cid, f"⏳ در حال دانلود {kind} از Spotify…")
     chat_action(cid, "record_voice")
 
     def _status(text: str):
@@ -4755,39 +4764,20 @@ def do_spotify_dl(cid: int, url: str):
 
     if not result:
         send_message(cid,
-            "❌ دانلود Spotify ناموفق بود.\n\n"
+            "❌ دانلود از Spotify ناموفق بود.\n\n"
             "مطمئن شوید `spotdl` نصب است:\n"
             "`pip install spotdl`",
             parse_mode="Markdown", reply_markup=home_kb())
         return
 
     data, fname = result
-    caption = f"🟢 Spotify — {fname[:60]}"
+    caption = f"🎵 {fname[:60]}"
     if smart_send(cid, data, fname, caption=caption):
         send_message(cid, "✅ ارسال شد!", reply_markup=home_kb())
     else:
         send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
     clear_state(cid)
 
-
-def do_soundcloud_dl(cid: int, url: str):
-    """Download SoundCloud track/playlist."""
-    bump(cid, "downloads")
-    send_message(cid, "⏳ در حال دانلود از SoundCloud…")
-    chat_action(cid, "record_voice")
-
-    result = soundcloud_download(url)
-    if not result:
-        send_message(cid, "❌ دانلود SoundCloud ناموفق بود.", reply_markup=home_kb())
-        return
-
-    data, fname = result
-    caption = f"☁️ SoundCloud — {fname[:60]}"
-    if smart_send(cid, data, fname, caption=caption, media_type="audio"):
-        send_message(cid, "✅ ارسال شد!", reply_markup=home_kb())
-    else:
-        send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
-    clear_state(cid)
 
 def do_images(cid: int, query: str, source: str, page=0):
     bump(cid, "searches")
@@ -5668,8 +5658,8 @@ def handle_message(msg: dict):
     if text.startswith("http"):
         # Smart URL detection
         if _is_youtube(text): do_youtube_dl(cid, text)
-        elif "spotify" in text: do_spotify_dl(cid, text)
-        elif "soundcloud.com" in text: do_soundcloud_dl(cid, text)
+        elif "spotify.com" in text: do_music(cid, text)
+        elif "soundcloud.com" in text: do_music(cid, text)
         elif "tiktok.com" in text: do_tiktok_dl(cid, text)
         elif "twitter.com" in text or "x.com" in text: do_twitter_dl(cid, text)
         elif "instagram.com" in text: do_instagram_dl(cid, text)
@@ -5723,10 +5713,8 @@ def handle_callback(cb: dict):
         "mode_open":      ("open",      "🌐 آدرس سایت را وارد کنید (https://…):"),
         "mode_scholar":   ("scholar",   "📚 عنوان یا کلمه‌کلیدی مقاله:"),
         "mode_wiki":      ("wiki",      "📖 موضوع ویکی‌پدیا:"),
-        "mode_music":      ("music",     "🎵 Track/artist name or paste a URL (Spotify/SoundCloud/YouTube):"),
-        "mode_spotify":    ("music",     "🟢 Paste a Spotify track, album, or playlist URL:"),
-        "mode_soundcloud": ("music",     "☁️ Paste a SoundCloud URL or search: artist name - song:"),
-        "mode_apk":        ("apk",       "📱 Enter app name or package ID (e.g. org.telegram.messenger):"),
+        "mode_music":     ("music",     "🎵 نام آهنگ یا خواننده را بنویسید\nیا لینک Spotify / SoundCloud / YouTube را بفرستید:"),
+        "mode_apk":       ("apk",       "📱 نام اپ یا شناسه پکیج را وارد کنید (مثال: org.telegram.messenger):"),
         "mode_iplookup":  ("iplookup",  "🌐 آدرس IP یا دامنه:"),
         "mode_rss":       ("rss",       "📰 آدرس فید RSS یا سایت خبری را وارد کنید:"),
     }
