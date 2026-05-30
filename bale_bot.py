@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.2)
+بله قربان — Bale Bot  (v2.3)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -1996,27 +1996,48 @@ def _trim_video(src: Path, tmp: str, ffmpeg_dir="/usr/bin") -> Optional[tuple[by
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MUSIC PLATFORMS  (Spotify · SoundCloud · YouTube Music)
+# MUSIC PLATFORMS  (YouTube · YouTube Music · SoundCloud · JioSaavn · Deezer · Spotify)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def music_search_ytdlp(query: str, max_results: int = 6,
-                        source: str = "youtube") -> list[dict]:
-    """Search for tracks via yt-dlp (YouTube or SoundCloud)."""
-    log.info("music_search_ytdlp: %r source=%s", query, source)
+def _ffmpeg_dir() -> str:
     import shutil
-    ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
-    search_url = (f"scsearch{max_results}:{query}" if source == "soundcloud"
-                  else f"ytsearch{max_results}:{query}")
+    return str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
+
+
+# ── YouTube / SoundCloud search via yt-dlp ───────────────────────────────────
+def music_search_ytdlp(query: str, max_results: int = 5,
+                        source: str = "youtube") -> list[dict]:
+    """Search for tracks via yt-dlp (YouTube, YouTube Music, or SoundCloud)."""
+    log.info("music_search_ytdlp: %r source=%s", query, source)
+    if source == "soundcloud":
+        search_url = f"scsearch{max_results}:{query}"
+    elif source == "ytmusic":
+        search_url = f"https://music.youtube.com/search?q={urllib.parse.quote(query)}"
+    else:
+        search_url = f"ytsearch{max_results}:{query}"
+
     extra = []
-    if source != "soundcloud" and YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).exists():
+    if source in ("youtube", "ytmusic") and YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).exists():
         extra = ["--cookies", YOUTUBE_COOKIES_FILE]
+
     try:
-        cmd = ([YTDLP_BIN, "--flat-playlist", "--no-warnings", "--no-check-certificate",
-                "--ffmpeg-location", ffmpeg_dir]
-               + extra
-               + ["--print",
-                  "%(id)s|||%(title)s|||%(uploader)s|||%(duration_string)s|||%(url)s|||%(thumbnail)s",
-                  search_url])
+        if source == "ytmusic":
+            # For YT Music we search via yt-dlp's ytmusic extractor
+            search_url = f"https://music.youtube.com/search?q={urllib.parse.quote(query)}"
+            cmd = ([YTDLP_BIN, "--flat-playlist", "--no-warnings", "--no-check-certificate",
+                    "--ffmpeg-location", _ffmpeg_dir(), "--playlist-items", f"1-{max_results}"]
+                   + extra
+                   + ["--print",
+                      "%(id)s|||%(title)s|||%(uploader)s|||%(duration_string)s|||%(url)s|||%(thumbnail)s",
+                      f"https://music.youtube.com/search?q={urllib.parse.quote(query)}"])
+        else:
+            cmd = ([YTDLP_BIN, "--flat-playlist", "--no-warnings", "--no-check-certificate",
+                    "--ffmpeg-location", _ffmpeg_dir()]
+                   + extra
+                   + ["--print",
+                      "%(id)s|||%(title)s|||%(uploader)s|||%(duration_string)s|||%(url)s|||%(thumbnail)s",
+                      search_url])
+
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         items = []
         for line in result.stdout.strip().split("\n"):
@@ -2029,44 +2050,287 @@ def music_search_ytdlp(query: str, max_results: int = 6,
             duration = parts[3].strip() if len(parts) > 3 else ""
             url      = parts[4].strip() if len(parts) > 4 else ""
             thumb    = parts[5].strip() if len(parts) > 5 else ""
-            # Fix NA values — build fallback URLs from video ID
+            # Fix NA/None values
             if not url or url in ("NA", "none", "None"):
-                url = f"https://www.youtube.com/watch?v={vid_id}" if source == "youtube" and vid_id else ""
+                if source in ("youtube", "ytmusic") and vid_id:
+                    url = f"https://www.youtube.com/watch?v={vid_id}"
+                else:
+                    url = ""
             if not thumb or thumb in ("NA", "none", "None"):
-                thumb = f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg" if source == "youtube" and vid_id else ""
-            if not url:
+                if source in ("youtube", "ytmusic") and vid_id:
+                    thumb = f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg"
+                else:
+                    thumb = ""
+            if not url or not title:
                 continue
+            display_source = "ytmusic" if source == "ytmusic" else source
             items.append({"id": vid_id, "title": title, "uploader": uploader,
                           "duration": duration, "url": url, "thumbnail": thumb,
-                          "source": source})
+                          "source": display_source})
             if len(items) >= max_results:
                 break
         log.info("music_search_ytdlp (%s): %d results", source, len(items))
         return items
     except Exception as e:
-        log.error("music_search_ytdlp: %s", e)
+        log.error("music_search_ytdlp (%s): %s", source, e)
         return []
 
 
+# ── JioSaavn search (no API key required) ────────────────────────────────────
+def jiosaavn_search(query: str, max_results: int = 5) -> list[dict]:
+    """Search JioSaavn using their public API — no key needed."""
+    log.info("jiosaavn_search: %r", query)
+    try:
+        # JioSaavn public search endpoint
+        url = "https://www.jiosaavn.com/api.php"
+        params = {
+            "__call": "search.getResults",
+            "_format": "json",
+            "_marker": "0",
+            "api_version": "4",
+            "ctx": "web6dot0",
+            "query": query,
+            "n": str(max_results),
+            "p": "1",
+        }
+        r = WEB.get(url, params=params,
+                    headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.jiosaavn.com/"},
+                    timeout=15)
+        if r.status_code != 200:
+            log.error("jiosaavn_search: HTTP %d", r.status_code)
+            return []
+        data = r.json()
+        songs = data.get("results", [])
+        items = []
+        for s in songs[:max_results]:
+            title    = s.get("title", s.get("song", ""))
+            uploader = s.get("primary_artists", s.get("singers", ""))
+            duration = s.get("duration", "")
+            song_id  = s.get("id", "")
+            # Build perma URL
+            perma = s.get("perma_url", "")
+            # Encrypted media URL — needed for download
+            enc_url = s.get("media_preview_url", s.get("media_url", ""))
+            thumb   = s.get("image", "").replace("150x150", "500x500")
+            if duration:
+                try:
+                    secs = int(duration)
+                    duration = f"{secs//60}:{secs%60:02d}"
+                except Exception:
+                    pass
+            if not (title and song_id):
+                continue
+            items.append({
+                "id":        song_id,
+                "title":     title,
+                "uploader":  uploader,
+                "duration":  str(duration),
+                "url":       perma or f"https://www.jiosaavn.com/song/-/{song_id}",
+                "thumbnail": thumb,
+                "source":    "jiosaavn",
+                "enc_url":   enc_url,
+                "perma_url": perma,
+            })
+        log.info("jiosaavn_search: %d results", len(items))
+        return items
+    except Exception as e:
+        log.error("jiosaavn_search: %s", e)
+        return []
+
+
+def jiosaavn_download(item: dict) -> Optional[tuple[bytes, str]]:
+    """Download a JioSaavn track given a search result dict."""
+    log.info("jiosaavn_download: %s", item.get("title", "?"))
+    try:
+        song_id  = item.get("id", "")
+        perma    = item.get("perma_url", "")
+        title    = item.get("title", "track")
+        uploader = item.get("uploader", "")
+
+        # Approach 1: use yt-dlp which supports JioSaavn
+        if perma:
+            result = music_download_ytdlp(perma, source="jiosaavn")
+            if result:
+                return result
+
+        # Approach 2: fetch song details API to get stream URL
+        if song_id:
+            detail_url = "https://www.jiosaavn.com/api.php"
+            params = {
+                "__call": "song.getDetails",
+                "_format": "json",
+                "_marker": "0",
+                "api_version": "4",
+                "ctx": "web6dot0",
+                "pids": song_id,
+            }
+            r = WEB.get(detail_url, params=params,
+                        headers={"User-Agent": "Mozilla/5.0",
+                                 "Referer": "https://www.jiosaavn.com/"},
+                        timeout=15)
+            if r.status_code == 200:
+                d = r.json()
+                song_data = d.get(song_id, {})
+                enc = song_data.get("encrypted_media_url", "")
+                if enc:
+                    # Decrypt the media URL
+                    stream_url = _jiosaavn_decrypt(enc)
+                    if stream_url:
+                        resp = WEB.get(stream_url, timeout=60, stream=True)
+                        if resp.status_code == 200:
+                            data = resp.content
+                            safe = re.sub(r'[^\w\s-]', '', title)[:50]
+                            fname = f"{safe}.mp3"
+                            log.info("jiosaavn_download: OK %.1fMB", len(data)/1024/1024)
+                            return data, fname
+
+        log.error("jiosaavn_download: all methods failed for %s", title)
+        return None
+    except Exception as e:
+        log.error("jiosaavn_download: %s", e)
+        return None
+
+
+def _jiosaavn_decrypt(enc_url: str) -> Optional[str]:
+    """Decrypt JioSaavn encrypted media URL using their known DES key."""
+    try:
+        from base64 import b64decode, b64encode
+        # JioSaavn uses DES ECB with a known key
+        try:
+            from Crypto.Cipher import DES
+        except ImportError:
+            log.warning("jiosaavn_decrypt: pycryptodome not installed, skipping decrypt")
+            return None
+        key = b"38346591"
+        enc_bytes = b64decode(enc_url)
+        cipher = DES.new(key, DES.MODE_ECB)
+        decrypted = cipher.decrypt(enc_bytes)
+        # Remove padding
+        url = decrypted.decode("utf-8", errors="ignore").rstrip("\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10")
+        # Upgrade to 320kbps
+        url = url.replace("_96.mp4", "_320.mp4").replace("_160.mp4", "_320.mp4")
+        log.debug("jiosaavn_decrypt: %s", url[:80])
+        return url
+    except Exception as e:
+        log.error("jiosaavn_decrypt: %s", e)
+        return None
+
+
+# ── Deezer search (public API, no key) ───────────────────────────────────────
+def deezer_search(query: str, max_results: int = 5) -> list[dict]:
+    """Search Deezer using their public API — no API key required."""
+    log.info("deezer_search: %r", query)
+    try:
+        url = "https://api.deezer.com/search"
+        params = {"q": query, "limit": max_results, "output": "json"}
+        r = WEB.get(url, params=params,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=15)
+        if r.status_code != 200:
+            log.error("deezer_search: HTTP %d", r.status_code)
+            return []
+        data = r.json()
+        items = []
+        for track in data.get("data", [])[:max_results]:
+            title    = track.get("title", "")
+            uploader = track.get("artist", {}).get("name", "")
+            duration = track.get("duration", 0)
+            track_id = track.get("id", "")
+            link     = track.get("link", f"https://www.deezer.com/track/{track_id}")
+            thumb    = track.get("album", {}).get("cover_big",
+                       track.get("album", {}).get("cover_medium", ""))
+            dur_str  = f"{duration//60}:{duration%60:02d}" if duration else ""
+            if not (title and track_id):
+                continue
+            items.append({
+                "id":        str(track_id),
+                "title":     title,
+                "uploader":  uploader,
+                "duration":  dur_str,
+                "url":       link,
+                "thumbnail": thumb,
+                "source":    "deezer",
+            })
+        log.info("deezer_search: %d results", len(items))
+        return items
+    except Exception as e:
+        log.error("deezer_search: %s", e)
+        return []
+
+
+def deezer_download(item: dict) -> Optional[tuple[bytes, str]]:
+    """Download a Deezer track — tries yt-dlp (deezer extractor) then YT fallback."""
+    log.info("deezer_download: %s", item.get("title", "?"))
+    url   = item.get("url", "")
+    title = item.get("title", "track")
+    artist = item.get("uploader", "")
+
+    # Approach 1: yt-dlp native Deezer extractor (works if not geo-blocked)
+    if url:
+        result = music_download_ytdlp(url, source="deezer")
+        if result:
+            return result
+
+    # Approach 2: search YouTube Music for the same track and download
+    if title:
+        search_q = f"{artist} {title}".strip() if artist else title
+        yt_results = music_search_ytdlp(search_q, max_results=1, source="youtube")
+        if yt_results:
+            yt_url = yt_results[0].get("url", "")
+            if yt_url:
+                result = music_download_ytdlp(yt_url, source="youtube")
+                if result:
+                    log.info("deezer_download: fell back to YouTube for %s", title)
+                    return result
+
+    log.error("deezer_download: all methods failed for %s", title)
+    return None
+
+
+# ── Unified multi-source search ───────────────────────────────────────────────
 def music_search_multi(query: str) -> list[dict]:
-    """Search YouTube + SoundCloud simultaneously, interleave results."""
-    import threading
+    """Search YouTube, YouTube Music, SoundCloud, JioSaavn, and Deezer simultaneously."""
+    import threading as _t
     results: dict[str, list] = {}
 
-    def _s(src): results[src] = music_search_ytdlp(query, 5, src)
+    def _s(name, fn, *args):
+        try:
+            results[name] = fn(*args)
+        except Exception as e:
+            log.error("music_search_multi [%s]: %s", name, e)
+            results[name] = []
 
-    threads = [threading.Thread(target=_s, args=(s,))
-               for s in ("youtube", "soundcloud")]
+    threads = [
+        _t.Thread(target=_s, args=("youtube",   music_search_ytdlp, query, 4, "youtube")),
+        _t.Thread(target=_s, args=("ytmusic",   music_search_ytdlp, query, 4, "ytmusic")),
+        _t.Thread(target=_s, args=("soundcloud",music_search_ytdlp, query, 3, "soundcloud")),
+        _t.Thread(target=_s, args=("jiosaavn",  jiosaavn_search,    query, 4)),
+        _t.Thread(target=_s, args=("deezer",    deezer_search,      query, 4)),
+    ]
     for t in threads: t.start()
-    for t in threads: t.join(timeout=20)
+    for t in threads: t.join(timeout=25)
 
+    # Interleave: round-robin across sources so user sees variety
+    sources_order = ["ytmusic", "youtube", "jiosaavn", "deezer", "soundcloud"]
+    lists = [results.get(s, []) for s in sources_order]
     merged = []
-    yt = results.get("youtube", [])
-    sc = results.get("soundcloud", [])
-    for i in range(max(len(yt), len(sc))):
-        if i < len(yt): merged.append(yt[i])
-        if i < len(sc): merged.append(sc[i])
-    return merged[:10]
+    seen_titles = set()
+    i = 0
+    while len(merged) < 20:
+        added = False
+        for lst in lists:
+            if i < len(lst):
+                item = lst[i]
+                dedup_key = item.get("title", "").lower()[:30]
+                if dedup_key not in seen_titles:
+                    seen_titles.add(dedup_key)
+                    merged.append(item)
+                added = True
+        if not added:
+            break
+        i += 1
+    log.info("music_search_multi: %d total results", len(merged))
+    return merged[:20]
 
 
 def music_download_ytdlp(url: str, source: str = "auto") -> Optional[tuple[bytes, str]]:
@@ -2082,10 +2346,8 @@ def music_download_ytdlp(url: str, source: str = "auto") -> Optional[tuple[bytes
                 YTDLP_BIN, "--no-playlist", "--no-warnings", "--no-check-certificate",
                 "--ffmpeg-location", ffmpeg_dir,
                 "--socket-timeout", "30", "--retries", "3",
+                "--max-filesize", "19M",
                 "-o", os.path.join(tmp, "%(title).60s.%(ext)s"),
-                "--split-chapters", 
-                "--max-filesize", "19M", 
-                "-o", os.path.join(tmp, "%(title)s.%(ext)s"),
             ]
             if is_yt:
                 if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).exists():
@@ -2179,6 +2441,101 @@ def soundcloud_download(url: str) -> Optional[tuple[bytes, str]]:
     return music_download_ytdlp(url, source="soundcloud")
 
 
+def music_download_with_fallback(
+    query_or_url: str,
+    title: str = "",
+    artist: str = "",
+    source_hint: str = "auto",
+    status_cb=None,       # optional callable(str) to send progress messages
+) -> Optional[tuple[bytes, str]]:
+    """
+    Download music with a full platform fallback chain:
+      Spotify (spotdl) → YouTube Music → YouTube → SoundCloud → JioSaavn → Deezer
+
+    - query_or_url: either a direct URL or a search query string
+    - title/artist: used to build search queries for fallback steps
+    - source_hint: 'spotify'|'soundcloud'|'youtube'|'ytmusic'|'jiosaavn'|'deezer'|'auto'
+    - status_cb: optional function to send progress text to user
+    """
+    def _cb(msg: str):
+        if status_cb:
+            try: status_cb(msg)
+            except Exception: pass
+
+    is_url = query_or_url.startswith("http")
+    search_q = f"{artist} {title}".strip() if (artist or title) else query_or_url
+
+    # ── Step 1: Spotify (only if it's a Spotify URL or hint) ─────────────────
+    if is_url and "spotify.com" in query_or_url:
+        _cb("🟢 در حال دانلود از Spotify…")
+        result = spotify_download(query_or_url)
+        if result:
+            log.info("fallback: Spotify OK")
+            return result
+        log.warning("fallback: Spotify failed, trying YouTube Music")
+        _cb("⚠️ Spotify ناموفق — تلاش با YouTube Music…")
+
+    # ── Step 2: YouTube Music ─────────────────────────────────────────────────
+    if not is_url or "youtube.com" in query_or_url or "youtu.be" in query_or_url or source_hint in ("ytmusic", "youtube", "auto"):
+        if is_url and ("youtube.com" in query_or_url or "youtu.be" in query_or_url):
+            _cb("🎵 در حال دانلود از YouTube Music…")
+            result = music_download_ytdlp(query_or_url, source="youtube")
+            if result:
+                log.info("fallback: YouTube direct OK")
+                return result
+        else:
+            _cb("🎵 در حال جستجو در YouTube Music…")
+            yt_hits = music_search_ytdlp(search_q, max_results=1, source="ytmusic")
+            if not yt_hits:
+                yt_hits = music_search_ytdlp(search_q, max_results=1, source="youtube")
+            if yt_hits:
+                result = music_download_ytdlp(yt_hits[0]["url"], source="youtube")
+                if result:
+                    log.info("fallback: YouTube Music search OK")
+                    return result
+        log.warning("fallback: YouTube failed, trying SoundCloud")
+        _cb("⚠️ YouTube ناموفق — تلاش با SoundCloud…")
+
+    # ── Step 3: SoundCloud ────────────────────────────────────────────────────
+    if is_url and "soundcloud.com" in query_or_url:
+        _cb("☁️ در حال دانلود از SoundCloud…")
+        result = soundcloud_download(query_or_url)
+        if result:
+            log.info("fallback: SoundCloud direct OK")
+            return result
+    else:
+        _cb("☁️ در حال جستجو در SoundCloud…")
+        sc_hits = music_search_ytdlp(search_q, max_results=1, source="soundcloud")
+        if sc_hits:
+            result = soundcloud_download(sc_hits[0]["url"])
+            if result:
+                log.info("fallback: SoundCloud search OK")
+                return result
+    log.warning("fallback: SoundCloud failed, trying JioSaavn")
+    _cb("⚠️ SoundCloud ناموفق — تلاش با JioSaavn…")
+
+    # ── Step 4: JioSaavn ─────────────────────────────────────────────────────
+    _cb("🎶 در حال جستجو در JioSaavn…")
+    saavn_hits = jiosaavn_search(search_q, max_results=1)
+    if saavn_hits:
+        result = jiosaavn_download(saavn_hits[0])
+        if result:
+            log.info("fallback: JioSaavn OK")
+            return result
+    log.warning("fallback: JioSaavn failed, trying Deezer")
+    _cb("⚠️ JioSaavn ناموفق — تلاش با Deezer…")
+
+    # ── Step 5: Deezer ────────────────────────────────────────────────────────
+    _cb("🎧 در حال جستجو در Deezer…")
+    dz_hits = deezer_search(search_q, max_results=1)
+    if dz_hits:
+        result = deezer_download(dz_hits[0])
+        if result:
+            log.info("fallback: Deezer OK")
+            return result
+
+    log.error("fallback: ALL sources failed for %r", search_q)
+    return None
 
 
 # ─── Generic yt-dlp social downloader ────────────────────────────────────────
@@ -4300,11 +4657,17 @@ def do_music(cid: int, query: str):
 
     rows = []
     for i, r in enumerate(results):
-        title    = r.get("title", f"Track {i+1}")[:38]
-        uploader = r.get("uploader", "")[:20]
+        title    = r.get("title", f"Track {i+1}")[:35]
+        uploader = r.get("uploader", "")[:18]
         dur      = r.get("duration", "")
         source   = r.get("source", "")
-        src_icon = {"youtube": "▶️", "soundcloud": "☁️", "ytmusic": "🎵"}.get(source, "🎵")
+        src_icon = {
+            "youtube":    "▶️",
+            "ytmusic":    "🎵",
+            "soundcloud": "☁️",
+            "jiosaavn":   "🎶",
+            "deezer":     "🎧",
+        }.get(source, "🎵")
         parts = [f"{src_icon} {title}"]
         if uploader: parts.append(f"— {uploader}")
         if dur:      parts.append(f"({dur})")
@@ -4319,18 +4682,43 @@ def do_music(cid: int, query: str):
 
 
 def _do_audio_download(cid: int, url: str, source: str = "auto",
-                        title: str = ""):
-    """Download audio from a URL and send to user."""
+                        title: str = "", artist: str = "",
+                        track_item: dict = None):
+    """Download audio from a URL/query with full platform fallback chain."""
     bump(cid, "downloads")
-    send_message(cid, f"⏳ در حال دانلود صدا…")
+    msg = send_message(cid, "⏳ در حال دانلود صدا…")
     chat_action(cid, "record_voice")
 
-    result = music_download_ytdlp(url, source=source)
+    def _status(text: str):
+        send_message(cid, text)
+
+    # JioSaavn and Deezer items need their own download functions
+    if source == "jiosaavn" and track_item:
+        result = jiosaavn_download(track_item)
+        if not result:
+            result = music_download_with_fallback(
+                title or url, title=title, artist=artist,
+                source_hint=source, status_cb=_status)
+    elif source == "deezer" and track_item:
+        result = deezer_download(track_item)
+        if not result:
+            result = music_download_with_fallback(
+                title or url, title=title, artist=artist,
+                source_hint=source, status_cb=_status)
+    else:
+        # For YouTube/SoundCloud/Spotify URLs — try directly first, then fallback
+        result = music_download_ytdlp(url, source=source)
+        if not result:
+            _status("⚠️ دانلود مستقیم ناموفق — در حال امتحان منابع دیگر…")
+            result = music_download_with_fallback(
+                url, title=title, artist=artist,
+                source_hint=source, status_cb=_status)
+
     if not result:
         send_message(cid,
             "❌ دانلود موسیقی ناموفق بود.\n"
-            "• لینک را بررسی کنید\n"
-            "• ممکن است محتوا محدودیت داشته باشد",
+            "• عبارت دیگری جستجو کنید\n"
+            "• ممکن است محتوا محدودیت جغرافیایی داشته باشد",
             parse_mode="Markdown", reply_markup=home_kb())
         return
 
@@ -4345,25 +4733,31 @@ def _do_audio_download(cid: int, url: str, source: str = "auto",
 
 
 def do_spotify_dl(cid: int, url: str):
-    """Download Spotify track/album/playlist via spotdl."""
+    """Download Spotify track/album/playlist via spotdl, with full platform fallback."""
     bump(cid, "downloads")
     is_track    = "/track/" in url
     is_album    = "/album/" in url
     is_playlist = "/playlist/" in url
-
     kind = "track" if is_track else "album" if is_album else "playlist" if is_playlist else "item"
-    send_message(cid, f"⏳ در حال دانلود Spotify {kind}… (ممکن است کمی طول بکشد)")
+
+    send_message(cid, f"⏳ در حال دانلود Spotify {kind}…")
     chat_action(cid, "record_voice")
 
-    result = spotify_download(url)
+    def _status(text: str):
+        send_message(cid, text)
+
+    # For single tracks, use full fallback chain; for albums/playlists only spotdl
+    if is_track:
+        result = music_download_with_fallback(
+            url, source_hint="spotify", status_cb=_status)
+    else:
+        result = spotify_download(url)
+
     if not result:
         send_message(cid,
             "❌ دانلود Spotify ناموفق بود.\n\n"
             "مطمئن شوید `spotdl` نصب است:\n"
-            "`pip install spotdl`\n\n"
-            "برای پلیلیست، توکن Spotify لازم است:\n"
-            "`export SPOTIFY_CLIENT_ID=...`\n"
-            "`export SPOTIFY_CLIENT_SECRET=...`",
+            "`pip install spotdl`",
             parse_mode="Markdown", reply_markup=home_kb())
         return
 
@@ -6066,26 +6460,31 @@ def handle_callback(cb: dict):
         if not results or idx >= len(results):
             send_message(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید."); return
         track = results[idx]
-        url   = track.get("url", "")
-        title = track.get("title", "")
-        thumb = track.get("thumbnail", "")
+        url    = track.get("url", "")
+        title  = track.get("title", "")
+        artist = track.get("uploader", "")
+        thumb  = track.get("thumbnail", "")
+        source = track.get("source", "youtube")
 
         # Send thumbnail first
         if thumb:
             try:
                 tb = download_bytes(thumb, MAX_IMAGE_SIZE)
                 if tb:
-                    uploader = track.get("uploader", "")
-                    dur      = track.get("duration", "")
+                    dur = track.get("duration", "")
                     cap = title
-                    if uploader: cap += f"\n🎤 {uploader}"
-                    if dur:      cap += f"\n⏱ {dur}"
+                    if artist: cap += f"\n🎤 {artist}"
+                    if dur:    cap += f"\n⏱ {dur}"
+                    src_label = {"youtube":"▶️ YouTube","ytmusic":"🎵 YouTube Music",
+                                 "soundcloud":"☁️ SoundCloud","jiosaavn":"🎶 JioSaavn",
+                                 "deezer":"🎧 Deezer"}.get(source, "")
+                    if src_label: cap += f"\n{src_label}"
                     send_photo(cid, tb, caption=cap[:1024])
             except Exception as e:
                 log.warning("music thumb: %s", e)
 
-        source = track.get("source", "youtube")
-        _do_audio_download(cid, url, source=source, title=title)
+        _do_audio_download(cid, url, source=source, title=title,
+                           artist=artist, track_item=track)
         return
 
     # ── Images query entry ────────────────────────────────────────────────
