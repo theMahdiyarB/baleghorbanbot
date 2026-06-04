@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.5)
+بله قربان — Bale Bot  (v2.6)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -373,9 +373,61 @@ def _post_file(endpoint: str, field: str, filename: str,
     log.error("%s: all %d retries failed for %s", endpoint, _retries, filename)
     return False
 
+def _video_meta(data_bytes: bytes, filename: str) -> dict:
+    """
+    Extract video duration (seconds) and generate a thumbnail frame via ffmpeg.
+    Returns dict with optional keys: duration (int), thumb_bytes (bytes).
+    Fast — runs in <1s for normal clips.
+    """
+    import shutil as _sh
+    ffmpeg  = _sh.which("ffmpeg")  or "/usr/bin/ffmpeg"
+    ffprobe = _sh.which("ffprobe") or "/usr/bin/ffprobe"
+    result  = {}
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / filename
+            src.write_bytes(data_bytes)
+
+            # Duration
+            probe = subprocess.run(
+                [ffprobe, "-v", "error",
+                 "-show_entries", "format=duration:stream=width,height",
+                 "-of", "json", str(src)],
+                capture_output=True, text=True, timeout=15)
+            if probe.returncode == 0:
+                import json as _json
+                pj = _json.loads(probe.stdout or "{}")
+                fmt = pj.get("format", {})
+                dur = float(fmt.get("duration", 0) or 0)
+                if dur > 0:
+                    result["duration"] = int(dur)
+                streams = pj.get("streams", [{}])
+                w = streams[0].get("width", 0) if streams else 0
+                h = streams[0].get("height", 0) if streams else 0
+                if w and h:
+                    result["width"]  = w
+                    result["height"] = h
+
+            # Thumbnail — grab frame at 1s (or 0 if short)
+            seek = min(1, result.get("duration", 0) // 2) if result.get("duration", 0) > 2 else 0
+            thumb_path = Path(tmp) / "thumb.jpg"
+            tf = subprocess.run(
+                [ffmpeg, "-y", "-ss", str(seek), "-i", str(src),
+                 "-frames:v", "1", "-q:v", "5",
+                 "-vf", "scale=320:-2",
+                 str(thumb_path)],
+                capture_output=True, timeout=15)
+            if tf.returncode == 0 and thumb_path.exists() and thumb_path.stat().st_size > 100:
+                result["thumb_bytes"] = thumb_path.read_bytes()
+    except Exception as e:
+        log.debug("_video_meta: %s", e)
+    return result
+
+
 def _send_one_chunk(chat_id, data_bytes: bytes, filename: str,
                     caption="", media_type="document") -> bool:
     """Send a single chunk using the correct Bale endpoint.
+    For videos: extracts duration + thumbnail frame via ffmpeg for proper player display.
     Uses _real_ext() so .part files from yt-dlp route as video/audio correctly.
     """
     ext = _real_ext(filename)
@@ -383,6 +435,40 @@ def _send_one_chunk(chat_id, data_bytes: bytes, filename: str,
 
     if media_type == "video" or ext in {"mp4","mkv","avi","mov","webm","m4v"}:
         extra["supports_streaming"] = "true"
+        # Extract duration + thumbnail for proper video player display
+        meta = _video_meta(data_bytes, filename)
+        if meta.get("duration"):
+            extra["duration"] = str(meta["duration"])
+        if meta.get("width"):
+            extra["width"]  = str(meta["width"])
+            extra["height"] = str(meta["height"])
+        thumb_bytes = meta.get("thumb_bytes")
+        if thumb_bytes:
+            # thumb must be sent as a separate multipart field
+            delay = 3
+            for attempt in range(3):
+                files = {
+                    "video": (filename,    io.BytesIO(data_bytes), _mime(filename)),
+                    "thumbnail": ("thumb.jpg", io.BytesIO(thumb_bytes), "image/jpeg"),
+                }
+                try:
+                    r = _session().post(f"{_base_url()}/sendVideo",
+                                        data=extra, files=files, timeout=180)
+                    resp = _safe_json(r)
+                    if resp.get("ok"):
+                        return True
+                    code = resp.get("error_code", 0)
+                    if code in (429, 500, 502, 503, 504) or r.status_code >= 500:
+                        time.sleep(delay); delay = min(delay*2, 30); continue
+                    log.error("sendVideo+thumb failed: %s  file=%s", resp, filename)
+                    break
+                except Exception as e:
+                    log.warning("sendVideo+thumb: %s retry %d", e, attempt+1)
+                    time.sleep(delay); delay = min(delay*2, 30)
+            else:
+                log.error("sendVideo+thumb: all retries failed for %s", filename)
+            # Fall through to plain sendVideo if thumb attempt completely failed
+            return _post_file("sendVideo", "video", filename, data_bytes, extra)
         return _post_file("sendVideo", "video", filename, data_bytes, extra)
     elif media_type == "audio" or ext in {"mp3","ogg","wav","flac","m4a","aac","opus"}:
         return _post_file("sendAudio", "audio", filename, data_bytes, extra)
@@ -5591,6 +5677,31 @@ def do_twitter_show(cid: int, tweet: dict):
         send_message(cid, "✅", reply_markup=home_kb())
 
 
+def _fetch_tweet_caption(tweet_url: str) -> str:
+    """Fetch tweet text via vxtwitter/fxtwitter API. Returns empty string on failure."""
+    tweet_url = tweet_url.replace("x.com/", "twitter.com/")
+    m = re.search(r"twitter\.com/([^/]+)/status/(\d+)", tweet_url)
+    if not m:
+        return ""
+    username, tweet_id = m.group(1), m.group(2)
+    for api_base in ["https://api.vxtwitter.com", "https://api.fxtwitter.com"]:
+        try:
+            r = WEB.get(f"{api_base}/{username}/status/{tweet_id}",
+                        headers={"User-Agent": UA_DESK}, timeout=10)
+            if r.status_code != 200:
+                continue
+            jdata = r.json()
+            tweet = jdata.get("tweet") or jdata
+            text = (tweet.get("text") or tweet.get("full_text") or
+                    tweet.get("tweetText") or "").strip()
+            if text:
+                log.info("_fetch_tweet_caption: got %d chars from %s", len(text), api_base)
+                return text[:1000]
+        except Exception as e:
+            log.debug("_fetch_tweet_caption %s: %s", api_base, e)
+    return ""
+
+
 def do_twitter_dl(cid: int, url: str):
     """Download media from a tweet URL."""
     bump(cid, "downloads")
@@ -5602,7 +5713,8 @@ def do_twitter_dl(cid: int, url: str):
                      reply_markup=home_kb())
         return
     data, fname = result
-    caption = get_state(cid).get("last_caption", "") or ""
+    # Use stored caption from state (set by do_twitter_show) or fetch now
+    caption = get_state(cid).get("last_caption", "") or _fetch_tweet_caption(url)
     smart_send(cid, data, fname, caption=caption[:1024])
     send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
     clear_state(cid)
@@ -5629,6 +5741,47 @@ def do_instagram_profile(cid: int, username: str):
     send_message(cid, f"📸 @{username} — {len(posts)} پست اخیر:", reply_markup=kb)
 
 
+def _fetch_instagram_caption(url: str) -> str:
+    """Fetch Instagram post caption via oEmbed API (no login needed for public posts)."""
+    try:
+        m = re.search(r"instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)", url)
+        if not m:
+            return ""
+        shortcode = m.group(1)
+        # Instagram oEmbed endpoint — works for public posts without auth
+        r = WEB.get(
+            f"https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/p/{shortcode}/",
+            headers={"User-Agent": UA_MOB, "Accept": "application/json"},
+            timeout=10)
+        if r.status_code == 200:
+            j = r.json()
+            title = j.get("title", "").strip()
+            author = j.get("author_name", "").strip()
+            if title:
+                cap = f"{title}"
+                if author:
+                    cap += f"\n\n— @{author}"
+                log.info("_fetch_instagram_caption: %d chars via oEmbed", len(cap))
+                return cap[:1000]
+    except Exception as e:
+        log.debug("_fetch_instagram_caption oEmbed: %s", e)
+
+    # Fallback: try the old oembed endpoint
+    try:
+        r = WEB.get(
+            f"https://graph.instagram.com/oembed?url={url}&omitscript=true",
+            headers={"User-Agent": UA_MOB}, timeout=10)
+        if r.status_code == 200:
+            j = r.json()
+            title = j.get("title", "").strip()
+            if title:
+                return title[:1000]
+    except Exception as e:
+        log.debug("_fetch_instagram_caption graph: %s", e)
+
+    return ""
+
+
 def do_instagram_dl(cid: int, url: str):
     """دانلود تمام رسانه‌های یک پست اینستاگرام (تکی / کاروسل / ریل) با کپشن کامل."""
     bump(cid, "downloads")
@@ -5636,7 +5789,6 @@ def do_instagram_dl(cid: int, url: str):
     chat_action(cid, "upload_video")
 
     items = instagram_download_all(url)
-    # Filter out empty/tiny items (< 5KB) that are likely broken
     items = [it for it in items if it.get("data") and len(it["data"]) > 5000]
 
     if not items:
@@ -5647,8 +5799,18 @@ def do_instagram_dl(cid: int, url: str):
             reply_markup=home_kb())
         return
 
-    caption = get_state(cid).get("last_caption", "") or ""
-    total   = len(items)
+    # Caption priority: instaloader already extracted it → oEmbed fallback → state
+    caption = ""
+    for it in items:
+        if it.get("caption"):
+            caption = it["caption"]
+            break
+    if not caption:
+        caption = get_state(cid).get("last_caption", "") or ""
+    if not caption:
+        caption = _fetch_instagram_caption(url)
+
+    total = len(items)
     log.info("do_instagram_dl: sending %d items, caption_len=%d", total, len(caption))
 
     if total > 1:
@@ -5656,7 +5818,6 @@ def do_instagram_dl(cid: int, url: str):
 
     sent = 0
     for i, item in enumerate(items):
-        # Send full caption only on first item
         item_caption = caption if i == 0 and caption else ""
         try:
             ok = smart_send(cid, item["data"], item["fname"],
