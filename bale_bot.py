@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.4)
+بله قربان — Bale Bot  (v2.5)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -1892,12 +1892,6 @@ def _cobalt_download_all(url: str, audio_only: bool = False,
         else:
             payload["downloadMode"] = "auto"
 
-        # Pass YouTube cookies to Cobalt if available (fixes error.api.youtube.login)
-        if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).exists():
-            # Cobalt doesn't accept cookie files directly, but we can try youtubeCookies
-            # For self-hosted, set COOKIE_YOUTUBE in cobalt's own .env instead
-            pass
-
         resp = WEB.post(
             f"{COBALT_URL}/",
             json=payload,
@@ -1919,38 +1913,76 @@ def _cobalt_download_all(url: str, audio_only: bool = False,
             log.warning("_cobalt_download_all: API error code=%s", code)
             return []
 
-        def _fetch_item(item_url: str, is_video: bool = True,
+        def _sniff_type(raw: bytes, item_url: str, content_type_hint: str = "") -> tuple[str, bool]:
+            """Return (ext, is_video) by inspecting magic bytes and content-type."""
+            ct = content_type_hint.lower()
+            # Magic bytes detection (most reliable)
+            if raw[:4] == b"\xff\xd8\xff\xe0" or raw[:4] == b"\xff\xd8\xff\xe1":
+                return "jpg", False   # JPEG
+            if raw[:8] == b"\x89PNG\r\n\x1a\n":
+                return "png", False   # PNG
+            if raw[:4] in (b"RIFF",) and raw[8:12] == b"WEBP":
+                return "webp", False  # WEBP
+            if raw[:4] == b"GIF8":
+                return "gif", False   # GIF
+            # MP4/MOV: ftyp box or moov atom near start
+            if raw[4:8] in (b"ftyp", b"moov", b"mdat", b"pnot", b"wide", b"free"):
+                return "mp4", True
+            if raw[:3] == b"ID3" or raw[:2] == b"\xff\xfb":
+                return "mp3", False   # Audio
+            # Content-type fallback
+            if "image/jpeg" in ct: return "jpg", False
+            if "image/png" in ct:  return "png", False
+            if "image/webp" in ct: return "webp", False
+            if "image/gif" in ct:  return "gif", False
+            if "video/" in ct:     return "mp4", True
+            if "audio/" in ct:     return "mp3", False
+            # URL extension fallback
+            url_lower = item_url.lower().split("?")[0]
+            for ext, is_vid in [(".jpg","jpg"), (".jpeg","jpg"), (".png","png"),
+                                 (".webp","webp"), (".gif","gif"), (".mp4","mp4"),
+                                 (".mov","mp4"), (".mp3","mp3")]:
+                if url_lower.endswith(ext):
+                    return is_vid, ext == ".mp4" or ext == ".mov"
+            # Default: assume video if large, image if small
+            is_vid = len(raw) > 2_000_000
+            return ("mp4" if is_vid else "jpg"), is_vid
+
+        def _fetch_item(item_url: str, is_video_hint: bool = True,
                         ext_hint: str = "") -> Optional[dict]:
             if not item_url:
                 return None
-            raw = download_bytes(item_url, MAX_FILE_SIZE * 2)
-            if not raw or len(raw) < 500:
+            try:
+                r = WEB.get(item_url, timeout=60, stream=False)
+                if not r.ok or len(r.content) < 500:
+                    return None
+                raw = r.content
+                ct = r.headers.get("content-type", "")
+                ext, is_video = _sniff_type(raw, item_url, ct)
+                if audio_only:
+                    is_video = False
+                domain_m = re.search(r"(?:https?://)?(?:www\.)?([^/]+)", url)
+                prefix = domain_m.group(1).split(".")[0] if domain_m else "media"
+                fname = f"{prefix}_media.{ext}"
+                log.info("cobalt item OK: %.1fMB %s is_video=%s", len(raw)/1024/1024, fname, is_video)
+                return {"data": raw, "fname": fname, "is_video": is_video}
+            except Exception as e:
+                log.warning("_fetch_item: %s", e)
                 return None
-            # Detect extension from URL or content-type hint
-            ext = ext_hint or ("mp4" if is_video else "jpg")
-            if "webp" in item_url.lower(): ext = "webp"
-            elif ".jpg" in item_url.lower() or ".jpeg" in item_url.lower(): ext = "jpg"
-            elif ".png" in item_url.lower(): ext = "png"
-            domain_m = re.search(r"(?:https?://)?(?:www\.)?([^/]+)", url)
-            prefix = domain_m.group(1).split(".")[0] if domain_m else "media"
-            fname = f"{prefix}_media.{ext}"
-            log.info("cobalt item OK: %.1fMB %s", len(raw)/1024/1024, fname)
-            return {"data": raw, "fname": fname, "is_video": is_video}
 
         # Single direct URL
         if j.get("url") and status in ("tunnel", "redirect", "stream"):
-            ext = "mp3" if audio_only else "mp4"
-            result = _fetch_item(j["url"], is_video=not audio_only, ext_hint=ext)
+            result = _fetch_item(j["url"], is_video_hint=not audio_only)
             return [result] if result else []
 
         # Picker = carousel / multiple items
         if j.get("picker"):
             results = []
             for item in j["picker"][:20]:  # max 20 slides
-                item_url = item.get("url", "")
+                item_url  = item.get("url", "")
                 item_type = item.get("type", "")
-                is_video = item_type == "video"
-                r = _fetch_item(item_url, is_video=is_video)
+                is_video_hint = item_type == "video"
+                r = _fetch_item(item_url, is_video_hint=is_video_hint)
                 if r:
                     results.append(r)
             log.info("cobalt picker: %d/%d items fetched",
@@ -2018,22 +2050,24 @@ def music_search_ytdlp(query: str, max_results: int = 5,
     if source in ("youtube", "ytmusic") and YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).exists():
         extra = ["--cookies", YOUTUBE_COOKIES_FILE]
 
+    # For SoundCloud: use webpage_url (the actual SC permalink) not url (raw API URL)
+    # For YouTube: webpage_url and url are the same watch?v= link
+    url_field = "%(webpage_url)s" if source == "soundcloud" else "%(url)s"
+
     try:
         if source == "ytmusic":
-            # For YT Music we search via yt-dlp's ytmusic extractor
-            search_url = f"https://music.youtube.com/search?q={urllib.parse.quote(query)}"
             cmd = ([YTDLP_BIN, "--flat-playlist", "--no-warnings", "--no-check-certificate",
                     "--ffmpeg-location", _ffmpeg_dir(), "--playlist-items", f"1-{max_results}"]
                    + extra
                    + ["--print",
-                      "%(id)s|||%(title)s|||%(uploader)s|||%(duration_string)s|||%(url)s|||%(thumbnail)s",
+                      f"%(id)s|||%(title)s|||%(uploader)s|||%(duration_string)s|||%(webpage_url)s|||%(thumbnail)s",
                       f"https://music.youtube.com/search?q={urllib.parse.quote(query)}"])
         else:
             cmd = ([YTDLP_BIN, "--flat-playlist", "--no-warnings", "--no-check-certificate",
                     "--ffmpeg-location", _ffmpeg_dir()]
                    + extra
                    + ["--print",
-                      "%(id)s|||%(title)s|||%(uploader)s|||%(duration_string)s|||%(url)s|||%(thumbnail)s",
+                      f"%(id)s|||%(title)s|||%(uploader)s|||%(duration_string)s|||{url_field}|||%(thumbnail)s",
                       search_url])
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -2052,6 +2086,9 @@ def music_search_ytdlp(query: str, max_results: int = 5,
             if not url or url in ("NA", "none", "None"):
                 if source in ("youtube", "ytmusic") and vid_id:
                     url = f"https://www.youtube.com/watch?v={vid_id}"
+                elif source == "soundcloud" and vid_id:
+                    # vid_id for SC is numeric; webpage_url should have been set but fallback
+                    url = ""  # don't guess — bad SC API URLs cause 404s
                 else:
                     url = ""
             if not thumb or thumb in ("NA", "none", "None"):
@@ -2060,6 +2097,10 @@ def music_search_ytdlp(query: str, max_results: int = 5,
                 else:
                     thumb = ""
             if not url or not title:
+                continue
+            # Reject raw SoundCloud API URLs (api.soundcloud.com/tracks/...) — they 404 on re-download
+            if source == "soundcloud" and "api.soundcloud.com" in url:
+                log.debug("SC search: skipping raw API URL %s", url)
                 continue
             display_source = "ytmusic" if source == "ytmusic" else source
             items.append({"id": vid_id, "title": title, "uploader": uploader,
@@ -2257,31 +2298,39 @@ def deezer_search(query: str, max_results: int = 5) -> list[dict]:
 
 
 def deezer_download(item: dict) -> Optional[tuple[bytes, str]]:
-    """Download a Deezer track — tries yt-dlp (deezer extractor) then YT fallback."""
-    log.info("deezer_download: %s", item.get("title", "?"))
-    url   = item.get("url", "")
-    title = item.get("title", "track")
+    """
+    Download a Deezer track.
+    Deezer URLs are DRM-protected — yt-dlp will never work.
+    We go straight to searching YouTube Music → YouTube → SoundCloud by title+artist.
+    """
+    title  = item.get("title", "")
     artist = item.get("uploader", "")
+    log.info("deezer_download: %s — %s", artist, title)
 
-    # Approach 1: yt-dlp native Deezer extractor (works if not geo-blocked)
-    if url:
-        result = music_download_ytdlp(url, source="deezer")
+    if not title:
+        return None
+
+    search_q = f"{artist} - {title}".strip(" -") if artist else title
+
+    # 1. YouTube Music
+    hits = music_search_ytdlp(search_q, max_results=2, source="ytmusic")
+    if not hits:
+        hits = music_search_ytdlp(search_q, max_results=2, source="youtube")
+    for hit in hits:
+        result = music_download_ytdlp(hit["url"], source="youtube")
         if result:
+            log.info("deezer_download: found via YouTube for %r", search_q)
             return result
 
-    # Approach 2: search YouTube Music for the same track and download
-    if title:
-        search_q = f"{artist} {title}".strip() if artist else title
-        yt_results = music_search_ytdlp(search_q, max_results=1, source="youtube")
-        if yt_results:
-            yt_url = yt_results[0].get("url", "")
-            if yt_url:
-                result = music_download_ytdlp(yt_url, source="youtube")
-                if result:
-                    log.info("deezer_download: fell back to YouTube for %s", title)
-                    return result
+    # 2. SoundCloud
+    sc_hits = music_search_ytdlp(search_q, max_results=2, source="soundcloud")
+    for hit in sc_hits:
+        result = music_download_ytdlp(hit["url"], source="soundcloud")
+        if result:
+            log.info("deezer_download: found via SoundCloud for %r", search_q)
+            return result
 
-    log.error("deezer_download: all methods failed for %s", title)
+    log.error("deezer_download: all methods failed for %r", search_q)
     return None
 
 
@@ -2332,18 +2381,31 @@ def music_search_multi(query: str) -> list[dict]:
 
 
 def music_download_ytdlp(url: str, source: str = "auto") -> Optional[tuple[bytes, str]]:
-    """Download audio via yt-dlp (YouTube/SoundCloud/etc.) → MP3."""
+    """Download audio via yt-dlp → MP3. Returns None on DRM or permanent failure."""
     log.info("music_download_ytdlp: %s source=%s", url, source)
     import shutil
     ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
     is_yt = "youtube.com" in url or "youtu.be" in url
+    is_sc = "soundcloud.com" in url
+
+    # Deezer is DRM-protected — never attempt, saves ~4×5s of wasted retries
+    if "deezer.com" in url:
+        log.warning("music_download_ytdlp: skipping DRM-protected Deezer URL")
+        return None
+
+    # Reject raw SoundCloud API URLs (not downloadable via yt-dlp)
+    if "api.soundcloud.com" in url and "soundcloud%3A" in url:
+        log.warning("music_download_ytdlp: skipping raw SC API URL %s", url)
+        return None
+
+    timeout = 120 if is_sc else 300   # SC tracks are small, fail fast
 
     def _run_audio(extra_args: list) -> Optional[tuple[bytes, str]]:
         with tempfile.TemporaryDirectory() as tmp:
             base = [
                 YTDLP_BIN, "--no-playlist", "--no-warnings", "--no-check-certificate",
                 "--ffmpeg-location", ffmpeg_dir,
-                "--socket-timeout", "30", "--retries", "3",
+                "--socket-timeout", "20", "--retries", "2",
                 "--max-filesize", "19M",
                 "-o", os.path.join(tmp, "%(title).60s.%(ext)s"),
             ]
@@ -2356,32 +2418,51 @@ def music_download_ytdlp(url: str, source: str = "auto") -> Optional[tuple[bytes
                 base += ["--proxy", WARP_PROXY]
             cmd = base + extra_args + [url]
             log.debug("music dl: %s", " ".join(cmd))
-            proc = subprocess.run(cmd, capture_output=True, timeout=300)
+            try:
+                proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                log.error("music dl: timed out after %ds", timeout)
+                return None
             if proc.returncode != 0:
-                log.error("music dl rc=%d: %s", proc.returncode,
-                          proc.stderr.decode(errors="replace")[:400])
+                stderr = proc.stderr.decode(errors="replace")
+                # Early-exit on permanent errors — no point retrying with different flags
+                if "DRM" in stderr or "is not supported" in stderr:
+                    log.error("music dl: DRM/unsupported: %s", stderr[:200])
+                    raise RuntimeError("DRM")
+                log.error("music dl rc=%d: %s", proc.returncode, stderr[:300])
                 return None
             files = [f for f in Path(tmp).glob("*")
-                     if f.suffix.lower() in {".mp3", ".m4a", ".ogg", ".opus", ".flac"}
+                     if f.suffix.lower() in {".mp3", ".m4a", ".ogg", ".opus", ".flac", ".webm"}
                      and f.stat().st_size > 1000]
             if not files:
                 return None
-            f = files[0]
-            data = f.read_bytes()
-            log.info("music dl OK: %s  %.1fMB", f.name, len(data)/1024/1024)
-            return data, f.name
+            best = max(files, key=lambda f: f.stat().st_size)
+            data = best.read_bytes()
+            log.info("music dl OK: %s  %.1fMB", best.name, len(data)/1024/1024)
+            return data, best.name
 
-    # Try progressively simpler format specs — avoids "Requested format not available"
-    for args in [
-        ["-x", "--audio-format", "mp3", "--audio-quality", "0",
+    # Format strategy:
+    # 1. Best audio → convert to mp3 (works for most public tracks)
+    # 2. bestaudio without conversion (fastest, keeps native format like opus/m4a)
+    # 3. Any audio extract (-x only)
+    # For YouTube "Requested format not available": bestaudio/best bypasses the issue
+    format_attempts = [
+        ["-f", "bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "0",
          "--embed-thumbnail", "--add-metadata"],
-        ["-x", "--audio-format", "mp3", "--audio-quality", "0"],
-        ["-x", "--audio-format", "mp3"],
+        ["-f", "bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "0"],
+        ["-f", "bestaudio/best", "-x"],
         ["-x"],
-    ]:
-        result = _run_audio(args)
-        if result:
-            return result
+    ]
+
+    try:
+        for args in format_attempts:
+            result = _run_audio(args)
+            if result:
+                return result
+    except RuntimeError as e:
+        if "DRM" in str(e):
+            return None
+        raise
 
     return None
 
@@ -2444,17 +2525,16 @@ def music_download_with_fallback(
     title: str = "",
     artist: str = "",
     source_hint: str = "auto",
-    status_cb=None,       # optional callable(str) to send progress messages
+    status_cb=None,
+    _tried_yt_ids: set = None,   # internal: YT video IDs already attempted
 ) -> Optional[tuple[bytes, str]]:
     """
-    Download music with a full platform fallback chain:
-      Spotify (spotdl) → YouTube Music → YouTube → SoundCloud → JioSaavn → Deezer
-
-    - query_or_url: either a direct URL or a search query string
-    - title/artist: used to build search queries for fallback steps
-    - source_hint: 'spotify'|'soundcloud'|'youtube'|'ytmusic'|'jiosaavn'|'deezer'|'auto'
-    - status_cb: optional function to send progress text to user
+    Full fallback chain: Spotify → YouTube Music → SoundCloud → JioSaavn → Deezer(→YT/SC)
+    Tracks already-tried YouTube IDs so the chain never retries the same video twice.
     """
+    if _tried_yt_ids is None:
+        _tried_yt_ids = set()
+
     def _cb(msg: str):
         if status_cb:
             try: status_cb(msg)
@@ -2462,8 +2542,7 @@ def music_download_with_fallback(
 
     is_url = query_or_url.startswith("http")
 
-    # Build the cleanest possible search query.
-    # Prefer explicit title/artist over the raw URL or a long video title.
+    # Cleanest possible search query
     if artist and title:
         search_q = f"{artist} - {title}"
     elif title:
@@ -2471,9 +2550,9 @@ def music_download_with_fallback(
     elif not is_url:
         search_q = query_or_url
     else:
-        search_q = ""   # URL-only call with no title — will be filled in per-step
+        search_q = ""
 
-    # ── Step 1: Spotify (only if it's a Spotify URL) ─────────────────────────
+    # ── Step 1: Spotify ───────────────────────────────────────────────────────
     if is_url and "spotify.com" in query_or_url:
         _cb("🟢 در حال دانلود از Spotify…")
         result = spotify_download(query_or_url)
@@ -2483,19 +2562,21 @@ def music_download_with_fallback(
         log.warning("fallback: Spotify failed, trying YouTube Music")
         _cb("⚠️ Spotify ناموفق — در حال جستجو در یوتیوب موزیک…")
 
-    # ── Step 2: YouTube / YouTube Music ──────────────────────────────────────
-    # If we have a direct YouTube URL, try it; otherwise search.
-    if is_url and ("youtube.com" in query_or_url or "youtu.be" in query_or_url):
-        # Already tried once in _do_audio_download; skip to save time
-        pass
-    else:
-        q = search_q or query_or_url
+    # ── Step 2: YouTube Music + YouTube ──────────────────────────────────────
+    # Skip if the original call was already a direct YT URL (tried in _do_audio_download)
+    skip_yt_search = is_url and ("youtube.com" in query_or_url or "youtu.be" in query_or_url)
+
+    if not skip_yt_search and search_q:
         _cb("🎵 در حال جستجو در یوتیوب موزیک…")
-        yt_hits = music_search_ytdlp(q, max_results=1, source="ytmusic")
+        yt_hits = music_search_ytdlp(search_q, max_results=3, source="ytmusic")
         if not yt_hits:
-            yt_hits = music_search_ytdlp(q, max_results=1, source="youtube")
-        if yt_hits:
-            result = music_download_ytdlp(yt_hits[0]["url"], source="youtube")
+            yt_hits = music_search_ytdlp(search_q, max_results=3, source="youtube")
+        for hit in yt_hits:
+            vid_id = hit.get("id", "") or hit.get("url", "")
+            if vid_id in _tried_yt_ids:
+                continue
+            _tried_yt_ids.add(vid_id)
+            result = music_download_ytdlp(hit["url"], source="youtube")
             if result:
                 log.info("fallback: YouTube Music search OK")
                 return result
@@ -2509,12 +2590,11 @@ def music_download_with_fallback(
         if result:
             log.info("fallback: SoundCloud direct OK")
             return result
-    else:
-        q = search_q or query_or_url
+    elif search_q:
         _cb("☁️ در حال جستجو در SoundCloud…")
-        sc_hits = music_search_ytdlp(q, max_results=1, source="soundcloud")
-        if sc_hits:
-            result = soundcloud_download(sc_hits[0]["url"])
+        sc_hits = music_search_ytdlp(search_q, max_results=3, source="soundcloud")
+        for hit in sc_hits:
+            result = soundcloud_download(hit["url"])
             if result:
                 log.info("fallback: SoundCloud search OK")
                 return result
@@ -2524,26 +2604,57 @@ def music_download_with_fallback(
     # ── Step 4: JioSaavn ─────────────────────────────────────────────────────
     if search_q:
         _cb("🎶 در حال جستجو در JioSaavn…")
-        saavn_hits = jiosaavn_search(search_q, max_results=1)
-        if saavn_hits:
-            result = jiosaavn_download(saavn_hits[0])
+        saavn_hits = jiosaavn_search(search_q, max_results=2)
+        for hit in saavn_hits:
+            result = jiosaavn_download(hit)
             if result:
                 log.info("fallback: JioSaavn OK")
                 return result
     log.warning("fallback: JioSaavn failed, trying Deezer")
     _cb("⚠️ JioSaavn ناموفق — در حال جستجو در Deezer…")
 
-    # ── Step 5: Deezer ────────────────────────────────────────────────────────
+    # ── Step 5: Deezer (metadata search → YT/SC download, no DRM) ────────────
+    # Note: deezer_download() itself searches YouTube and SoundCloud internally.
+    # We pass the already-tried IDs so it doesn't repeat failed videos.
     if search_q:
         _cb("🎧 در حال جستجو در Deezer…")
-        dz_hits = deezer_search(search_q, max_results=1)
-        if dz_hits:
-            result = deezer_download(dz_hits[0])
+        dz_hits = deezer_search(search_q, max_results=2)
+        for hit in dz_hits:
+            # deezer_download searches YT/SC — pass tried IDs to avoid repeats
+            result = _deezer_download_dedup(hit, _tried_yt_ids)
             if result:
-                log.info("fallback: Deezer OK")
+                log.info("fallback: Deezer metadata OK")
                 return result
 
     log.error("fallback: ALL sources failed for %r", search_q or query_or_url)
+    return None
+
+
+def _deezer_download_dedup(item: dict, tried_ids: set) -> Optional[tuple[bytes, str]]:
+    """Like deezer_download() but skips YouTube IDs already attempted."""
+    title  = item.get("title", "")
+    artist = item.get("uploader", "")
+    if not title:
+        return None
+    search_q = f"{artist} - {title}".strip(" -") if artist else title
+
+    for src in ("ytmusic", "youtube"):
+        hits = music_search_ytdlp(search_q, max_results=3, source=src)
+        for hit in hits:
+            vid_id = hit.get("id", "") or hit.get("url", "")
+            if vid_id in tried_ids:
+                continue
+            tried_ids.add(vid_id)
+            result = music_download_ytdlp(hit["url"], source="youtube")
+            if result:
+                return result
+
+    sc_hits = music_search_ytdlp(search_q, max_results=2, source="soundcloud")
+    for hit in sc_hits:
+        result = music_download_ytdlp(hit["url"], source="soundcloud")
+        if result:
+            return result
+
     return None
 
 
@@ -3193,13 +3304,28 @@ def instagram_download_all(url: str) -> list[dict]:
     """
     log.info("instagram_download_all: %s", url)
 
-    # Strategy 1: Cobalt API (handles reels and carousels — returns all slides)
+    # Strategy 1: Cobalt API
+    # - Reels/videos → tunnel → single mp4 ✓
+    # - Carousels → picker → multiple items ✓
+    # - Image-only posts → tunnel → Cobalt wraps it as a single-frame mp4 slideshow ✗
+    #   In that case Cobalt returns 1 item that our magic-byte sniffer will mark as
+    #   is_video=False (it's actually an image container). We use it only for reels.
     cobalt_items = _cobalt_download_all(url, audio_only=False)
     if cobalt_items:
-        # Cobalt returns all carousel items — wrap with caption placeholder
-        return [{"data": it["data"], "fname": it["fname"],
-                 "caption": "", "is_video": it.get("is_video", True)}
-                for it in cobalt_items]
+        # If Cobalt returned a picker (multiple items) — use them all
+        if len(cobalt_items) > 1:
+            log.info("instagram: cobalt picker with %d items", len(cobalt_items))
+            return [{"data": it["data"], "fname": it["fname"],
+                     "caption": "", "is_video": it.get("is_video", False)}
+                    for it in cobalt_items]
+        # Single item: if it's a real video (mp4 by magic bytes), use it (reel/video post)
+        single = cobalt_items[0]
+        if single.get("is_video", True):
+            log.info("instagram: cobalt single video item")
+            return [{"data": single["data"], "fname": single["fname"],
+                     "caption": "", "is_video": True}]
+        # Single non-video from cobalt = image post — fall through to get full carousel
+        log.info("instagram: cobalt returned single image, trying instaloader for carousel")
 
     # Strategy 2: instaloader (handles carousel / multiple slides natively)
     try:
@@ -3240,7 +3366,7 @@ def instagram_download_all(url: str) -> list[dict]:
                 f for f in all_files
                 if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"}
                 and f.stat().st_size > 1000
-            ][:20]  # max 20 slides
+            ][:20]
             log.info("instaloader: %d media files for %s", len(media_files), shortcode)
 
             for f in media_files:
@@ -3264,12 +3390,19 @@ def instagram_download_all(url: str) -> list[dict]:
         result = social_download_ytdlp(url, cookies_file=ig_cookies)
         if result:
             data, fname = result
-            return [{"data": data, "fname": fname, "caption": "", "is_video": True}]
+            is_video = fname.lower().endswith((".mp4", ".mov", ".webm"))
+            return [{"data": data, "fname": fname, "caption": "", "is_video": is_video}]
     except Exception as e:
         log.error("yt-dlp instagram: %s", e)
 
-    # Strategy 4: Instagram oEmbed API — returns thumbnail for photo posts
-    # Works for public posts without login
+    # Strategy 4: use the cobalt single image we already fetched, if any
+    if cobalt_items:
+        single = cobalt_items[0]
+        log.info("instagram: falling back to cobalt single image")
+        return [{"data": single["data"], "fname": single["fname"],
+                 "caption": "", "is_video": single.get("is_video", False)}]
+
+    # Strategy 5: Instagram oEmbed API — returns thumbnail for public photo posts
     try:
         m = re.search(r"instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)", url)
         if m:
@@ -3293,13 +3426,6 @@ def instagram_download_all(url: str) -> list[dict]:
         log.error("instagram media redirect: %s", e)
 
     return []
-    results = []
-
-    """Backward-compat single-item wrapper."""
-    items = instagram_download_all(url)
-    if items:
-        return items[0]["data"], items[0]["fname"]
-    return None
 
 
 
@@ -4700,6 +4826,7 @@ def _do_audio_download(cid: int, url: str, source: str = "auto",
         send_message(cid, text)
 
     result = None
+    tried_ids: set = set()
 
     # JioSaavn و Deezer نیاز به تابع دانلود اختصاصی دارند
     if source == "jiosaavn" and track_item:
@@ -4707,21 +4834,30 @@ def _do_audio_download(cid: int, url: str, source: str = "auto",
         if not result:
             result = music_download_with_fallback(
                 title or url, title=title, artist=artist,
-                source_hint=source, status_cb=_status)
+                source_hint=source, status_cb=_status,
+                _tried_yt_ids=tried_ids)
     elif source == "deezer" and track_item:
         result = deezer_download(track_item)
         if not result:
             result = music_download_with_fallback(
                 title or url, title=title, artist=artist,
-                source_hint=source, status_cb=_status)
+                source_hint=source, status_cb=_status,
+                _tried_yt_ids=tried_ids)
     else:
         # برای YouTube/SoundCloud — یک بار مستقیم امتحان، سپس fallback
+        # Extract YT video ID so fallback doesn't retry the same video
+        if "youtube.com" in url or "youtu.be" in url:
+            import urllib.parse as _up
+            qs = _up.parse_qs(_up.urlparse(url).query)
+            vid = qs.get("v", [""])[0] or url
+            tried_ids.add(vid)
         result = music_download_ytdlp(url, source=source)
         if not result:
             _status("⚠️ دانلود مستقیم ناموفق — در حال جستجو در منابع دیگر…")
             result = music_download_with_fallback(
                 url, title=title, artist=artist,
-                source_hint=source, status_cb=_status)
+                source_hint=source, status_cb=_status,
+                _tried_yt_ids=tried_ids)
 
     if not result:
         send_message(cid,
