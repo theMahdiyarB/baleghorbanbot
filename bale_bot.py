@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.6)
+بله قربان — Bale Bot  (v2.7)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -138,6 +138,10 @@ WARP_PROXY = os.getenv("WARP_PROXY", "")  # e.g. "socks5://127.0.0.1:40000"
 # Default assumes local instance on port 9000.
 # Set COBALT_URL= (empty) to disable, or point to a remote instance.
 COBALT_URL = os.getenv("COBALT_URL", "http://localhost:9000")
+
+# VirusTotal — free tier: 4 req/min, 500 req/day, 32MB max
+# Get your key at https://www.virustotal.com/gui/join-us
+VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
 
 ZLIB_DOMAINS = [
     "https://z-library.sk",
@@ -697,6 +701,77 @@ def send_photo(chat_id, img_bytes: bytes, caption="", reply_markup=None) -> bool
 def send_audio(chat_id, audio_bytes: bytes, filename: str, caption="") -> bool:
     return smart_send(chat_id, audio_bytes, filename, caption, media_type="audio")
 
+
+def send_media_group(chat_id, items: list[dict]) -> bool:
+    """
+    Send up to 10 photos/videos as a single album (media group).
+    Each item: {"data": bytes, "fname": str, "is_video": bool, "caption": str (first item only)}
+
+    Returns True if at least one item was sent successfully.
+    Bale supports sendMediaGroup identical to Telegram's API.
+    Falls back to sending one-by-one if the group call fails.
+    """
+    if not items:
+        return False
+    # Bale/Telegram limits: max 10 items per group
+    items = items[:10]
+
+    # Build multipart: media JSON + file fields
+    media_list = []
+    files      = {}
+    for i, item in enumerate(items):
+        field = f"file{i}"
+        is_vid = item.get("is_video", False)
+        mtype  = "video" if is_vid else "photo"
+        entry: dict = {"type": mtype, "media": f"attach://{field}"}
+        if i == 0 and item.get("caption"):
+            entry["caption"] = item["caption"][:1024]
+        if is_vid:
+            entry["supports_streaming"] = True
+            meta = _video_meta(item["data"], item["fname"])
+            if meta.get("duration"):
+                entry["duration"] = meta["duration"]
+            if meta.get("width"):
+                entry["width"]  = meta["width"]
+                entry["height"] = meta["height"]
+        media_list.append(entry)
+        mime = "video/mp4" if is_vid else "image/jpeg"
+        files[field] = (item["fname"], io.BytesIO(item["data"]), mime)
+
+    data   = {"chat_id": str(chat_id), "media": json.dumps(media_list)}
+    delay  = 3
+    for attempt in range(3):
+        try:
+            # Reset BytesIO positions for retry
+            for f in files.values():
+                f[1].seek(0)
+            r = _session().post(f"{_base_url()}/sendMediaGroup",
+                                data=data, files=files, timeout=180)
+            resp = _safe_json(r)
+            if resp.get("ok"):
+                log.info("send_media_group: OK %d items to %d", len(items), chat_id)
+                return True
+            code = resp.get("error_code", 0)
+            if code in (429, 500, 502, 503, 504) or r.status_code >= 500:
+                time.sleep(delay); delay = min(delay * 2, 30); continue
+            log.error("sendMediaGroup failed: %s", resp)
+            break
+        except Exception as e:
+            log.warning("sendMediaGroup attempt %d: %s", attempt + 1, e)
+            time.sleep(delay); delay = min(delay * 2, 30)
+
+    # Fallback: send individually
+    log.warning("send_media_group: falling back to individual sends")
+    sent = 0
+    for item in items:
+        mtype = "video" if item.get("is_video") else "photo"
+        cap   = item.get("caption", "")
+        ok    = smart_send(chat_id, item["data"], item["fname"],
+                           caption=cap, media_type=mtype)
+        if ok:
+            sent += 1
+    return sent > 0
+
 def chat_action(chat_id, action="typing"):
     if not chat_id or chat_id == 0:
         return
@@ -781,9 +856,10 @@ def main_menu_kb():
          {"text": "🌐 ترجمه",             "callback_data": "mode_translate"}],
         [{"text": "🖼 OCR متن از عکس",   "callback_data": "mode_ocr"},
          {"text": "🌐 IP / دامنه",        "callback_data": "mode_iplookup"}],
-        [{"text": "📊 آمار کاربری",       "callback_data": "stats"},
+        [{"text": "🛡 تشخیص ویروس",      "callback_data": "mode_virusscan"},
          {"text": "🔒 حریم خصوصی",       "callback_data": "privacy"}],
-        [{"text": "❓ راهنما",             "callback_data": "help"}],
+        [{"text": "📊 آمار کاربری",       "callback_data": "stats"},
+         {"text": "❓ راهنما",             "callback_data": "help"}],
     ]}
 
 def cancel_kb():
@@ -5677,45 +5753,250 @@ def do_twitter_show(cid: int, tweet: dict):
         send_message(cid, "✅", reply_markup=home_kb())
 
 
-def _fetch_tweet_caption(tweet_url: str) -> str:
-    """Fetch tweet text via vxtwitter/fxtwitter API. Returns empty string on failure."""
+def _fetch_tweet_data(tweet_url: str) -> dict:
+    """
+    Fetch full tweet metadata via vxtwitter/fxtwitter.
+    Returns dict with keys: text, author_name, author_handle, avatar_url,
+    likes, retweets, replies, views, created_at, media_urls, is_verified
+    """
     tweet_url = tweet_url.replace("x.com/", "twitter.com/")
     m = re.search(r"twitter\.com/([^/]+)/status/(\d+)", tweet_url)
     if not m:
-        return ""
+        return {}
     username, tweet_id = m.group(1), m.group(2)
     for api_base in ["https://api.vxtwitter.com", "https://api.fxtwitter.com"]:
         try:
             r = WEB.get(f"{api_base}/{username}/status/{tweet_id}",
-                        headers={"User-Agent": UA_DESK}, timeout=10)
+                        headers={"User-Agent": UA_DESK}, timeout=12)
             if r.status_code != 200:
                 continue
             jdata = r.json()
-            tweet = jdata.get("tweet") or jdata
-            text = (tweet.get("text") or tweet.get("full_text") or
-                    tweet.get("tweetText") or "").strip()
-            if text:
-                log.info("_fetch_tweet_caption: got %d chars from %s", len(text), api_base)
-                return text[:1000]
+            tw = jdata.get("tweet") or jdata
+            result = {
+                "text":          (tw.get("text") or tw.get("full_text") or tw.get("tweetText") or "").strip(),
+                "author_name":   tw.get("user_name") or tw.get("author") or username,
+                "author_handle": tw.get("user_screen_name") or tw.get("authorHandle") or username,
+                "avatar_url":    tw.get("user_profile_image_url") or tw.get("authorAvatar") or "",
+                "likes":         tw.get("likes") or tw.get("favorite_count") or 0,
+                "retweets":      tw.get("retweets") or tw.get("retweet_count") or 0,
+                "replies":       tw.get("replies") or tw.get("reply_count") or 0,
+                "views":         tw.get("views") or tw.get("view_count") or 0,
+                "created_at":    tw.get("date") or tw.get("created_at") or "",
+                "is_verified":   tw.get("is_verified") or tw.get("user_verified") or False,
+            }
+            if result["text"]:
+                log.info("_fetch_tweet_data: OK from %s (%d chars)", api_base, len(result["text"]))
+                return result
         except Exception as e:
-            log.debug("_fetch_tweet_caption %s: %s", api_base, e)
-    return ""
+            log.debug("_fetch_tweet_data %s: %s", api_base, e)
+    return {}
+
+
+def _render_tweet_card(tw: dict, tweet_url: str) -> Optional[bytes]:
+    """
+    Render a beautiful tweet card as PNG using Pillow.
+    Shows: avatar, name, handle, verified badge, tweet text,
+           date, and engagement stats (likes/retweets/replies/views).
+    No browser/Selenium needed.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import textwrap as _tw
+    except ImportError:
+        log.warning("_render_tweet_card: Pillow not installed")
+        return None
+
+    try:
+        # ── Layout constants ─────────────────────────────────────────────
+        W, PAD = 720, 28
+        BG      = (21,  32,  43)    # X dark background
+        CARD    = (30,  39,  50)    # card surface
+        TEXT    = (247, 249, 249)   # primary text
+        MUTED   = (113, 118, 123)   # secondary / muted
+        BLUE    = (29,  155, 240)   # X blue
+        LIKE    = (249,  24, 128)   # heart pink
+        BORDER  = (47,  51,  54)    # divider
+
+        # ── Fonts (system fallbacks) ──────────────────────────────────────
+        def _font(size: int, bold: bool = False):
+            candidates = (
+                ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                 "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                 "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"]
+                if bold else
+                ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                 "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                 "/usr/share/fonts/truetype/freefont/FreeSans.ttf"]
+            )
+            for p in candidates:
+                if Path(p).exists():
+                    return ImageFont.truetype(p, size)
+            return ImageFont.load_default()
+
+        font_name   = _font(17, bold=True)
+        font_handle = _font(15)
+        font_body   = _font(18)
+        font_small  = _font(14)
+        font_stats  = _font(15)
+
+        # ── Helper: measure text height ───────────────────────────────────
+        def text_h(text: str, font, max_w: int) -> int:
+            dummy = Image.new("RGB", (1, 1))
+            d = ImageDraw.Draw(dummy)
+            _, _, tw2, th = d.textbbox((0, 0), text, font=font)
+            return th
+
+        # ── Wrap tweet body ───────────────────────────────────────────────
+        body    = tw.get("text", "")
+        wrapped = _tw.fill(body, width=52)
+        lines   = wrapped.split("\n")
+        line_h  = text_h("Ag", font_body, W - PAD * 2) + 4
+        body_h  = len(lines) * line_h
+
+        # ── Total height ──────────────────────────────────────────────────
+        H = PAD + 56 + PAD + body_h + PAD + 22 + PAD + 2 + PAD + 38 + PAD
+
+        img  = Image.new("RGB", (W, H), CARD)
+        draw = ImageDraw.Draw(img)
+
+        # Rounded card outline
+        draw.rounded_rectangle([(1, 1), (W-2, H-2)], radius=16,
+                                outline=BORDER, width=1)
+
+        # ── Avatar ────────────────────────────────────────────────────────
+        av_size = 48
+        av_x, av_y = PAD, PAD
+        avatar_img = None
+        av_url = tw.get("avatar_url", "")
+        if av_url:
+            try:
+                av_data = WEB.get(av_url, timeout=8).content
+                from io import BytesIO as _BIO
+                avatar_img = Image.open(_BIO(av_data)).convert("RGBA").resize((av_size, av_size))
+                # Circular mask
+                mask = Image.new("L", (av_size, av_size), 0)
+                ImageDraw.Draw(mask).ellipse([(0,0),(av_size,av_size)], fill=255)
+                bg_patch = Image.new("RGBA", (av_size, av_size), CARD + (255,))
+                bg_patch.paste(avatar_img, mask=mask)
+                img.paste(bg_patch, (av_x, av_y), mask)
+            except Exception:
+                pass
+        if not avatar_img:
+            draw.ellipse([(av_x, av_y), (av_x+av_size, av_y+av_size)], fill=BLUE)
+
+        # ── Name + handle + X logo ────────────────────────────────────────
+        name_x = av_x + av_size + 12
+        name   = tw.get("author_name", "")[:28]
+        handle = f"@{tw.get('author_handle', '')}"
+        draw.text((name_x, av_y + 2),  name,   font=font_name,   fill=TEXT)
+        draw.text((name_x, av_y + 24), handle, font=font_handle, fill=MUTED)
+        # X logo (simple ✕ shape as text) top-right
+        draw.text((W - PAD - 20, av_y + 4), "𝕏", font=font_name, fill=MUTED)
+
+        # ── Tweet body ────────────────────────────────────────────────────
+        ty = av_y + av_size + PAD
+        for line in lines:
+            draw.text((PAD, ty), line, font=font_body, fill=TEXT)
+            ty += line_h
+
+        # ── Date ──────────────────────────────────────────────────────────
+        ty += 4
+        date_str = tw.get("created_at", "")
+        if date_str:
+            try:
+                from datetime import datetime as _dt
+                # Handle ISO and Twitter date formats
+                for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%a %b %d %H:%M:%S +0000 %Y",
+                            "%Y-%m-%dT%H:%M:%SZ"):
+                    try:
+                        dt = _dt.strptime(date_str, fmt)
+                        date_str = dt.strftime("%-I:%M %p · %b %-d, %Y")
+                        break
+                    except ValueError:
+                        continue
+            except Exception:
+                pass
+        draw.text((PAD, ty), date_str or "", font=font_small, fill=MUTED)
+        ty += 22
+
+        # ── Divider ───────────────────────────────────────────────────────
+        ty += PAD // 2
+        draw.line([(PAD, ty), (W - PAD, ty)], fill=BORDER, width=1)
+        ty += PAD // 2
+
+        # ── Stats row ─────────────────────────────────────────────────────
+        def _fmt(n) -> str:
+            try:
+                n = int(n)
+                if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+                if n >= 1_000:     return f"{n/1_000:.1f}K"
+                return str(n)
+            except Exception:
+                return "0"
+
+        stats = [
+            ("💬", tw.get("replies",  0), MUTED),
+            ("🔁", tw.get("retweets", 0), MUTED),
+            ("❤️", tw.get("likes",    0), LIKE),
+            ("👁",  tw.get("views",    0), MUTED),
+        ]
+        sx = PAD
+        for icon, val, color in stats:
+            label = f"{icon} {_fmt(val)}"
+            draw.text((sx, ty), label, font=font_stats, fill=color)
+            sx += 150
+
+        # ── Convert to PNG bytes ──────────────────────────────────────────
+        from io import BytesIO as _BIO2
+        buf = _BIO2()
+        img.save(buf, format="PNG", optimize=True)
+        buf.seek(0)
+        card_bytes = buf.read()
+        log.info("_render_tweet_card: rendered %dx%d  %.1fKB", W, H, len(card_bytes)/1024)
+        return card_bytes
+
+    except Exception as e:
+        log.error("_render_tweet_card: %s", e)
+        return None
 
 
 def do_twitter_dl(cid: int, url: str):
-    """Download media from a tweet URL."""
+    """Download media from a tweet, send tweet card + media + caption."""
     bump(cid, "downloads")
     send_message(cid, "⏳ در حال دانلود از توییت…")
     chat_action(cid, "upload_video")
+
+    # Fetch tweet metadata (caption + stats for card)
+    tw_data = _fetch_tweet_data(url)
+    caption = (get_state(cid).get("last_caption", "")
+               or tw_data.get("text", ""))
+
+    # Send tweet card image first
+    card_bytes = _render_tweet_card(tw_data, url) if tw_data else None
+    if card_bytes:
+        send_photo(cid, card_bytes, caption="")
+
+    # Download media
     result = twitter_download_media(url)
     if not result:
-        send_message(cid, "❌ دانلود ناموفق.\nاین توییت ممکن است رسانه نداشته باشد.",
-                     reply_markup=home_kb())
+        if not card_bytes:
+            send_message(cid, "❌ این توییت رسانه‌ای ندارد یا دانلود ناموفق بود.",
+                         reply_markup=home_kb())
+        else:
+            # Card was sent; no media is fine
+            if caption:
+                send_message(cid, caption[:4096])
+            send_message(cid, "✅ توییت ارسال شد.", reply_markup=home_kb())
+        clear_state(cid)
         return
+
     data, fname = result
-    # Use stored caption from state (set by do_twitter_show) or fetch now
-    caption = get_state(cid).get("last_caption", "") or _fetch_tweet_caption(url)
-    smart_send(cid, data, fname, caption=caption[:1024])
+    smart_send(cid, data, fname, caption="")
+
+    # Send caption as separate message if present
+    if caption:
+        send_message(cid, caption[:4096])
+
     send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
     clear_state(cid)
 
@@ -5799,12 +6080,11 @@ def do_instagram_dl(cid: int, url: str):
             reply_markup=home_kb())
         return
 
-    # Caption priority: instaloader already extracted it → oEmbed fallback → state
+    # Caption priority: instaloader → oEmbed → state
     caption = ""
     for it in items:
         if it.get("caption"):
-            caption = it["caption"]
-            break
+            caption = it["caption"]; break
     if not caption:
         caption = get_state(cid).get("last_caption", "") or ""
     if not caption:
@@ -5813,25 +6093,42 @@ def do_instagram_dl(cid: int, url: str):
     total = len(items)
     log.info("do_instagram_dl: sending %d items, caption_len=%d", total, len(caption))
 
-    if total > 1:
-        send_message(cid, f"📸 {total} تصویر/ویدیو یافت شد — در حال ارسال همه…")
+    BALE_CAPTION_LIMIT = 1024
 
-    sent = 0
-    for i, item in enumerate(items):
-        item_caption = caption if i == 0 and caption else ""
-        try:
-            ok = smart_send(cid, item["data"], item["fname"],
-                            caption=item_caption[:1024],
-                            media_type="video" if item.get("is_video") else "photo")
-            if ok:
-                sent += 1
-        except Exception as e:
-            log.error("do_instagram_dl item %d: %s", i, e)
-
-    if sent > 0:
-        send_message(cid, f"✅ {sent} از {total} مورد ارسال شد.", reply_markup=home_kb())
+    if total == 1:
+        # Single item — send with caption inline if it fits
+        item = items[0]
+        mtype = "video" if item.get("is_video") else "photo"
+        inline_cap = caption[:BALE_CAPTION_LIMIT] if len(caption) <= BALE_CAPTION_LIMIT else ""
+        smart_send(cid, item["data"], item["fname"],
+                   caption=inline_cap, media_type=mtype)
+        if caption and not inline_cap:
+            send_message(cid, caption[:4096])
     else:
-        send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+        # Multiple items — send as media group (album)
+        # Caption on first item only, but only if short enough; otherwise separate msg
+        group_items = []
+        for i, item in enumerate(items[:10]):
+            inline_cap = (caption[:BALE_CAPTION_LIMIT]
+                          if i == 0 and len(caption) <= BALE_CAPTION_LIMIT else "")
+            group_items.append({
+                "data":     item["data"],
+                "fname":    item["fname"],
+                "is_video": item.get("is_video", False),
+                "caption":  inline_cap,
+            })
+        send_media_group(cid, group_items)
+
+        # If more than 10 items, send the rest individually
+        for item in items[10:]:
+            mtype = "video" if item.get("is_video") else "photo"
+            smart_send(cid, item["data"], item["fname"], caption="", media_type=mtype)
+
+        # Send long caption as separate message
+        if caption and len(caption) > BALE_CAPTION_LIMIT:
+            send_message(cid, caption[:4096])
+
+    send_message(cid, f"✅ {total} مورد ارسال شد.", reply_markup=home_kb())
     clear_state(cid)
 
 
@@ -5857,8 +6154,25 @@ def do_tiktok_user(cid: int, username: str):
     send_message(cid, f"🎵 @{username} — {len(videos)} ویدیو اخیر:", reply_markup=kb)
 
 
+def _fetch_tiktok_caption(url: str) -> str:
+    """Fetch TikTok video title/description via yt-dlp --dump-json."""
+    try:
+        r = subprocess.run(
+            [YTDLP_BIN, "--no-warnings", "--no-check-certificate",
+             "--dump-json", "--no-playlist", url],
+            capture_output=True, text=True, timeout=20)
+        if r.returncode == 0:
+            import json as _j
+            info = _j.loads(r.stdout)
+            desc = info.get("description") or info.get("title") or ""
+            return desc.strip()[:2000]
+    except Exception as e:
+        log.debug("_fetch_tiktok_caption: %s", e)
+    return ""
+
+
 def do_tiktok_dl(cid: int, url: str):
-    """دانلود ویدیوی TikTok."""
+    """دانلود ویدیوی TikTok با کپشن کامل."""
     bump(cid, "downloads")
     send_message(cid, "⏳ در حال دانلود از TikTok…")
     chat_action(cid, "upload_video")
@@ -5867,12 +6181,240 @@ def do_tiktok_dl(cid: int, url: str):
         send_message(cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb())
         return
     data, fname = result
-    # Use stored caption from state if available
-    caption = get_state(cid).get("last_caption", "") or ""
-    smart_send(cid, data, fname, caption=caption[:1024])
+
+    # Caption: state (from timeline browse) → yt-dlp metadata fetch
+    caption = get_state(cid).get("last_caption", "") or _fetch_tiktok_caption(url)
+
+    BALE_CAPTION_LIMIT = 1024
+    inline_cap = caption[:BALE_CAPTION_LIMIT] if len(caption) <= BALE_CAPTION_LIMIT else ""
+    smart_send(cid, data, fname, caption=inline_cap)
+    if caption and not inline_cap:
+        send_message(cid, caption[:4096])
     send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
     clear_state(cid)
 
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VIRUS SCAN  (VirusTotal free API — 4 req/min, 500 req/day, 32MB max)
+# Set VIRUSTOTAL_API_KEY env var. Get key: https://www.virustotal.com/gui/join-us
+# ═══════════════════════════════════════════════════════════════════════════════
+
+VT_BASE = "https://www.virustotal.com/api/v3"
+
+def _vt_headers() -> dict:
+    return {"x-apikey": VIRUSTOTAL_API_KEY, "Accept": "application/json"}
+
+
+def virustotal_scan_file(data: bytes, filename: str) -> Optional[dict]:
+    """
+    Upload file to VirusTotal and wait for analysis result.
+    Returns analysis dict with keys: malicious, suspicious, clean, total,
+    verdict (clean/suspicious/malicious), detections (list of engine names).
+    Returns None on API error.
+    """
+    if not VIRUSTOTAL_API_KEY:
+        return None
+    if len(data) > 32 * 1024 * 1024:
+        return {"error": "فایل بزرگتر از ۳۲MB است — حد مجاز VirusTotal"}
+
+    log.info("virustotal_scan_file: %s  %.1fMB", filename, len(data)/1024/1024)
+    try:
+        # Step 1: Upload
+        files = {"file": (filename, io.BytesIO(data), "application/octet-stream")}
+        r = WEB.post(f"{VT_BASE}/files", headers=_vt_headers(), files=files, timeout=60)
+        if r.status_code == 429:
+            return {"error": "محدودیت نرخ VirusTotal — لطفاً یک دقیقه صبر کنید"}
+        if not r.ok:
+            log.error("VT upload: %d %s", r.status_code, r.text[:200])
+            return None
+        analysis_id = r.json().get("data", {}).get("id", "")
+        if not analysis_id:
+            return None
+
+        # Step 2: Poll for result (max 60s)
+        for attempt in range(12):
+            time.sleep(5)
+            ar = WEB.get(f"{VT_BASE}/analyses/{analysis_id}",
+                         headers=_vt_headers(), timeout=20)
+            if not ar.ok:
+                continue
+            aj = ar.json()
+            status = aj.get("data", {}).get("attributes", {}).get("status", "")
+            if status != "completed":
+                log.debug("VT poll %d: status=%s", attempt, status)
+                continue
+
+            stats = aj["data"]["attributes"].get("stats", {})
+            malicious  = stats.get("malicious",  0)
+            suspicious = stats.get("suspicious", 0)
+            undetected = stats.get("undetected", 0)
+            harmless   = stats.get("harmless",   0)
+            total      = malicious + suspicious + undetected + harmless
+
+            # Collect engine names that flagged it
+            results_map = aj["data"]["attributes"].get("results", {})
+            detections  = sorted([
+                f"{eng}: {res.get('result','?')}"
+                for eng, res in results_map.items()
+                if res.get("category") in ("malicious", "suspicious")
+            ])
+
+            verdict = ("malicious"  if malicious  > 0 else
+                       "suspicious" if suspicious > 0 else "clean")
+            log.info("VT result: %s  %d/%d malicious", verdict, malicious, total)
+            return {
+                "malicious":  malicious,
+                "suspicious": suspicious,
+                "clean":      undetected + harmless,
+                "total":      total,
+                "verdict":    verdict,
+                "detections": detections[:20],
+                "analysis_id": analysis_id,
+            }
+
+        return {"error": "تحلیل VirusTotal تمام نشد — بعداً دوباره امتحان کنید"}
+
+    except Exception as e:
+        log.error("virustotal_scan_file: %s", e)
+        return None
+
+
+def virustotal_scan_url(url: str) -> Optional[dict]:
+    """Scan a URL with VirusTotal. Returns same dict structure as file scan."""
+    if not VIRUSTOTAL_API_KEY:
+        return None
+    log.info("virustotal_scan_url: %s", url)
+    try:
+        import base64 as _b64
+        # Submit URL
+        r = WEB.post(f"{VT_BASE}/urls", headers=_vt_headers(),
+                     data={"url": url}, timeout=20)
+        if r.status_code == 429:
+            return {"error": "محدودیت نرخ VirusTotal — لطفاً یک دقیقه صبر کنید"}
+        if not r.ok:
+            return None
+        analysis_id = r.json().get("data", {}).get("id", "")
+        if not analysis_id:
+            return None
+
+        for attempt in range(12):
+            time.sleep(5)
+            ar = WEB.get(f"{VT_BASE}/analyses/{analysis_id}",
+                         headers=_vt_headers(), timeout=20)
+            if not ar.ok:
+                continue
+            aj = ar.json()
+            status = aj.get("data", {}).get("attributes", {}).get("status", "")
+            if status != "completed":
+                continue
+            stats      = aj["data"]["attributes"].get("stats", {})
+            malicious  = stats.get("malicious",  0)
+            suspicious = stats.get("suspicious", 0)
+            undetected = stats.get("undetected", 0)
+            harmless   = stats.get("harmless",   0)
+            total      = malicious + suspicious + undetected + harmless
+            results_map = aj["data"]["attributes"].get("results", {})
+            detections  = sorted([
+                f"{eng}: {res.get('result','?')}"
+                for eng, res in results_map.items()
+                if res.get("category") in ("malicious", "suspicious")
+            ])
+            verdict = ("malicious" if malicious > 0 else
+                       "suspicious" if suspicious > 0 else "clean")
+            return {"malicious": malicious, "suspicious": suspicious,
+                    "clean": undetected + harmless, "total": total,
+                    "verdict": verdict, "detections": detections[:20],
+                    "analysis_id": analysis_id}
+        return {"error": "تحلیل VirusTotal تمام نشد"}
+    except Exception as e:
+        log.error("virustotal_scan_url: %s", e)
+        return None
+
+
+def _format_vt_result(result: dict, name: str) -> str:
+    """Format VirusTotal result as a readable Persian message."""
+    if result.get("error"):
+        return f"⚠️ خطا: {result['error']}"
+
+    verdict   = result.get("verdict", "unknown")
+    malicious = result.get("malicious",  0)
+    suspicious= result.get("suspicious", 0)
+    total     = result.get("total",      0)
+    clean     = result.get("clean",      0)
+    aid       = result.get("analysis_id","")
+
+    emoji = "✅" if verdict == "clean" else "⚠️" if verdict == "suspicious" else "🚨"
+    verdict_fa = {"clean": "پاک", "suspicious": "مشکوک", "malicious": "مخرب"}.get(verdict, verdict)
+
+    lines = [
+        f"{emoji} *نتیجه بررسی:* {verdict_fa}",
+        f"📄 فایل/آدرس: `{name[:60]}`",
+        f"",
+        f"🔴 مخرب: {malicious} آنتی‌ویروس",
+        f"🟡 مشکوک: {suspicious} آنتی‌ویروس",
+        f"🟢 پاک: {clean} آنتی‌ویروس",
+        f"📊 مجموع بررسی‌شده: {total} آنتی‌ویروس",
+    ]
+    if result.get("detections"):
+        lines.append(f"\n⚠️ *موارد شناسایی‌شده:*")
+        for d in result["detections"][:10]:
+            lines.append(f"  • {d}")
+    if aid:
+        # Build VT report link from analysis ID
+        try:
+            import base64 as _b64
+            # Analysis IDs for files are file-SHA256-timestamp or url-base64
+            lines.append(f"\n🔗 [گزارش کامل در VirusTotal](https://www.virustotal.com/gui/file-analysis/{aid})")
+        except Exception:
+            pass
+    return "\n".join(lines)
+
+
+def do_virusscan(cid: int, data: bytes, filename: str):
+    """Scan uploaded file with VirusTotal and report result."""
+    if not VIRUSTOTAL_API_KEY:
+        send_message(cid,
+            "⚠️ کلید API VirusTotal تنظیم نشده است.\n"
+            "متغیر محیطی `VIRUSTOTAL_API_KEY` را تنظیم کنید.\n"
+            "کلید رایگان: https://www.virustotal.com/gui/join-us",
+            parse_mode="Markdown", reply_markup=home_kb())
+        return
+
+    size_mb = len(data) / 1024 / 1024
+    send_message(cid, f"🔍 در حال آپلود `{filename}` ({size_mb:.1f}MB) به VirusTotal…\n"
+                       "ممکن است تا ۶۰ ثانیه طول بکشد.",
+                 parse_mode="Markdown")
+    chat_action(cid, "typing")
+
+    result = virustotal_scan_file(data, filename)
+    if result is None:
+        send_message(cid, "❌ خطا در ارتباط با VirusTotal.", reply_markup=home_kb())
+        return
+
+    msg = _format_vt_result(result, filename)
+    send_message(cid, msg, parse_mode="Markdown", reply_markup=home_kb())
+    clear_state(cid)
+
+
+def do_virusscan_url(cid: int, url: str):
+    """Scan a URL with VirusTotal."""
+    if not VIRUSTOTAL_API_KEY:
+        send_message(cid,
+            "⚠️ کلید API VirusTotal تنظیم نشده است.",
+            reply_markup=home_kb())
+        return
+    send_message(cid, f"🔍 در حال بررسی آدرس در VirusTotal…")
+    chat_action(cid, "typing")
+    result = virustotal_scan_url(url)
+    if result is None:
+        send_message(cid, "❌ خطا در ارتباط با VirusTotal.", reply_markup=home_kb())
+        return
+    msg = _format_vt_result(result, url)
+    send_message(cid, msg, parse_mode="Markdown", reply_markup=home_kb())
+    clear_state(cid)
 
 
 def handle_message(msg: dict):
@@ -5908,6 +6450,24 @@ def handle_message(msg: dict):
         if st.get("mode") == "ocr" or not st.get("mode"):
             do_ocr_photo(cid, photos, msg["message_id"]); return
 
+    # Document / file upload
+    doc = msg.get("document")
+    if doc:
+        st = get_state(cid)
+        if st.get("mode") == "virusscan":
+            file_url = get_file_url(doc["file_id"])
+            if not file_url:
+                send_message(cid, "❌ دریافت فایل ناموفق بود.", reply_markup=home_kb())
+                return
+            file_data = download_bytes(file_url, 32 * 1024 * 1024)
+            if not file_data:
+                send_message(cid, "❌ دانلود فایل ناموفق بود.", reply_markup=home_kb())
+                return
+            fname = doc.get("file_name") or f"file_{doc['file_id'][:8]}"
+            threading.Thread(target=do_virusscan, args=(cid, file_data, fname),
+                             daemon=True).start()
+            return
+
     if not text: return
 
     st   = get_state(cid)
@@ -5926,6 +6486,8 @@ def handle_message(msg: dict):
         "gh_zip":       lambda: do_github_zip(cid, text),
         "gh_release":   lambda: do_github_release(cid, text),
         "translate":    lambda: do_translate(cid, text, st.get("target_lang","en")),
+        "virusscan":    lambda: do_virusscan_url(cid, text) if text.startswith("http") else
+                                send_message(cid, "🛡 لطفاً یک فایل ارسال کنید یا یک آدرس اینترنتی بنویسید."),
         "currency":     lambda: do_currency(cid, text),
         "iplookup":     lambda: do_ip_lookup(cid, text),
         "shorten":      lambda: do_shorten(cid, text),
@@ -6014,6 +6576,7 @@ def handle_callback(cb: dict):
         "mode_apk":       ("apk",       "📱 نام اپ یا شناسه پکیج را وارد کنید (مثال: org.telegram.messenger):"),
         "mode_iplookup":  ("iplookup",  "🌐 آدرس IP یا دامنه:"),
         "mode_rss":       ("rss",       "📰 آدرس فید RSS یا سایت خبری را وارد کنید:"),
+        "mode_virusscan": ("virusscan", "🛡 فایل خود را ارسال کنید تا بررسی شود\nیا یک آدرس اینترنتی بفرستید تا اسکن شود:"),
     }
     if data in mode_prompts:
         mode, prompt = mode_prompts[data]
