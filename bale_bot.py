@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.8)
+بله قربان — Bale Bot  (v2.9)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -7063,6 +7063,9 @@ def do_bluesky_dl(cid: int, url: str):
 def rkey_from_url(url: str) -> str:
     m = re.search(r"/post/([A-Za-z0-9]+)", url)
     return m.group(1) if m else "post"
+
+
+def handle_message(msg: dict):
     cid    = msg["chat"]["id"]
     text   = msg.get("text","")
     photos = msg.get("photo")
