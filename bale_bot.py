@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.7)
+بله قربان — Bale Bot  (v2.8)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -852,14 +852,15 @@ def main_menu_kb():
          {"text": "🐦 توییتر / X",        "callback_data": "mode_twitter"}],
         [{"text": "📸 اینستاگرام",        "callback_data": "mode_instagram"},
          {"text": "🎵 تیک‌تاک",           "callback_data": "mode_tiktok"}],
-        [{"text": "📰 اخبار RSS",         "callback_data": "mode_rss"},
-         {"text": "🌐 ترجمه",             "callback_data": "mode_translate"}],
-        [{"text": "🖼 OCR متن از عکس",   "callback_data": "mode_ocr"},
-         {"text": "🌐 IP / دامنه",        "callback_data": "mode_iplookup"}],
-        [{"text": "🛡 تشخیص ویروس",      "callback_data": "mode_virusscan"},
-         {"text": "🔒 حریم خصوصی",       "callback_data": "privacy"}],
-        [{"text": "📊 آمار کاربری",       "callback_data": "stats"},
-         {"text": "❓ راهنما",             "callback_data": "help"}],
+        [{"text": "🦋 بلواسکای",           "callback_data": "mode_bluesky"},
+         {"text": "📰 اخبار RSS",         "callback_data": "mode_rss"}],
+        [{"text": "🌐 ترجمه",             "callback_data": "mode_translate"},
+         {"text": "🖼 OCR متن از عکس",   "callback_data": "mode_ocr"}],
+        [{"text": "🌐 IP / دامنه",        "callback_data": "mode_iplookup"},
+         {"text": "🛡 تشخیص ویروس",      "callback_data": "mode_virusscan"}],
+        [{"text": "🔒 حریم خصوصی",       "callback_data": "privacy"},
+         {"text": "📊 آمار کاربری",       "callback_data": "stats"}],
+        [{"text": "❓ راهنما",             "callback_data": "help"}],
     ]}
 
 def cancel_kb():
@@ -893,6 +894,8 @@ def youtube_action_kb():
     return {"inline_keyboard": [
         [{"text": "📥 دانلود ویدیو",    "callback_data": "yt_video"},
          {"text": "🔍 جستجوی یوتیوب",  "callback_data": "yt_search"}],
+        [{"text": "🖼 کاور (Thumbnail)", "callback_data": "yt_thumb"},
+         {"text": "📊 آمار ویدیو",      "callback_data": "yt_stats"}],
         [{"text": "❌ انصراف",           "callback_data": "cancel"}],
     ]}
 
@@ -916,6 +919,7 @@ def twitter_kb():
     return {"inline_keyboard": [
         [{"text": "📰 پیام‌های کاربر",   "callback_data": "tw_timeline"},
          {"text": "📥 دانلود ویدیو/عکس","callback_data": "tw_dl"}],
+        [{"text": "🇮🇷 دانلود + ترجمه",  "callback_data": "tw_dl_translate"}],
         [{"text": "❌ انصراف",            "callback_data": "cancel"}],
     ]}
 
@@ -923,6 +927,9 @@ def instagram_kb():
     return {"inline_keyboard": [
         [{"text": "📋 پست‌های پروفایل",  "callback_data": "ig_profile"},
          {"text": "📥 دانلود پست/ریل",   "callback_data": "ig_dl"}],
+        [{"text": "🖼 عکس پروفایل",      "callback_data": "ig_profile_pic"},
+         {"text": "📸 اسکرین‌شات پروفایل","callback_data": "ig_profile_shot"}],
+        [{"text": "🔲 موزاییک پست",      "callback_data": "ig_mosaic"}],
         [{"text": "❌ انصراف",            "callback_data": "cancel"}],
     ]}
 
@@ -3358,15 +3365,10 @@ def twitter_get_channel(username: str, limit: int = 20) -> list[dict]:
     return []
 
 
-def twitter_download_media(tweet_url: str) -> Optional[tuple[bytes, str]]:
+def twitter_download_media(tweet_url: str) -> Optional[list[tuple[bytes, str]]]:
     """
-    Download video/image from a tweet.
-    0. Cobalt API (handles Twitter natively when self-hosted)
-    1. vxtwitter/fxtwitter API
-    2. yt-dlp with twitter cookies
-    3. yt-dlp via Nitter instances
-    4. Direct image scrape from Nitter HTML
-    5. Final Cobalt retry on original URL
+    Download ALL media (images + videos) from a tweet.
+    Returns list of (bytes, filename) tuples, or None on total failure.
     """
     log.info("twitter_download_media: %s", tweet_url)
     tweet_url = tweet_url.replace("x.com/", "twitter.com/")
@@ -3374,12 +3376,15 @@ def twitter_download_media(tweet_url: str) -> Optional[tuple[bytes, str]]:
     username = m.group(1) if m else ""
     tweet_id = m.group(2) if m else ""
 
-    # Strategy 0: Cobalt API (self-hosted handles Twitter well)
-    cobalt = _cobalt_download(tweet_url)
-    if cobalt:
-        return cobalt
+    # Strategy 0: Cobalt API (handles multi-image picker)
+    cobalt_items = _cobalt_download_all(tweet_url, audio_only=False)
+    if cobalt_items:
+        results = [(it["data"], it["fname"]) for it in cobalt_items if it.get("data")]
+        if results:
+            log.info("twitter_download_media: cobalt %d items", len(results))
+            return results
 
-    # Strategy 1: vxtwitter / fxtwitter API
+    # Strategy 1: vxtwitter / fxtwitter — collect ALL media in one pass
     if username and tweet_id:
         for api_url in [
             f"https://api.vxtwitter.com/{username}/status/{tweet_id}",
@@ -3387,7 +3392,6 @@ def twitter_download_media(tweet_url: str) -> Optional[tuple[bytes, str]]:
         ]:
             try:
                 r = WEB.get(api_url, headers={"User-Agent": UA_DESK}, timeout=15)
-                log.debug("vxtwitter %s: status=%d", api_url, r.status_code)
                 if r.status_code != 200:
                     continue
                 jdata = r.json()
@@ -3395,19 +3399,22 @@ def twitter_download_media(tweet_url: str) -> Optional[tuple[bytes, str]]:
                 media_list = (tweet.get("media", {}).get("all", []) or
                               tweet.get("media_extended", []) or
                               tweet.get("media", []))
-                for media in media_list:
+                collected = []
+                for idx, media in enumerate(media_list):
                     murl  = (media.get("url") or media.get("media_url_https") or "")
                     mtype = media.get("type", "")
                     if not murl:
                         continue
-                    log.info("vxtwitter: type=%s url=%s", mtype, murl[:80])
+                    log.info("vxtwitter: item %d type=%s url=%s", idx, mtype, murl[:80])
                     content = download_bytes(murl)
                     if content and len(content) > 1000:
                         ext = "mp4" if mtype == "video" else \
                               murl.rsplit(".", 1)[-1].split("?")[0] or "jpg"
-                        fname = f"tweet_{tweet_id}.{ext}"
-                        log.info("vxtwitter OK: %.1fMB", len(content)/1024/1024)
-                        return content, fname
+                        fname = f"tweet_{tweet_id}_{idx}.{ext}"
+                        collected.append((content, fname))
+                if collected:
+                    log.info("vxtwitter OK: %d items", len(collected))
+                    return collected
             except Exception as e:
                 log.warning("vxtwitter %s: %s", api_url, e)
 
@@ -3415,16 +3422,15 @@ def twitter_download_media(tweet_url: str) -> Optional[tuple[bytes, str]]:
     cookies = TWITTER_COOKIES_FILE if TWITTER_COOKIES_FILE else ""
     result = social_download_ytdlp(tweet_url, cookies_file=cookies)
     if result:
-        return result
+        return [result]
 
     # Strategy 3: yt-dlp via Nitter
     if username and tweet_id:
         for instance in NITTER_INSTANCES:
             nitter_url = f"{instance}/{username}/status/{tweet_id}"
-            log.debug("Nitter yt-dlp: %s", nitter_url)
             r2 = social_download_ytdlp(nitter_url)
             if r2:
-                return r2
+                return [r2]
 
     # Strategy 4: scrape images from Nitter HTML
     if username and tweet_id:
@@ -3435,6 +3441,7 @@ def twitter_download_media(tweet_url: str) -> Optional[tuple[bytes, str]]:
                 if page.status_code != 200:
                     continue
                 soup = BeautifulSoup(page.text, "html.parser")
+                collected = []
                 for img in soup.select(".still-image img, .attachment img"):
                     src = img.get("src", "")
                     if not src:
@@ -3442,16 +3449,12 @@ def twitter_download_media(tweet_url: str) -> Optional[tuple[bytes, str]]:
                     full = f"{instance}{src}" if src.startswith("/") else src
                     content = download_bytes(full, MAX_IMAGE_SIZE)
                     if content and len(content) > 1000:
-                        fname = f"tweet_{tweet_id}.jpg"
-                        log.info("Nitter img scrape OK: %dKB", len(content)//1024)
-                        return content, fname
+                        collected.append((content, f"tweet_{tweet_id}_{len(collected)}.jpg"))
+                if collected:
+                    log.info("Nitter img scrape OK: %d items", len(collected))
+                    return collected
             except Exception as e:
                 log.warning("Nitter scrape %s: %s", instance, e)
-
-    # Strategy 5: Cobalt API — handles Twitter/X natively
-    cobalt_result = _social_cobalt(tweet_url)
-    if cobalt_result:
-        return cobalt_result
 
     log.error("twitter_download_media: all strategies failed for %s", tweet_url)
     return None
@@ -5794,207 +5797,265 @@ def _fetch_tweet_data(tweet_url: str) -> dict:
 
 def _render_tweet_card(tw: dict, tweet_url: str) -> Optional[bytes]:
     """
-    Render a beautiful tweet card as PNG using Pillow.
-    Shows: avatar, name, handle, verified badge, tweet text,
-           date, and engagement stats (likes/retweets/replies/views).
-    No browser/Selenium needed.
+    Render a tweet card as PNG: Vazirmatn font, RTL support, media embed, X dark theme.
     """
     try:
         from PIL import Image, ImageDraw, ImageFont
+        from io import BytesIO as _BIO
         import textwrap as _tw
     except ImportError:
         log.warning("_render_tweet_card: Pillow not installed")
         return None
-
     try:
-        # ── Layout constants ─────────────────────────────────────────────
-        W, PAD = 720, 28
-        BG      = (21,  32,  43)    # X dark background
-        CARD    = (30,  39,  50)    # card surface
-        TEXT    = (247, 249, 249)   # primary text
-        MUTED   = (113, 118, 123)   # secondary / muted
-        BLUE    = (29,  155, 240)   # X blue
-        LIKE    = (249,  24, 128)   # heart pink
-        BORDER  = (47,  51,  54)    # divider
+        # Download / cache Vazirmatn font
+        font_dir  = Path(tempfile.gettempdir()) / "bot_fonts"
+        font_dir.mkdir(exist_ok=True)
+        font_reg  = font_dir / "Vazirmatn-Regular.ttf"
+        font_bold = font_dir / "Vazirmatn-Bold.ttf"
+        VAZIR_URLS = {
+            font_reg:  "https://github.com/rastikerdar/vazirmatn/raw/master/fonts/ttf/Vazirmatn-Regular.ttf",
+            font_bold: "https://github.com/rastikerdar/vazirmatn/raw/master/fonts/ttf/Vazirmatn-Bold.ttf",
+        }
+        for fpath, furl in VAZIR_URLS.items():
+            if not fpath.exists() or fpath.stat().st_size < 10000:
+                try:
+                    fpath.write_bytes(WEB.get(furl, timeout=15).content)
+                    log.info("tweet card: downloaded %s", fpath.name)
+                except Exception as fe:
+                    log.warning("font dl: %s", fe)
 
-        # ── Fonts (system fallbacks) ──────────────────────────────────────
-        def _font(size: int, bold: bool = False):
-            candidates = (
-                ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                 "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-                 "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"]
-                if bold else
-                ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                 "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-                 "/usr/share/fonts/truetype/freefont/FreeSans.ttf"]
-            )
-            for p in candidates:
-                if Path(p).exists():
-                    return ImageFont.truetype(p, size)
+        def _fnt(size, bold=False):
+            p = font_bold if bold else font_reg
+            if p.exists():
+                try: return ImageFont.truetype(str(p), size)
+                except Exception: pass
+            for fb in (["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"] if bold
+                       else ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]):
+                if Path(fb).exists(): return ImageFont.truetype(fb, size)
             return ImageFont.load_default()
 
-        font_name   = _font(17, bold=True)
-        font_handle = _font(15)
-        font_body   = _font(18)
-        font_small  = _font(14)
-        font_stats  = _font(15)
+        W, PAD = 720, 28
+        INNER  = W - PAD * 2
+        CARD   = (21,  32,  43)
+        TEXT   = (231, 233, 234)
+        MUTED  = (113, 118, 123)
+        BLUE   = (29,  155, 240)
+        LIKE_C = (249,  24, 128)
+        BORDER = (47,   51,  54)
 
-        # ── Helper: measure text height ───────────────────────────────────
-        def text_h(text: str, font, max_w: int) -> int:
-            dummy = Image.new("RGB", (1, 1))
-            d = ImageDraw.Draw(dummy)
-            _, _, tw2, th = d.textbbox((0, 0), text, font=font)
-            return th
+        fn_name   = _fnt(17, bold=True)
+        fn_handle = _fnt(15)
+        fn_body   = _fnt(17)
+        fn_small  = _fnt(13)
+        fn_stats  = _fnt(15)
 
-        # ── Wrap tweet body ───────────────────────────────────────────────
-        body    = tw.get("text", "")
-        wrapped = _tw.fill(body, width=52)
-        lines   = wrapped.split("\n")
-        line_h  = text_h("Ag", font_body, W - PAD * 2) + 4
-        body_h  = len(lines) * line_h
+        def _bb(text, font):
+            d = ImageDraw.Draw(Image.new("RGB", (1,1)))
+            b = d.textbbox((0,0), text, font=font)
+            return b[2]-b[0], b[3]-b[1]
 
-        # ── Total height ──────────────────────────────────────────────────
-        H = PAD + 56 + PAD + body_h + PAD + 22 + PAD + 2 + PAD + 38 + PAD
+        def _is_rtl(text):
+            return any("\u0600" <= c <= "\u06FF" or "\uFB50" <= c <= "\uFDFF"
+                       or "\uFE70" <= c <= "\uFEFF" for c in text)
 
-        img  = Image.new("RGB", (W, H), CARD)
-        draw = ImageDraw.Draw(img)
+        def _draw_line(draw, y, text, font, fill):
+            if _is_rtl(text):
+                tw2, _ = _bb(text, font)
+                draw.text((PAD + INNER - tw2, y), text, font=font, fill=fill)
+            else:
+                draw.text((PAD, y), text, font=font, fill=fill)
 
-        # Rounded card outline
-        draw.rounded_rectangle([(1, 1), (W-2, H-2)], radius=16,
-                                outline=BORDER, width=1)
+        def _wrap(text, font):
+            lines = []
+            cw, _ = _bb("م", fn_body)
+            cpl = max(20, int(INNER / max(cw, 1)))
+            for para in text.split("\n"):
+                if not para.strip():
+                    lines.append("")
+                    continue
+                lines.extend(_tw.wrap(para, width=cpl) or [""])
+            return lines
 
-        # ── Avatar ────────────────────────────────────────────────────────
-        av_size = 48
-        av_x, av_y = PAD, PAD
-        avatar_img = None
-        av_url = tw.get("avatar_url", "")
-        if av_url:
+        # Avatar
+        av_size, avatar = 48, None
+        if tw.get("avatar_url"):
             try:
-                av_data = WEB.get(av_url, timeout=8).content
-                from io import BytesIO as _BIO
-                avatar_img = Image.open(_BIO(av_data)).convert("RGBA").resize((av_size, av_size))
-                # Circular mask
+                av_data = WEB.get(tw["avatar_url"], timeout=8).content
+                av = Image.open(_BIO(av_data)).convert("RGBA").resize((av_size, av_size))
                 mask = Image.new("L", (av_size, av_size), 0)
                 ImageDraw.Draw(mask).ellipse([(0,0),(av_size,av_size)], fill=255)
-                bg_patch = Image.new("RGBA", (av_size, av_size), CARD + (255,))
-                bg_patch.paste(avatar_img, mask=mask)
-                img.paste(bg_patch, (av_x, av_y), mask)
-            except Exception:
-                pass
-        if not avatar_img:
-            draw.ellipse([(av_x, av_y), (av_x+av_size, av_y+av_size)], fill=BLUE)
+                base = Image.new("RGBA", (av_size, av_size), CARD+(255,))
+                base.paste(av, mask=mask)
+                avatar = base
+            except Exception: pass
 
-        # ── Name + handle + X logo ────────────────────────────────────────
-        name_x = av_x + av_size + 12
-        name   = tw.get("author_name", "")[:28]
-        handle = f"@{tw.get('author_handle', '')}"
-        draw.text((name_x, av_y + 2),  name,   font=font_name,   fill=TEXT)
-        draw.text((name_x, av_y + 24), handle, font=font_handle, fill=MUTED)
-        # X logo (simple ✕ shape as text) top-right
-        draw.text((W - PAD - 20, av_y + 4), "𝕏", font=font_name, fill=MUTED)
+        # Embedded media thumbnail
+        media_img = None
+        try:
+            tw_clean = tweet_url.replace("x.com/", "twitter.com/")
+            mx = re.search(r"twitter\.com/([^/]+)/status/(\d+)", tw_clean)
+            if mx:
+                u2, tid = mx.group(1), mx.group(2)
+                for api_b in ["https://api.vxtwitter.com","https://api.fxtwitter.com"]:
+                    try:
+                        rj = WEB.get(f"{api_b}/{u2}/status/{tid}",
+                                     headers={"User-Agent": UA_DESK}, timeout=10).json()
+                        tw_obj = rj.get("tweet") or rj
+                        ml = (tw_obj.get("media",{}).get("all",[]) or
+                              tw_obj.get("media_extended",[]) or [])
+                        for med in ml:
+                            thumb = med.get("thumbnail_url") or med.get("media_url_https","")
+                            if thumb and "pbs.twimg" in thumb:
+                                mi_data = WEB.get(thumb+":large", timeout=10).content
+                                mi = Image.open(_BIO(mi_data)).convert("RGB")
+                                ratio = INNER / mi.width
+                                mi = mi.resize((INNER, int(mi.height*ratio)), Image.LANCZOS)
+                                media_img = mi
+                                break
+                        if media_img: break
+                    except Exception: continue
+        except Exception: pass
 
-        # ── Tweet body ────────────────────────────────────────────────────
-        ty = av_y + av_size + PAD
-        for line in lines:
-            draw.text((PAD, ty), line, font=font_body, fill=TEXT)
-            ty += line_h
+        # Body lines
+        body   = tw.get("text", "")
+        blines = _wrap(body, fn_body)
+        lh     = _bb("Agم", fn_body)[1] + 5
+        body_h = len(blines) * lh
 
-        # ── Date ──────────────────────────────────────────────────────────
-        ty += 4
-        date_str = tw.get("created_at", "")
+        # Date
+        date_str = tw.get("created_at","")
         if date_str:
             try:
                 from datetime import datetime as _dt
-                # Handle ISO and Twitter date formats
-                for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%a %b %d %H:%M:%S +0000 %Y",
-                            "%Y-%m-%dT%H:%M:%SZ"):
-                    try:
-                        dt = _dt.strptime(date_str, fmt)
-                        date_str = dt.strftime("%-I:%M %p · %b %-d, %Y")
-                        break
-                    except ValueError:
-                        continue
-            except Exception:
-                pass
-        draw.text((PAD, ty), date_str or "", font=font_small, fill=MUTED)
-        ty += 22
+                for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ","%a %b %d %H:%M:%S +0000 %Y",
+                            "%Y-%m-%dT%H:%M:%SZ","%Y-%m-%dT%H:%M:%S"):
+                    try: date_str = _dt.strptime(date_str,fmt).strftime("%-I:%M %p · %b %-d, %Y"); break
+                    except ValueError: continue
+            except Exception: pass
 
-        # ── Divider ───────────────────────────────────────────────────────
-        ty += PAD // 2
-        draw.line([(PAD, ty), (W - PAD, ty)], fill=BORDER, width=1)
-        ty += PAD // 2
+        # Height
+        MH = (media_img.height + PAD) if media_img else 0
+        H  = PAD + av_size + PAD + body_h + PAD + MH + 22 + PAD//2 + 1 + PAD//2 + 28 + PAD
 
-        # ── Stats row ─────────────────────────────────────────────────────
-        def _fmt(n) -> str:
+        img  = Image.new("RGB", (W, H), CARD)
+        draw = ImageDraw.Draw(img)
+        draw.rounded_rectangle([(1,1),(W-2,H-2)], radius=12, outline=BORDER, width=1)
+
+        # Avatar row
+        if avatar: img.paste(avatar, (PAD, PAD), avatar)
+        else: draw.ellipse([(PAD,PAD),(PAD+av_size,PAD+av_size)], fill=BLUE)
+
+        nx = PAD + av_size + 12
+        draw.text((nx, PAD+2),  tw.get("author_name","")[:30], font=fn_name,   fill=TEXT)
+        handle_str = "@" + tw.get("author_handle", "")
+        draw.text((nx, PAD+24), handle_str, font=fn_handle, fill=MUTED)
+        xw, _ = _bb("𝕏", fn_name)
+        draw.text((W-PAD-xw, PAD+4), "𝕏", font=fn_name, fill=MUTED)
+
+        # Body
+        ty = PAD + av_size + PAD
+        for line in blines:
+            _draw_line(draw, ty, line, fn_body, TEXT)
+            ty += lh
+
+        # Media
+        if media_img:
+            ty += PAD//2
+            rmask = Image.new("L", media_img.size, 0)
+            ImageDraw.Draw(rmask).rounded_rectangle(
+                [(0,0),(media_img.width-1,media_img.height-1)], radius=10, fill=255)
+            img.paste(media_img, (PAD, ty), rmask)
+            ty += media_img.height + PAD//2
+
+        # Date
+        ty += PAD//4
+        draw.text((PAD, ty), date_str, font=fn_small, fill=MUTED)
+        ty += 22 + PAD//2
+
+        # Divider
+        draw.line([(PAD,ty),(W-PAD,ty)], fill=BORDER, width=1)
+        ty += PAD//2
+
+        # Stats
+        def _fmt(n):
             try:
-                n = int(n)
+                n = int(n or 0)
                 if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
                 if n >= 1_000:     return f"{n/1_000:.1f}K"
                 return str(n)
-            except Exception:
-                return "0"
+            except: return "0"
 
-        stats = [
-            ("💬", tw.get("replies",  0), MUTED),
-            ("🔁", tw.get("retweets", 0), MUTED),
-            ("❤️", tw.get("likes",    0), LIKE),
-            ("👁",  tw.get("views",    0), MUTED),
-        ]
-        sx = PAD
+        stats = [("💬", tw.get("replies",0), MUTED),
+                 ("🔁", tw.get("retweets",0), MUTED),
+                 ("❤",  tw.get("likes",0),    LIKE_C),
+                 ("👁",  tw.get("views",0),    MUTED)]
+        sx, col_w = PAD, INNER//4
         for icon, val, color in stats:
-            label = f"{icon} {_fmt(val)}"
-            draw.text((sx, ty), label, font=font_stats, fill=color)
-            sx += 150
+            draw.text((sx, ty), f"{icon} {_fmt(val)}", font=fn_stats, fill=color)
+            sx += col_w
 
-        # ── Convert to PNG bytes ──────────────────────────────────────────
-        from io import BytesIO as _BIO2
-        buf = _BIO2()
+        buf = _BIO()
         img.save(buf, format="PNG", optimize=True)
-        buf.seek(0)
-        card_bytes = buf.read()
-        log.info("_render_tweet_card: rendered %dx%d  %.1fKB", W, H, len(card_bytes)/1024)
+        card_bytes = buf.getvalue()
+        log.info("_render_tweet_card: %dx%d  %.1fKB", W, H, len(card_bytes)/1024)
         return card_bytes
 
     except Exception as e:
-        log.error("_render_tweet_card: %s", e)
+        log.error("_render_tweet_card: %s", e, exc_info=True)
         return None
 
 
-def do_twitter_dl(cid: int, url: str):
-    """Download media from a tweet, send tweet card + media + caption."""
+def do_twitter_dl(cid: int, url: str, _tw_data_override: dict = None):
+    """Download ALL media from a tweet, send tweet card + media group + caption."""
     bump(cid, "downloads")
     send_message(cid, "⏳ در حال دانلود از توییت…")
     chat_action(cid, "upload_video")
 
-    # Fetch tweet metadata (caption + stats for card)
-    tw_data = _fetch_tweet_data(url)
-    caption = (get_state(cid).get("last_caption", "")
-               or tw_data.get("text", ""))
+    tw_data = _tw_data_override or _fetch_tweet_data(url)
+    caption = get_state(cid).get("last_caption", "") or tw_data.get("text", "")
 
-    # Send tweet card image first
+    # If override has translated text, show original in card, translated in caption msg
+    original_text = tw_data.get("_original_text", "")
+
     card_bytes = _render_tweet_card(tw_data, url) if tw_data else None
     if card_bytes:
         send_photo(cid, card_bytes, caption="")
 
-    # Download media
-    result = twitter_download_media(url)
-    if not result:
+    results = twitter_download_media(url)
+    if not results:
         if not card_bytes:
             send_message(cid, "❌ این توییت رسانه‌ای ندارد یا دانلود ناموفق بود.",
                          reply_markup=home_kb())
         else:
-            # Card was sent; no media is fine
             if caption:
-                send_message(cid, caption[:4096])
+                if original_text:
+                    send_message(cid, f"🌐 *ترجمه:*\n{caption[:4096]}", parse_mode="Markdown")
+                    send_message(cid, f"📝 *متن اصلی:*\n{original_text[:2000]}", parse_mode="Markdown")
+                else:
+                    send_message(cid, caption[:4096])
             send_message(cid, "✅ توییت ارسال شد.", reply_markup=home_kb())
         clear_state(cid)
         return
 
-    data, fname = result
-    smart_send(cid, data, fname, caption="")
+    BALE_CAPTION_LIMIT = 1024
 
-    # Send caption as separate message if present
-    if caption:
+    if len(results) == 1:
+        data, fname = results[0]
+        inline_cap = caption[:BALE_CAPTION_LIMIT] if len(caption) <= BALE_CAPTION_LIMIT else ""
+        smart_send(cid, data, fname, caption=inline_cap)
+    else:
+        group_items = []
+        for data, fname in results[:10]:
+            is_vid = fname.lower().endswith((".mp4", ".mov", ".webm"))
+            group_items.append({"data": data, "fname": fname,
+                                 "is_video": is_vid, "caption": ""})
+        send_media_group(cid, group_items)
+
+    # Caption / translation as separate message
+    if original_text:
+        send_message(cid, f"🌐 *ترجمه:*\n{caption[:4096]}", parse_mode="Markdown")
+        send_message(cid, f"📝 *متن اصلی:*\n{original_text[:2000]}", parse_mode="Markdown")
+    elif caption and (len(results) > 1 or len(caption) > BALE_CAPTION_LIMIT):
         send_message(cid, caption[:4096])
 
     send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
@@ -6029,25 +6090,23 @@ def _fetch_instagram_caption(url: str) -> str:
         if not m:
             return ""
         shortcode = m.group(1)
-        # Instagram oEmbed endpoint — works for public posts without auth
         r = WEB.get(
             f"https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/p/{shortcode}/",
             headers={"User-Agent": UA_MOB, "Accept": "application/json"},
             timeout=10)
         if r.status_code == 200:
             j = r.json()
-            title = j.get("title", "").strip()
+            title  = j.get("title", "").strip()
             author = j.get("author_name", "").strip()
             if title:
-                cap = f"{title}"
+                cap = title
                 if author:
                     cap += f"\n\n— @{author}"
                 log.info("_fetch_instagram_caption: %d chars via oEmbed", len(cap))
-                return cap[:1000]
+                return cap  # full caption — caller truncates as needed
     except Exception as e:
         log.debug("_fetch_instagram_caption oEmbed: %s", e)
 
-    # Fallback: try the old oembed endpoint
     try:
         r = WEB.get(
             f"https://graph.instagram.com/oembed?url={url}&omitscript=true",
@@ -6056,7 +6115,7 @@ def _fetch_instagram_caption(url: str) -> str:
             j = r.json()
             title = j.get("title", "").strip()
             if title:
-                return title[:1000]
+                return title
     except Exception as e:
         log.debug("_fetch_instagram_caption graph: %s", e)
 
@@ -6417,7 +6476,593 @@ def do_virusscan_url(cid: int, url: str):
     clear_state(cid)
 
 
-def handle_message(msg: dict):
+    return
+    msg = _format_vt_result(result, url)
+    send_message(cid, msg, parse_mode="Markdown", reply_markup=home_kb())
+    clear_state(cid)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# YOUTUBE EXTRAS  (thumbnail download · video stats card)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def do_youtube_thumbnail(cid: int, url: str):
+    """Download and send YouTube video thumbnail at highest available resolution."""
+    bump(cid, "downloads")
+    send_message(cid, "⏳ در حال دریافت کاور ویدیو…")
+    # yt-dlp --dump-json to get thumbnail URL, then try maxresdefault → hqdefault
+    try:
+        r = subprocess.run([YTDLP_BIN, "--no-warnings", "--dump-json",
+                            "--no-playlist", url],
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode == 0:
+            import json as _j
+            info = _j.loads(r.stdout)
+            thumb_url = info.get("thumbnail", "")
+            vid_id    = info.get("id", "")
+            title     = info.get("title", "ویدیو")[:60]
+            # Try multiple resolutions
+            candidates = []
+            if vid_id:
+                candidates = [
+                    f"https://img.youtube.com/vi/{vid_id}/maxresdefault.jpg",
+                    f"https://img.youtube.com/vi/{vid_id}/hqdefault.jpg",
+                    f"https://img.youtube.com/vi/{vid_id}/mqdefault.jpg",
+                ]
+            if thumb_url:
+                candidates.insert(0, thumb_url)
+            for turl in candidates:
+                data = download_bytes(turl, MAX_IMAGE_SIZE)
+                if data and len(data) > 5000:
+                    fname = f"thumbnail_{vid_id or 'yt'}.jpg"
+                    send_photo(cid, data, caption=f"🖼 {title}")
+                    send_message(cid, "✅ کاور ارسال شد.", reply_markup=home_kb())
+                    return
+    except Exception as e:
+        log.error("do_youtube_thumbnail: %s", e)
+    send_message(cid, "❌ دریافت کاور ناموفق بود.", reply_markup=home_kb())
+
+
+def do_youtube_stats(cid: int, url: str):
+    """Fetch YouTube video stats (views, likes, description) and send as a card."""
+    bump(cid, "searches")
+    send_message(cid, "⏳ در حال دریافت آمار ویدیو…")
+    try:
+        r = subprocess.run([YTDLP_BIN, "--no-warnings", "--dump-json",
+                            "--no-playlist", url],
+                           capture_output=True, text=True, timeout=25)
+        if r.returncode != 0:
+            send_message(cid, "❌ دریافت اطلاعات ناموفق بود.", reply_markup=home_kb())
+            return
+        import json as _j
+        info = _j.loads(r.stdout)
+        title    = info.get("title", "")[:80]
+        uploader = info.get("uploader", info.get("channel", ""))
+        views    = info.get("view_count", 0) or 0
+        likes    = info.get("like_count", 0) or 0
+        duration = info.get("duration_string", info.get("duration", ""))
+        upload   = info.get("upload_date", "")
+        desc     = (info.get("description") or "")[:800]
+        vid_id   = info.get("id", "")
+
+        def _fmt(n):
+            try:
+                n = int(n)
+                if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+                if n >= 1_000:     return f"{n/1_000:.1f}K"
+                return str(n)
+            except Exception: return str(n)
+
+        date_str = ""
+        if upload and len(upload) == 8:
+            date_str = f"{upload[6:8]}/{upload[4:6]}/{upload[:4]}"
+
+        lines = [
+            f"▶️ *{title}*",
+            f"👤 {uploader}",
+            f"",
+            f"👁 بازدید: {_fmt(views)}",
+            f"👍 لایک: {_fmt(likes)}",
+            f"⏱ مدت: {duration}",
+        ]
+        if date_str:
+            lines.append(f"📅 تاریخ: {date_str}")
+        if desc:
+            lines += ["", f"📝 *توضیحات:*", desc]
+
+        text = "\n".join(lines)
+
+        # Also send thumbnail
+        thumb_url = info.get("thumbnail", "")
+        if vid_id:
+            for tu in [f"https://img.youtube.com/vi/{vid_id}/hqdefault.jpg", thumb_url]:
+                data = download_bytes(tu, MAX_IMAGE_SIZE) if tu else None
+                if data and len(data) > 5000:
+                    send_photo(cid, data, caption=title[:1024])
+                    break
+
+        send_message(cid, text, parse_mode="Markdown", reply_markup=home_kb())
+    except Exception as e:
+        log.error("do_youtube_stats: %s", e)
+        send_message(cid, "❌ دریافت آمار ناموفق بود.", reply_markup=home_kb())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INSTAGRAM EXTRAS  (profile pic · profile screenshot · carousel mosaic)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def do_instagram_profile_pic(cid: int, username: str):
+    """Download and send Instagram profile picture at full size."""
+    bump(cid, "downloads")
+    username = username.strip().lstrip("@")
+    send_message(cid, f"⏳ در حال دریافت عکس پروفایل @{username}…")
+    try:
+        import instaloader
+        L = instaloader.Instaloader(quiet=True, download_pictures=False,
+                                    download_videos=False, download_comments=False,
+                                    save_metadata=False)
+        if INSTAGRAM_USER and INSTAGRAM_PASS:
+            try: L.login(INSTAGRAM_USER, INSTAGRAM_PASS)
+            except Exception: pass
+        profile = instaloader.Profile.from_username(L.context, username)
+        pic_url = profile.profile_pic_url
+        data = download_bytes(pic_url, MAX_IMAGE_SIZE)
+        if data and len(data) > 1000:
+            send_photo(cid, data,
+                       caption=f"🖼 تصویر پروفایل @{username}")
+            send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
+            return
+    except Exception as e:
+        log.error("do_instagram_profile_pic: %s", e)
+    send_message(cid, "❌ دریافت عکس پروفایل ناموفق بود.", reply_markup=home_kb())
+
+
+def do_instagram_profile_screenshot(cid: int, username: str):
+    """
+    Build a profile card image with:
+    bio, followers, following, post count, last 9 post thumbnails.
+    Uses Pillow — no browser needed.
+    """
+    bump(cid, "downloads")
+    username = username.strip().lstrip("@")
+    send_message(cid, f"⏳ در حال ساخت اسکرین‌شات پروفایل @{username}…")
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        from io import BytesIO as _BIO
+        import instaloader, textwrap as _tw
+
+        L = instaloader.Instaloader(quiet=True, download_pictures=False,
+                                    download_videos=False, download_comments=False,
+                                    save_metadata=False)
+        if INSTAGRAM_USER and INSTAGRAM_PASS:
+            try: L.login(INSTAGRAM_USER, INSTAGRAM_PASS)
+            except Exception: pass
+
+        profile = instaloader.Profile.from_username(L.context, username)
+        full_name    = profile.full_name or username
+        bio          = profile.biography or ""
+        followers    = profile.followers
+        following    = profile.followees
+        post_count   = profile.mediacount
+        ext_url      = profile.external_url or ""
+        is_verified  = profile.is_verified
+        pic_url      = profile.profile_pic_url
+
+        # Fetch 9 post thumbnails
+        thumbs = []
+        for post in profile.get_posts():
+            if len(thumbs) >= 9: break
+            try:
+                td = download_bytes(post.url, MAX_IMAGE_SIZE)
+                if td: thumbs.append(td)
+            except Exception: pass
+
+        # ── Build card ──────────────────────────────────────────────────
+        W, PAD = 640, 20
+        BG     = (250, 250, 250)
+        DARK   = (30,  30,  30)
+        MUTED  = (120, 120, 120)
+        PINK   = (228, 64,  95)
+
+        def _fnt(size, bold=False):
+            for p in (["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"] if bold
+                      else ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]):
+                if Path(p).exists():
+                    return ImageFont.truetype(p, size)
+            return ImageFont.load_default()
+
+        fn_name  = _fnt(18, bold=True)
+        fn_body  = _fnt(14)
+        fn_small = _fnt(12)
+
+        # Avatar
+        AV = 80
+        av_img = None
+        try:
+            av_data = download_bytes(pic_url, MAX_IMAGE_SIZE)
+            av = Image.open(_BIO(av_data)).convert("RGBA").resize((AV, AV))
+            mask = Image.new("L", (AV, AV), 0)
+            ImageDraw.Draw(mask).ellipse([(0,0),(AV,AV)], fill=255)
+            base = Image.new("RGBA", (AV, AV), BG+(255,))
+            base.paste(av, mask=mask)
+            av_img = base
+        except Exception: pass
+
+        # Bio wrap
+        bio_lines = []
+        for para in bio.split("\n"):
+            bio_lines.extend(_tw.wrap(para, width=55) or [""])
+
+        lh     = 18
+        bio_h  = len(bio_lines) * lh
+        GRID_S = (W - PAD*2 - 4) // 3  # size of each thumbnail cell
+
+        HEADER_H = PAD + max(AV, 80) + PAD
+        INFO_H   = 24 + PAD                     # stats row
+        BIO_H    = bio_h + (PAD if bio else 0)
+        URL_H    = 20 + PAD if ext_url else 0
+        GRID_H   = (GRID_S + 2) if thumbs else 0
+        if len(thumbs) > 3: GRID_H = (GRID_S + 2) * ((len(thumbs)-1)//3+1)
+        H = HEADER_H + INFO_H + BIO_H + URL_H + GRID_H + PAD
+
+        img  = Image.new("RGB", (W, H), BG)
+        draw = ImageDraw.Draw(img)
+
+        # Avatar
+        ay = PAD
+        if av_img:
+            img.paste(av_img, (PAD, ay), av_img)
+
+        # Name + verified
+        nx = PAD + AV + PAD
+        vbadge = " ✓" if is_verified else ""
+        draw.text((nx, ay), full_name + vbadge, font=fn_name, fill=DARK)
+        draw.text((nx, ay+22), f"@{username}", font=fn_body, fill=MUTED)
+
+        # Stats row below avatar
+        ty = PAD + max(AV, 60) + PAD//2
+
+        def _fmt(n):
+            if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+            if n >= 1_000:     return f"{n/1_000:.1f}K"
+            return str(n)
+
+        stats = [
+            (str(post_count), "پست"),
+            (_fmt(followers),  "فالوور"),
+            (_fmt(following),  "دنبال‌شده"),
+        ]
+        col = W // 3
+        for i, (val, label) in enumerate(stats):
+            cx = i * col + col//2
+            vw, _ = draw.textbbox((0,0), val, font=fn_name)[2:4]  # approximate
+            draw.text((cx - 20, ty), val,   font=fn_name,  fill=DARK, align="center")
+            draw.text((cx - 20, ty+20), label, font=fn_small, fill=MUTED)
+
+        ty += INFO_H
+
+        # Bio
+        for line in bio_lines:
+            draw.text((PAD, ty), line, font=fn_body, fill=DARK)
+            ty += lh
+        if bio: ty += PAD//2
+
+        # External URL
+        if ext_url:
+            draw.text((PAD, ty), f"🔗 {ext_url[:60]}", font=fn_small, fill=PINK)
+            ty += URL_H
+
+        # Grid of thumbnails
+        if thumbs:
+            draw.line([(PAD, ty), (W-PAD, ty)], fill=(220,220,220), width=1)
+            ty += PAD//2
+            for i, tb in enumerate(thumbs[:9]):
+                try:
+                    ti = Image.open(_BIO(tb)).convert("RGB")
+                    ti = ti.resize((GRID_S, GRID_S), Image.LANCZOS)
+                    gx = PAD + (i % 3) * (GRID_S + 2)
+                    gy = ty + (i // 3) * (GRID_S + 2)
+                    img.paste(ti, (gx, gy))
+                except Exception: pass
+
+        buf = _BIO()
+        img.save(buf, format="PNG", optimize=True)
+        card = buf.getvalue()
+        log.info("ig_profile_shot: %dx%d  %.1fKB", W, H, len(card)/1024)
+        send_photo(cid, card, caption=f"📸 پروفایل @{username}")
+        send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
+
+    except Exception as e:
+        log.error("do_instagram_profile_screenshot: %s", e)
+        send_message(cid, "❌ ساخت اسکرین‌شات ناموفق بود.\n"
+                     "• پروفایل باید عمومی باشد\n"
+                     "• `instaloader` نصب باشد", reply_markup=home_kb())
+
+
+def do_instagram_mosaic(cid: int, url: str):
+    """
+    Build a mosaic grid image from all carousel slides of an Instagram post.
+    Sends the grid as a single PNG.
+    """
+    bump(cid, "downloads")
+    send_message(cid, "⏳ در حال دانلود اسلایدها و ساخت موزاییک…")
+    try:
+        from PIL import Image
+        from io import BytesIO as _BIO
+
+        items = instagram_download_all(url)
+        images = [it for it in items if not it.get("is_video") and it.get("data")]
+        if not images:
+            send_message(cid, "❌ تصویری برای موزاییک یافت نشد.", reply_markup=home_kb())
+            return
+
+        n    = len(images)
+        cols = min(3, n)
+        rows = (n + cols - 1) // cols
+        S    = 320  # cell size
+
+        grid = Image.new("RGB", (cols * S, rows * S), (30, 30, 30))
+        for i, item in enumerate(images[:9]):
+            try:
+                tile = Image.open(_BIO(item["data"])).convert("RGB")
+                # Crop to square centre
+                w, h  = tile.size
+                side  = min(w, h)
+                tile  = tile.crop(((w-side)//2, (h-side)//2,
+                                   (w+side)//2, (h+side)//2))
+                tile  = tile.resize((S, S), Image.LANCZOS)
+                gx    = (i % cols) * S
+                gy    = (i // cols) * S
+                grid.paste(tile, (gx, gy))
+            except Exception: pass
+
+        buf = _BIO()
+        grid.save(buf, format="JPEG", quality=88, optimize=True)
+        mosaic = buf.getvalue()
+        log.info("do_instagram_mosaic: %dx%d  %d images  %.1fKB",
+                 cols*S, rows*S, n, len(mosaic)/1024)
+        caption = _fetch_instagram_caption(url)
+        send_photo(cid, mosaic,
+                   caption=(caption[:1024] if caption else f"🔲 موزاییک — {n} تصویر"))
+        if caption and len(caption) > 1024:
+            send_message(cid, caption[:4096])
+        send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
+
+    except Exception as e:
+        log.error("do_instagram_mosaic: %s", e)
+        send_message(cid, "❌ ساخت موزاییک ناموفق بود.", reply_markup=home_kb())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TWITTER EXTRAS  (auto-translate tweet text)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def do_twitter_dl_translate(cid: int, url: str):
+    """Download tweet media + auto-translate tweet text to Persian."""
+    tw_data = _fetch_tweet_data(url)
+    original = tw_data.get("text", "")
+    if original:
+        try:
+            translated = translate_text(original, target="fa", source="auto")
+            tw_data["text"] = translated
+            tw_data["_original_text"] = original
+        except Exception as e:
+            log.warning("tweet translate: %s", e)
+    do_twitter_dl(cid, url, _tw_data_override=tw_data)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOUNDCLOUD EXTRAS  (cover art + track info · on.soundcloud.com short links)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def do_soundcloud_info(cid: int, url: str):
+    """
+    Show SoundCloud track info (cover, title, artist, duration, plays)
+    then offer download.
+    """
+    bump(cid, "searches")
+    # Resolve on.soundcloud.com short links
+    if "on.soundcloud.com" in url:
+        try:
+            r = WEB.head(url, allow_redirects=True, timeout=10)
+            url = r.url
+            log.info("soundcloud short link resolved: %s", url)
+        except Exception: pass
+
+    send_message(cid, "⏳ در حال دریافت اطلاعات آهنگ…")
+    try:
+        r = subprocess.run([YTDLP_BIN, "--no-warnings", "--dump-json",
+                            "--no-playlist", url],
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            # Fall back to direct download without info
+            do_music(cid, url); return
+
+        import json as _j
+        info = _j.loads(r.stdout)
+        title    = info.get("title", "")[:80]
+        uploader = info.get("uploader", info.get("artist", ""))[:50]
+        duration = info.get("duration_string", "")
+        plays    = info.get("view_count", 0) or 0
+        likes    = info.get("like_count", 0) or 0
+        desc     = (info.get("description") or "")[:400]
+        thumb    = info.get("thumbnail", "")
+
+        def _fmt(n):
+            try:
+                n = int(n)
+                if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+                if n >= 1_000:     return f"{n/1_000:.1f}K"
+                return str(n)
+            except Exception: return str(n)
+
+        lines = [
+            f"☁️ *{title}*",
+            f"🎤 {uploader}",
+            f"⏱ {duration}" + (f"  |  👁 {_fmt(plays)}" if plays else ""),
+        ]
+        if likes: lines.append(f"❤️ {_fmt(likes)}")
+        if desc:  lines += ["", desc]
+
+        if thumb:
+            data = download_bytes(thumb, MAX_IMAGE_SIZE)
+            if data and len(data) > 1000:
+                send_photo(cid, data, caption="\n".join(lines)[:1024])
+            else:
+                send_message(cid, "\n".join(lines), parse_mode="Markdown")
+        else:
+            send_message(cid, "\n".join(lines), parse_mode="Markdown")
+
+        # Offer download button
+        url_key = store_url(url)
+        kb = {"inline_keyboard": [[
+            {"text": "⬇️ دانلود آهنگ", "callback_data": f"sc_dl_{url_key}"},
+            {"text": "🏠 منوی اصلی",   "callback_data": "home"},
+        ]]}
+        send_message(cid, "برای دانلود دکمه را بزنید:", reply_markup=kb)
+
+    except Exception as e:
+        log.error("do_soundcloud_info: %s", e)
+        do_music(cid, url)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BLUESKY  (bsky.app — posts, videos, images, text)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+BSKY_API = "https://public.api.bsky.app/xrpc"
+
+
+def bsky_get_post(url: str) -> Optional[dict]:
+    """
+    Fetch a Bluesky post via the public ATP API (no login needed for public posts).
+    Returns the post record dict or None.
+    """
+    # URL format: https://bsky.app/profile/user.bsky.social/post/RKEY
+    m = re.search(r"bsky\.app/profile/([^/]+)/post/([A-Za-z0-9]+)", url)
+    if not m:
+        return None
+    handle, rkey = m.group(1), m.group(2)
+    try:
+        # Resolve handle to DID
+        r = WEB.get(f"{BSKY_API}/com.atproto.identity.resolveHandle",
+                    params={"handle": handle},
+                    headers={"Accept": "application/json"}, timeout=10)
+        if r.status_code != 200:
+            return None
+        did = r.json().get("did", "")
+        if not did:
+            return None
+
+        # Fetch post
+        at_uri = f"at://{did}/app.bsky.feed.post/{rkey}"
+        r2 = WEB.get(f"{BSKY_API}/app.bsky.feed.getPosts",
+                     params={"uris": at_uri},
+                     headers={"Accept": "application/json"}, timeout=10)
+        if r2.status_code != 200:
+            return None
+        posts = r2.json().get("posts", [])
+        if not posts:
+            return None
+
+        post  = posts[0]
+        record = post.get("record", {})
+        author = post.get("author", {})
+        embed  = post.get("embed", {})
+
+        # Extract media URLs
+        media_items = []
+        etype = embed.get("$type", "")
+        if "images" in etype or "images" in embed:
+            for img in embed.get("images", []):
+                furl = img.get("fullsize") or img.get("thumb","")
+                if furl:
+                    media_items.append({"url": furl, "type": "image",
+                                        "alt": img.get("alt","")})
+        elif "video" in etype or "video" in embed:
+            vurl = (embed.get("playlist") or embed.get("video",{}).get("ref",{})
+                    .get("$link",""))
+            if vurl:
+                media_items.append({"url": vurl, "type": "video"})
+
+        return {
+            "text":        record.get("text",""),
+            "author_name": author.get("displayName","") or author.get("handle",""),
+            "author_handle": author.get("handle",""),
+            "avatar_url":  author.get("avatar",""),
+            "created_at":  record.get("createdAt",""),
+            "likes":       post.get("likeCount",0),
+            "reposts":     post.get("repostCount",0),
+            "replies":     post.get("replyCount",0),
+            "media":       media_items,
+            "did":         did,
+            "rkey":        rkey,
+        }
+    except Exception as e:
+        log.error("bsky_get_post: %s", e)
+        return None
+
+
+def do_bluesky_dl(cid: int, url: str):
+    """Download media + text from a Bluesky post."""
+    bump(cid, "downloads")
+    send_message(cid, "⏳ در حال دریافت از Bluesky…")
+    chat_action(cid, "upload_photo")
+
+    post = bsky_get_post(url)
+    if not post:
+        send_message(cid, "❌ پست یافت نشد یا خصوصی است.", reply_markup=home_kb())
+        return
+
+    text   = post.get("text","")
+    author = post.get("author_handle","")
+    media  = post.get("media", [])
+
+    BALE_CAPTION_LIMIT = 1024
+
+    if not media:
+        # Text-only post — just send the text
+        msg = f"🦋 *@{author}*\n\n{text}" if text else f"🦋 @{author}"
+        send_message(cid, msg, parse_mode="Markdown", reply_markup=home_kb())
+        return
+
+    # Download all media items
+    downloaded = []
+    for item in media[:10]:
+        murl  = item.get("url","")
+        mtype = item.get("type","image")
+        if not murl: continue
+        data = download_bytes(murl, MAX_FILE_SIZE)
+        if data and len(data) > 500:
+            ext = "mp4" if mtype == "video" else "jpg"
+            downloaded.append({"data": data, "fname": f"bsky_{rkey_from_url(url)}.{ext}",
+                                "is_video": mtype=="video", "caption":""})
+
+    if not downloaded:
+        send_message(cid, "❌ دانلود رسانه ناموفق بود.", reply_markup=home_kb())
+        return
+
+    caption = f"🦋 @{author}\n\n{text}".strip() if text else f"🦋 @{author}"
+
+    if len(downloaded) == 1:
+        item = downloaded[0]
+        mtype = "video" if item["is_video"] else "photo"
+        inline_cap = caption[:BALE_CAPTION_LIMIT] if len(caption) <= BALE_CAPTION_LIMIT else ""
+        smart_send(cid, item["data"], item["fname"], caption=inline_cap, media_type=mtype)
+    else:
+        downloaded[0]["caption"] = caption[:BALE_CAPTION_LIMIT] if len(caption) <= BALE_CAPTION_LIMIT else ""
+        send_media_group(cid, downloaded)
+
+    if len(caption) > BALE_CAPTION_LIMIT:
+        send_message(cid, caption[:4096])
+
+    send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
+    clear_state(cid)
+
+
+def rkey_from_url(url: str) -> str:
+    m = re.search(r"/post/([A-Za-z0-9]+)", url)
+    return m.group(1) if m else "post"
     cid    = msg["chat"]["id"]
     text   = msg.get("text","")
     photos = msg.get("photo")
@@ -6455,11 +7100,31 @@ def handle_message(msg: dict):
     if doc:
         st = get_state(cid)
         if st.get("mode") == "virusscan":
+            # Bale's getFile API only works for files ≤ ~20MB
+            file_size = doc.get("file_size", 0)
+            BALE_DL_LIMIT = 20 * 1024 * 1024   # 20MB
+            VT_LIMIT      = 32 * 1024 * 1024   # 32MB
+
+            if file_size > VT_LIMIT:
+                send_message(cid,
+                    f"⚠️ حجم فایل ({file_size//1024//1024}MB) بیشتر از حد مجاز VirusTotal (32MB) است.",
+                    reply_markup=home_kb())
+                clear_state(cid)
+                return
+
+            if file_size > BALE_DL_LIMIT:
+                send_message(cid,
+                    f"⚠️ حجم فایل ({file_size//1024//1024}MB) بیشتر از حد دانلود Bale (20MB) است.\n"
+                    "فایل را مستقیم در VirusTotal آپلود کنید: https://www.virustotal.com",
+                    reply_markup=home_kb())
+                clear_state(cid)
+                return
+
             file_url = get_file_url(doc["file_id"])
             if not file_url:
-                send_message(cid, "❌ دریافت فایل ناموفق بود.", reply_markup=home_kb())
+                send_message(cid, "❌ دریافت لینک فایل ناموفق بود.", reply_markup=home_kb())
                 return
-            file_data = download_bytes(file_url, 32 * 1024 * 1024)
+            file_data = download_bytes(file_url, VT_LIMIT)
             if not file_data:
                 send_message(cid, "❌ دانلود فایل ناموفق بود.", reply_markup=home_kb())
                 return
@@ -6499,15 +7164,22 @@ def handle_message(msg: dict):
         "tg_read":      lambda: do_tg_read(cid, text, False),
         "tg_mtproto":   lambda: do_tg_read(cid, text, True),
         "tg_dl":        lambda: do_tg_dl_media(cid, text),
-        "twitter_tl":   lambda: do_twitter_timeline(cid, text),
-        "twitter_dl":   lambda: do_twitter_dl(cid, text),
-        "ig_profile":   lambda: do_instagram_profile(cid, text),
-        "ig_dl":        lambda: do_instagram_dl(cid, text),
-        "tt_user":      lambda: do_tiktok_user(cid, text),
-        "tt_dl":        lambda: do_tiktok_dl(cid, text),
-        "rss":          lambda: do_rss(cid, text),
-        "zlib":         lambda: do_zlib_search(cid, text, st.get("zlib_ext")),
-        "apk":          lambda: do_apk_search(cid, text),
+        "twitter_tl":           lambda: do_twitter_timeline(cid, text),
+        "twitter_dl":           lambda: do_twitter_dl(cid, text),
+        "twitter_dl_translate": lambda: do_twitter_dl_translate(cid, text),
+        "ig_profile":           lambda: do_instagram_profile(cid, text),
+        "ig_dl":                lambda: do_instagram_dl(cid, text),
+        "ig_mosaic":            lambda: do_instagram_mosaic(cid, text),
+        "ig_profile_pic":       lambda: do_instagram_profile_pic(cid, text),
+        "ig_profile_shot":      lambda: do_instagram_profile_screenshot(cid, text),
+        "tt_user":              lambda: do_tiktok_user(cid, text),
+        "tt_dl":                lambda: do_tiktok_dl(cid, text),
+        "bluesky":              lambda: do_bluesky_dl(cid, text),
+        "yt_thumb":             lambda: do_youtube_thumbnail(cid, text),
+        "yt_stats":             lambda: do_youtube_stats(cid, text),
+        "rss":                  lambda: do_rss(cid, text),
+        "zlib":                 lambda: do_zlib_search(cid, text, st.get("zlib_ext")),
+        "apk":                  lambda: do_apk_search(cid, text),
     }
 
     if mode and mode in dispatch:
@@ -6518,10 +7190,12 @@ def handle_message(msg: dict):
         # Smart URL detection
         if _is_youtube(text): do_youtube_dl(cid, text)
         elif "spotify.com" in text: do_music(cid, text)
-        elif "soundcloud.com" in text: do_music(cid, text)
+        elif "soundcloud.com" in text or "on.soundcloud.com" in text:
+            do_soundcloud_info(cid, text)
         elif "tiktok.com" in text: do_tiktok_dl(cid, text)
         elif "twitter.com" in text or "x.com" in text: do_twitter_dl(cid, text)
         elif "instagram.com" in text: do_instagram_dl(cid, text)
+        elif "bsky.app" in text: do_bluesky_dl(cid, text)
         elif "t.me/" in text: do_tg_dl_media(cid, text)
         else: do_open_url(cid, text)
     else:
@@ -6572,11 +7246,15 @@ def handle_callback(cb: dict):
         "mode_open":      ("open",      "🌐 آدرس سایت را وارد کنید (https://…):"),
         "mode_scholar":   ("scholar",   "📚 عنوان یا کلمه‌کلیدی مقاله:"),
         "mode_wiki":      ("wiki",      "📖 موضوع ویکی‌پدیا:"),
-        "mode_music":     ("music",     "🎵 نام آهنگ یا خواننده را بنویسید\nیا لینک Spotify / SoundCloud / YouTube را بفرستید:"),
-        "mode_apk":       ("apk",       "📱 نام اپ یا شناسه پکیج را وارد کنید (مثال: org.telegram.messenger):"),
-        "mode_iplookup":  ("iplookup",  "🌐 آدرس IP یا دامنه:"),
-        "mode_rss":       ("rss",       "📰 آدرس فید RSS یا سایت خبری را وارد کنید:"),
-        "mode_virusscan": ("virusscan", "🛡 فایل خود را ارسال کنید تا بررسی شود\nیا یک آدرس اینترنتی بفرستید تا اسکن شود:"),
+        "mode_music":      ("music",          "🎵 نام آهنگ یا خواننده را بنویسید\nیا لینک Spotify / SoundCloud / YouTube را بفرستید:"),
+        "mode_apk":        ("apk",            "📱 نام اپ یا شناسه پکیج را وارد کنید (مثال: org.telegram.messenger):"),
+        "mode_iplookup":   ("iplookup",       "🌐 آدرس IP یا دامنه:"),
+        "mode_rss":        ("rss",            "📰 آدرس فید RSS یا سایت خبری را وارد کنید:"),
+        "mode_virusscan":  ("virusscan",      "🛡 فایل خود را ارسال کنید تا بررسی شود\nیا یک آدرس اینترنتی بفرستید تا اسکن شود:"),
+        "mode_bluesky":    ("bluesky",        "🦋 لینک پست Bluesky را بفرستید:\nمثال: https://bsky.app/profile/user.bsky.social/post/123"),
+        "ig_profile_pic":  ("ig_profile_pic", "📸 نام کاربری اینستاگرام را وارد کنید (بدون @):"),
+        "ig_profile_shot": ("ig_profile_shot","📸 نام کاربری اینستاگرام را وارد کنید (بدون @):"),
+        "ig_mosaic":       ("ig_mosaic",      "🔲 لینک پست اینستاگرام را برای ساخت موزاییک بفرستید:"),
     }
     if data in mode_prompts:
         mode, prompt = mode_prompts[data]
@@ -7176,6 +7854,12 @@ def handle_callback(cb: dict):
             "_(مثال: `https://twitter.com/user/status/123`)_",
             parse_mode="Markdown", reply_markup=cancel_kb()); return
 
+    if data == "tw_dl_translate":
+        set_state(cid, mode="twitter_dl_translate")
+        send_message(cid,
+            "🐦🇮🇷 لینک توییت را وارد کنید — متن به فارسی ترجمه می‌شود:",
+            reply_markup=cancel_kb()); return
+
     # ── Instagram ─────────────────────────────────────────────────────────
     if data == "mode_instagram":
         send_message(cid, "📸 اینستاگرام:", reply_markup=instagram_kb()); return
@@ -7193,6 +7877,22 @@ def handle_callback(cb: dict):
             "_(مثال: `https://www.instagram.com/p/ABC123/`)_",
             parse_mode="Markdown", reply_markup=cancel_kb()); return
 
+    if data == "ig_profile_pic":
+        set_state(cid, mode="ig_profile_pic")
+        send_message(cid, "📸 نام کاربری اینستاگرام را وارد کنید (بدون @):",
+                     reply_markup=cancel_kb()); return
+
+    if data == "ig_profile_shot":
+        set_state(cid, mode="ig_profile_shot")
+        send_message(cid, "📸 نام کاربری اینستاگرام را وارد کنید (بدون @):",
+                     reply_markup=cancel_kb()); return
+
+    if data == "ig_mosaic":
+        set_state(cid, mode="ig_mosaic")
+        send_message(cid,
+            "🔲 لینک پست کاروسل اینستاگرام را وارد کنید:",
+            reply_markup=cancel_kb()); return
+
     # ── TikTok ────────────────────────────────────────────────────────────
     if data == "mode_tiktok":
         send_message(cid, "🎵 TikTok:", reply_markup=tiktok_kb()); return
@@ -7208,6 +7908,37 @@ def handle_callback(cb: dict):
         send_message(cid,
             "🎵 لینک ویدیو TikTok را وارد کنید:",
             reply_markup=cancel_kb()); return
+
+    # ── Bluesky ───────────────────────────────────────────────────────────
+    if data == "mode_bluesky":
+        set_state(cid, mode="bluesky")
+        send_message(cid,
+            "🦋 لینک پست Bluesky را وارد کنید:\n"
+            "_(مثال: `https://bsky.app/profile/user.bsky.social/post/abc123`)_",
+            parse_mode="Markdown", reply_markup=cancel_kb()); return
+
+    # ── YouTube extras ────────────────────────────────────────────────────
+    if data == "yt_thumb":
+        set_state(cid, mode="yt_thumb")
+        send_message(cid,
+            "▶️ لینک ویدیوی یوتیوب را برای دریافت کاور وارد کنید:",
+            reply_markup=cancel_kb()); return
+
+    if data == "yt_stats":
+        set_state(cid, mode="yt_stats")
+        send_message(cid,
+            "▶️ لینک ویدیوی یوتیوب را برای مشاهده آمار وارد کنید:",
+            reply_markup=cancel_kb()); return
+
+    # ── SoundCloud download from info page ────────────────────────────────
+    m_sc = re.match(r"sc_dl_(\w+)$", data)
+    if m_sc:
+        url_key = m_sc.group(1)
+        url = get_url(url_key)
+        if not url:
+            send_message(cid, "❌ لینک منقضی شده."); return
+        threading.Thread(target=do_music, args=(cid, url), daemon=True).start()
+        return
 
     # ── Social result item click: soc_{platform}_{cache_key}_{idx} ───────
     m = re.match(r"soc_(tg|tw|ig|tt)_(\w+)_(\d+)$", data)
