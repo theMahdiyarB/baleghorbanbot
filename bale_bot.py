@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.10)
+بله قربان — Bale Bot  (v2.11)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -785,7 +785,12 @@ def chat_action(chat_id, action="typing"):
 def get_file_url(file_id: str) -> Optional[str]:
     resp = api("getFile", file_id=file_id)
     if resp.get("ok"):
-        return f"https://tapi.bale.ai/file/bot{TOKEN}/{resp['result']['file_path']}"
+        file_path = resp["result"]["file_path"]
+        # Build correct URL for each platform
+        if _platform() == "telegram":
+            return f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        else:
+            return f"https://tapi.bale.ai/file/bot{BALE_TOKEN}/{file_path}"
     return None
 
 
@@ -844,23 +849,32 @@ def main_menu_kb():
          {"text": "📖 ویکی‌پدیا",         "callback_data": "mode_wiki"}],
         [{"text": "📺 یوتیوب",            "callback_data": "mode_youtube"},
          {"text": "🎵 دانلود موزیک",     "callback_data": "mode_music"}],
-        [{"text": "🖼 دانلود عکس",        "callback_data": "mode_images"},
-         {"text": "🐙 GitHub",            "callback_data": "mode_github"}],
         [{"text": "📱 دانلود APK",        "callback_data": "mode_apk"},
          {"text": "📚 Z-Library کتاب",   "callback_data": "mode_zlib"}],
-        [{"text": "✈️ کانال تلگرام",      "callback_data": "mode_tg_channel"},
-         {"text": "🐦 توییتر / X",        "callback_data": "mode_twitter"}],
-        [{"text": "📸 اینستاگرام",        "callback_data": "mode_instagram"},
-         {"text": "🎵 تیک‌تاک",           "callback_data": "mode_tiktok"}],
-        [{"text": "🦋 بلواسکای",           "callback_data": "mode_bluesky"},
-         {"text": "📰 اخبار RSS",         "callback_data": "mode_rss"}],
-        [{"text": "🌐 ترجمه",             "callback_data": "mode_translate"},
-         {"text": "🖼 OCR متن از عکس",   "callback_data": "mode_ocr"}],
-        [{"text": "🌐 IP / دامنه",        "callback_data": "mode_iplookup"},
-         {"text": "🛡 تشخیص ویروس",      "callback_data": "mode_virusscan"}],
-        [{"text": "🔒 حریم خصوصی",       "callback_data": "privacy"},
-         {"text": "📊 آمار کاربری",       "callback_data": "stats"}],
-        [{"text": "❓ راهنما",             "callback_data": "help"}],
+        [{"text": "🖼 دانلود عکس",        "callback_data": "mode_images"},
+         {"text": "🐙 GitHub",            "callback_data": "mode_github"}],
+        [{"text": "📰 اخبار RSS",         "callback_data": "mode_rss"},
+         {"text": "🌐 ترجمه",             "callback_data": "mode_translate"}],
+        [{"text": "🖼 OCR متن از عکس",   "callback_data": "mode_ocr"},
+         {"text": "🌐 IP / دامنه",        "callback_data": "mode_iplookup"}],
+        [{"text": "🛡 تشخیص ویروس",      "callback_data": "mode_virusscan"},
+         {"text": "🔒 حریم خصوصی",       "callback_data": "privacy"}],
+        # Full-width social networks button
+        [{"text": "📲  شبکه‌های اجتماعی  📲", "callback_data": "mode_social"}],
+        [{"text": "📊 آمار کاربری",       "callback_data": "stats"},
+         {"text": "❓ راهنما",             "callback_data": "help"}],
+    ]}
+
+
+def social_menu_kb():
+    """Sub-menu for all social media platforms."""
+    return {"inline_keyboard": [
+        [{"text": "🐦 توییتر / X",        "callback_data": "mode_twitter"},
+         {"text": "📸 اینستاگرام",        "callback_data": "mode_instagram"}],
+        [{"text": "🎵 تیک‌تاک",           "callback_data": "mode_tiktok"},
+         {"text": "🦋 بلواسکای",           "callback_data": "mode_bluesky"}],
+        [{"text": "✈️ کانال تلگرام",      "callback_data": "mode_tg_channel"}],
+        [{"text": "🏠 منوی اصلی",         "callback_data": "home"}],
     ]}
 
 def cancel_kb():
@@ -3595,38 +3609,91 @@ def instagram_download_all(url: str) -> list[dict]:
 
 
 def instagram_get_profile(username: str) -> list[dict]:
-    """Get recent Instagram posts from a public profile via instaloader."""
+    """
+    Get recent Instagram posts from a public profile.
+    Uses Instagram's public web API — no login required for public accounts.
+    Falls back to instaloader if credentials are set.
+    """
     log.info("instagram_get_profile: @%s", username)
+    username = username.strip().lstrip("@")
+
+    # Strategy 1: Instagram public GraphQL / web API (no auth needed for public)
     try:
-        import instaloader
-        L = instaloader.Instaloader(quiet=True, download_pictures=False)
-        if INSTAGRAM_USER and INSTAGRAM_PASS:
+        headers = {
+            "User-Agent": ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                           "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                           "Version/17.0 Mobile/15E148 Safari/604.1"),
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "X-IG-App-ID": "936619743392459",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": f"https://www.instagram.com/{username}/",
+        }
+        r = WEB.get(
+            f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
+            headers=headers, timeout=15)
+        if r.status_code == 200:
+            j = r.json()
+            user = j.get("data", {}).get("user", {})
+            if user:
+                posts = []
+                edges = (user.get("edge_owner_to_timeline_media", {})
+                         .get("edges", []))
+                for edge in edges[:12]:
+                    node = edge.get("node", {})
+                    sc   = node.get("shortcode", "")
+                    cap  = ""
+                    cap_edges = (node.get("edge_media_to_caption", {})
+                                 .get("edges", []))
+                    if cap_edges:
+                        cap = cap_edges[0].get("node", {}).get("text", "")
+                    posts.append({
+                        "url":         f"https://www.instagram.com/p/{sc}/",
+                        "shortcode":   sc,
+                        "text":        cap,
+                        "date":        str(node.get("taken_at_timestamp", ""))[:10],
+                        "is_video":    node.get("is_video", False),
+                        "likes":       node.get("edge_liked_by", {}).get("count", 0),
+                        "typename":    node.get("__typename", ""),
+                        "display_url": node.get("display_url", ""),
+                    })
+                if posts:
+                    log.info("instagram_get_profile (web API): %d posts", len(posts))
+                    return posts
+    except Exception as e:
+        log.warning("instagram_get_profile web API: %s", e)
+
+    # Strategy 2: instaloader (requires login for most accounts)
+    if INSTAGRAM_USER and INSTAGRAM_PASS:
+        try:
+            import instaloader
+            L = instaloader.Instaloader(quiet=True, download_pictures=False)
             try:
                 L.login(INSTAGRAM_USER, INSTAGRAM_PASS)
-            except Exception as e:
-                log.warning("instaloader login failed: %s", e)
-        profile = instaloader.Profile.from_username(L.context, username.lstrip("@"))
-        posts = []
-        for post in profile.get_posts():
-            # Get display URL (thumbnail for images/videos)
-            display_url = getattr(post, "url", "") or getattr(post, "display_url", "")
-            posts.append({
-                "url": f"https://www.instagram.com/p/{post.shortcode}/",
-                "shortcode": post.shortcode,
-                "text": post.caption or "",   # Full caption — no truncation
-                "date": str(post.date_local)[:16],
-                "is_video": post.is_video,
-                "likes": post.likes,
-                "typename": post.typename,
-                "display_url": display_url,
-            })
-            if len(posts) >= 12:
-                break
-        log.info("instagram_get_profile: %d posts", len(posts))
-        return posts
-    except Exception as e:
-        log.error("instagram_get_profile: %s", e)
-        return []
+            except Exception as le:
+                log.warning("instaloader login failed: %s", le)
+            profile = instaloader.Profile.from_username(L.context, username)
+            posts = []
+            for post in profile.get_posts():
+                display_url = getattr(post, "url", "") or getattr(post, "display_url", "")
+                posts.append({
+                    "url":         f"https://www.instagram.com/p/{post.shortcode}/",
+                    "shortcode":   post.shortcode,
+                    "text":        post.caption or "",
+                    "date":        str(post.date_local)[:16],
+                    "is_video":    post.is_video,
+                    "likes":       post.likes,
+                    "typename":    post.typename,
+                    "display_url": display_url,
+                })
+                if len(posts) >= 12:
+                    break
+            log.info("instagram_get_profile (instaloader): %d posts", len(posts))
+            return posts
+        except Exception as e:
+            log.error("instagram_get_profile instaloader: %s", e)
+
+    return []
 
 
 # ─── TikTok ──────────────────────────────────────────────────────────────────
@@ -6304,18 +6371,14 @@ def virustotal_scan_file(data: bytes, filename: str) -> Optional[dict]:
     log.info("virustotal_scan_file: %s  %.1fMB", filename, len(data)/1024/1024)
     try:
         import vt
+    except ImportError:
+        log.error("vt-py not installed — pip install vt-py --break-system-packages")
+        return {"error": "کتابخانه vt-py نصب نیست — با pip install vt-py نصب کنید"}
+    try:
         client = vt.Client(VIRUSTOTAL_API_KEY)
         try:
-            analysis = client.scan_file(io.BytesIO(data), size=len(data))
-            # Poll until completed (max 90s)
-            for _ in range(18):
-                time.sleep(5)
-                analysis = client.get_object(f"/analyses/{analysis.id}")
-                if analysis.status == "completed":
-                    break
-            if analysis.status != "completed":
-                return {"error": "تحلیل VirusTotal تمام نشد — بعداً امتحان کنید"}
-
+            # wait_for_completion=True blocks until analysis done (no 'size' param)
+            analysis = client.scan_file(io.BytesIO(data), wait_for_completion=True)
             stats = analysis.stats
             malicious  = stats.get("malicious",  0)
             suspicious = stats.get("suspicious", 0)
@@ -6329,30 +6392,26 @@ def virustotal_scan_file(data: bytes, filename: str) -> Optional[dict]:
             ])[:20]
             verdict = ("malicious"  if malicious  > 0 else
                        "suspicious" if suspicious > 0 else "clean")
-            log.info("VT file result: %s  %d/%d", verdict, malicious, total)
-            # Get SHA256 for report link
+            # SHA256 is encoded in analysis id: file-{sha256}-{datetime}
             sha256 = ""
-            try:
-                file_obj = client.get_object(f"/files/{analysis.id.split('-')[1]}")
-                sha256 = getattr(file_obj, "sha256", "")
-            except Exception:
-                pass
+            parts = (analysis.id or "").split("-")
+            if len(parts) >= 2 and len(parts[1]) == 64:
+                sha256 = parts[1]
+            log.info("VT file: %s  %d/%d", verdict, malicious, total)
             return {"malicious": malicious, "suspicious": suspicious,
                     "clean": undetected + harmless, "total": total,
                     "verdict": verdict, "detections": detections,
                     "sha256": sha256, "analysis_id": analysis.id}
         finally:
             client.close()
-    except ImportError:
-        log.error("vt-py not installed — run: pip install vt-py --break-system-packages")
-        return None
     except Exception as e:
-        log.error("virustotal_scan_file: %s", e)
-        if "WrongCredentialsError" in type(e).__name__ or "401" in str(e):
+        msg = str(e)
+        log.error("virustotal_scan_file: %s", msg)
+        if "WrongCredentials" in type(e).__name__ or "401" in msg:
             return {"error": "کلید API VirusTotal نامعتبر است"}
-        if "QuotaExceededError" in type(e).__name__ or "429" in str(e):
-            return {"error": "محدودیت روزانه VirusTotal تمام شد (500 اسکن/روز)"}
-        return None
+        if "QuotaExceeded" in type(e).__name__ or "429" in msg:
+            return {"error": "محدودیت روزانه VirusTotal تمام شد (۵۰۰ اسکن/روز)"}
+        return {"error": f"خطای VirusTotal: {msg[:100]}"}
 
 
 def virustotal_scan_url(url: str) -> Optional[dict]:
@@ -6590,29 +6649,57 @@ def do_youtube_stats(cid: int, url: str):
 # INSTAGRAM EXTRAS  (profile pic · profile screenshot · carousel mosaic)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _ig_fetch_user_info(username: str) -> dict:
+    """Fetch Instagram user info via public web API. Returns user dict or {}."""
+    username = username.strip().lstrip("@")
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                       "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                       "Version/17.0 Mobile/15E148 Safari/604.1"),
+        "X-IG-App-ID": "936619743392459",
+        "Accept": "*/*",
+        "Referer": f"https://www.instagram.com/{username}/",
+    }
+    try:
+        r = WEB.get(
+            f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
+            headers=headers, timeout=15)
+        if r.status_code == 200:
+            return r.json().get("data", {}).get("user", {})
+    except Exception as e:
+        log.warning("_ig_fetch_user_info: %s", e)
+    return {}
+
+
 def do_instagram_profile_pic(cid: int, username: str):
     """Download and send Instagram profile picture at full size."""
     bump(cid, "downloads")
     username = username.strip().lstrip("@")
     send_message(cid, f"⏳ در حال دریافت عکس پروفایل @{username}…")
-    try:
-        import instaloader
-        L = instaloader.Instaloader(quiet=True, download_pictures=False,
-                                    download_videos=False, download_comments=False,
-                                    save_metadata=False)
-        if INSTAGRAM_USER and INSTAGRAM_PASS:
+
+    # Try public API first
+    user = _ig_fetch_user_info(username)
+    pic_url = (user.get("profile_pic_url_hd") or
+               user.get("profile_pic_url") or "")
+
+    if not pic_url and INSTAGRAM_USER and INSTAGRAM_PASS:
+        try:
+            import instaloader
+            L = instaloader.Instaloader(quiet=True, download_pictures=False)
             try: L.login(INSTAGRAM_USER, INSTAGRAM_PASS)
             except Exception: pass
-        profile = instaloader.Profile.from_username(L.context, username)
-        pic_url = profile.profile_pic_url
+            profile = instaloader.Profile.from_username(L.context, username)
+            pic_url = profile.profile_pic_url
+        except Exception as e:
+            log.error("do_instagram_profile_pic instaloader: %s", e)
+
+    if pic_url:
         data = download_bytes(pic_url, MAX_IMAGE_SIZE)
         if data and len(data) > 1000:
-            send_photo(cid, data,
-                       caption=f"🖼 تصویر پروفایل @{username}")
+            send_photo(cid, data, caption=f"🖼 تصویر پروفایل @{username}")
             send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
             return
-    except Exception as e:
-        log.error("do_instagram_profile_pic: %s", e)
+
     send_message(cid, "❌ دریافت عکس پروفایل ناموفق بود.", reply_markup=home_kb())
 
 
@@ -6628,33 +6715,61 @@ def do_instagram_profile_screenshot(cid: int, username: str):
     try:
         from PIL import Image, ImageDraw, ImageFont
         from io import BytesIO as _BIO
-        import instaloader, textwrap as _tw
+        import textwrap as _tw
 
-        L = instaloader.Instaloader(quiet=True, download_pictures=False,
-                                    download_videos=False, download_comments=False,
-                                    save_metadata=False)
-        if INSTAGRAM_USER and INSTAGRAM_PASS:
-            try: L.login(INSTAGRAM_USER, INSTAGRAM_PASS)
-            except Exception: pass
-
-        profile = instaloader.Profile.from_username(L.context, username)
-        full_name    = profile.full_name or username
-        bio          = profile.biography or ""
-        followers    = profile.followers
-        following    = profile.followees
-        post_count   = profile.mediacount
-        ext_url      = profile.external_url or ""
-        is_verified  = profile.is_verified
-        pic_url      = profile.profile_pic_url
-
-        # Fetch 9 post thumbnails
-        thumbs = []
-        for post in profile.get_posts():
-            if len(thumbs) >= 9: break
+        # Fetch user info via public API (no login needed for public accounts)
+        user = _ig_fetch_user_info(username)
+        if not user and INSTAGRAM_USER and INSTAGRAM_PASS:
             try:
-                td = download_bytes(post.url, MAX_IMAGE_SIZE)
+                import instaloader as _il
+                L2 = _il.Instaloader(quiet=True, download_pictures=False)
+                L2.login(INSTAGRAM_USER, INSTAGRAM_PASS)
+                p2 = _il.Profile.from_username(L2.context, username)
+                user = {
+                    "full_name": p2.full_name, "biography": p2.biography,
+                    "edge_followed_by": {"count": p2.followers},
+                    "edge_follow": {"count": p2.followees},
+                    "edge_owner_to_timeline_media": {"count": p2.mediacount},
+                    "external_url": p2.external_url,
+                    "is_verified": p2.is_verified,
+                    "profile_pic_url_hd": p2.profile_pic_url,
+                    "_il_profile": p2,
+                }
+            except Exception as ie:
+                log.error("do_instagram_profile_screenshot instaloader: %s", ie)
+
+        if not user:
+            send_message(cid,
+                "❌ پروفایل یافت نشد.\n• نام کاربری را بررسی کنید\n• پروفایل باید عمومی باشد",
+                reply_markup=home_kb())
+            return
+
+        full_name  = user.get("full_name") or username
+        bio        = user.get("biography") or ""
+        followers  = user.get("edge_followed_by", {}).get("count", 0)
+        following  = user.get("edge_follow", {}).get("count", 0)
+        post_count = user.get("edge_owner_to_timeline_media", {}).get("count", 0)
+        ext_url    = user.get("external_url") or ""
+        is_verified= user.get("is_verified", False)
+        pic_url    = user.get("profile_pic_url_hd") or user.get("profile_pic_url","")
+
+        # Fetch 9 post thumbnails from web API data
+        thumbs = []
+        edges = user.get("edge_owner_to_timeline_media", {}).get("edges", [])
+        for edge in edges[:9]:
+            node = edge.get("node", {})
+            turl = node.get("display_url","") or node.get("thumbnail_src","")
+            if turl:
+                td = download_bytes(turl, MAX_IMAGE_SIZE)
                 if td: thumbs.append(td)
-            except Exception: pass
+        # Fallback: instaloader posts if API gave no edges
+        if not thumbs and "_il_profile" in user:
+            for post in user["_il_profile"].get_posts():
+                if len(thumbs) >= 9: break
+                try:
+                    td = download_bytes(post.url, MAX_IMAGE_SIZE)
+                    if td: thumbs.append(td)
+                except Exception: pass
 
         # ── Build card ──────────────────────────────────────────────────
         W, PAD = 640, 20
@@ -7228,6 +7343,9 @@ def handle_callback(cb: dict):
     if data in ("home","cancel"):
         clear_state(cid)
         send_message(cid, "🏠 منوی اصلی:", reply_markup=main_menu_kb()); return
+
+    if data == "mode_social":
+        send_message(cid, "📲 شبکه‌های اجتماعی:", reply_markup=social_menu_kb()); return
 
     if data == "help":
         send_message(cid, HELP_TEXT, parse_mode="Markdown"); return
