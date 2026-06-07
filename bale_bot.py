@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.9)
+بله قربان — Bale Bot  (v2.10)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -5976,7 +5976,7 @@ def _render_tweet_card(tw: dict, tweet_url: str) -> Optional[bytes]:
         draw.line([(PAD,ty),(W-PAD,ty)], fill=BORDER, width=1)
         ty += PAD//2
 
-        # Stats
+        # Stats — use text labels instead of emoji (emoji need special font)
         def _fmt(n):
             try:
                 n = int(n or 0)
@@ -5985,14 +5985,35 @@ def _render_tweet_card(tw: dict, tweet_url: str) -> Optional[bytes]:
                 return str(n)
             except: return "0"
 
-        stats = [("💬", tw.get("replies",0), MUTED),
-                 ("🔁", tw.get("retweets",0), MUTED),
-                 ("❤",  tw.get("likes",0),    LIKE_C),
-                 ("👁",  tw.get("views",0),    MUTED)]
-        sx, col_w = PAD, INNER//4
-        for icon, val, color in stats:
-            draw.text((sx, ty), f"{icon} {_fmt(val)}", font=fn_stats, fill=color)
+        stat_items = [
+            ("Reply",    tw.get("replies",  0), MUTED,   (5, 10, 5)),    # circle
+            ("Repost",   tw.get("retweets", 0), MUTED,   (5, 10, 5)),
+            ("Like",     tw.get("likes",    0), LIKE_C,  (5, 10, 5)),
+            ("View",     tw.get("views",    0), MUTED,   (5, 10, 5)),
+        ]
+        # Draw small colored dot + label + count per stat
+        sx, col_w = PAD, INNER // 4
+        DOT_R = 5
+        for label, val, color, _ in stat_items:
+            dot_x, dot_y = sx, ty + fn_stats.size // 2 - DOT_R + 2
+            draw.ellipse([(dot_x, dot_y),
+                          (dot_x + DOT_R*2, dot_y + DOT_R*2)], fill=color)
+            draw.text((sx + DOT_R*2 + 5, ty),
+                      f"{_fmt(val)}", font=fn_stats, fill=color)
+            # small muted label below count
+            draw.text((sx + DOT_R*2 + 5, ty + fn_stats.size + 1),
+                      label, font=fn_small, fill=MUTED)
             sx += col_w
+
+        # If tweet has multiple media, show badge on top-right of card
+        media_count = len(tw.get("_media_count_hint", []))
+        if media_count > 1:
+            badge = f"1/{media_count}"
+            bw, bh = _bb(badge, fn_small)
+            bx, by = W - PAD - bw - 10, PAD + 6
+            draw.rounded_rectangle([(bx-4, by-3), (bx+bw+4, by+bh+3)],
+                                   radius=6, fill=(0, 0, 0, 180))
+            draw.text((bx, by), badge, font=fn_small, fill=TEXT)
 
         buf = _BIO()
         img.save(buf, format="PNG", optimize=True)
@@ -6013,15 +6034,19 @@ def do_twitter_dl(cid: int, url: str, _tw_data_override: dict = None):
 
     tw_data = _tw_data_override or _fetch_tweet_data(url)
     caption = get_state(cid).get("last_caption", "") or tw_data.get("text", "")
-
-    # If override has translated text, show original in card, translated in caption msg
     original_text = tw_data.get("_original_text", "")
+
+    # Download all media first so we know the count for the card
+    results = twitter_download_media(url)
+
+    # Pass media count hint to card renderer
+    if tw_data and results:
+        tw_data["_media_count_hint"] = list(range(len(results)))
 
     card_bytes = _render_tweet_card(tw_data, url) if tw_data else None
     if card_bytes:
         send_photo(cid, card_bytes, caption="")
 
-    results = twitter_download_media(url)
     if not results:
         if not card_bytes:
             send_message(cid, "❌ این توییت رسانه‌ای ندارد یا دانلود ناموفق بود.",
@@ -6051,7 +6076,6 @@ def do_twitter_dl(cid: int, url: str, _tw_data_override: dict = None):
                                  "is_video": is_vid, "caption": ""})
         send_media_group(cid, group_items)
 
-    # Caption / translation as separate message
     if original_text:
         send_message(cid, f"🌐 *ترجمه:*\n{caption[:4096]}", parse_mode="Markdown")
         send_message(cid, f"📝 *متن اصلی:*\n{original_text[:2000]}", parse_mode="Markdown")
@@ -6261,18 +6285,16 @@ def do_tiktok_dl(cid: int, url: str):
 # Set VIRUSTOTAL_API_KEY env var. Get key: https://www.virustotal.com/gui/join-us
 # ═══════════════════════════════════════════════════════════════════════════════
 
-VT_BASE = "https://www.virustotal.com/api/v3"
-
-def _vt_headers() -> dict:
-    return {"x-apikey": VIRUSTOTAL_API_KEY, "Accept": "application/json"}
-
+# ═══════════════════════════════════════════════════════════════════════════════
+# VIRUS SCAN  (VirusTotal via vt-py — 4 req/min, 500 req/day, 32MB max)
+# pip install vt-py --break-system-packages
+# Set VIRUSTOTAL_API_KEY in .env
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def virustotal_scan_file(data: bytes, filename: str) -> Optional[dict]:
     """
-    Upload file to VirusTotal and wait for analysis result.
-    Returns analysis dict with keys: malicious, suspicious, clean, total,
-    verdict (clean/suspicious/malicious), detections (list of engine names).
-    Returns None on API error.
+    Upload file to VirusTotal via vt-py and poll for result.
+    Returns dict with: malicious, suspicious, clean, total, verdict, detections.
     """
     if not VIRUSTOTAL_API_KEY:
         return None
@@ -6281,115 +6303,103 @@ def virustotal_scan_file(data: bytes, filename: str) -> Optional[dict]:
 
     log.info("virustotal_scan_file: %s  %.1fMB", filename, len(data)/1024/1024)
     try:
-        # Step 1: Upload
-        files = {"file": (filename, io.BytesIO(data), "application/octet-stream")}
-        r = WEB.post(f"{VT_BASE}/files", headers=_vt_headers(), files=files, timeout=60)
-        if r.status_code == 429:
-            return {"error": "محدودیت نرخ VirusTotal — لطفاً یک دقیقه صبر کنید"}
-        if not r.ok:
-            log.error("VT upload: %d %s", r.status_code, r.text[:200])
-            return None
-        analysis_id = r.json().get("data", {}).get("id", "")
-        if not analysis_id:
-            return None
+        import vt
+        client = vt.Client(VIRUSTOTAL_API_KEY)
+        try:
+            analysis = client.scan_file(io.BytesIO(data), size=len(data))
+            # Poll until completed (max 90s)
+            for _ in range(18):
+                time.sleep(5)
+                analysis = client.get_object(f"/analyses/{analysis.id}")
+                if analysis.status == "completed":
+                    break
+            if analysis.status != "completed":
+                return {"error": "تحلیل VirusTotal تمام نشد — بعداً امتحان کنید"}
 
-        # Step 2: Poll for result (max 60s)
-        for attempt in range(12):
-            time.sleep(5)
-            ar = WEB.get(f"{VT_BASE}/analyses/{analysis_id}",
-                         headers=_vt_headers(), timeout=20)
-            if not ar.ok:
-                continue
-            aj = ar.json()
-            status = aj.get("data", {}).get("attributes", {}).get("status", "")
-            if status != "completed":
-                log.debug("VT poll %d: status=%s", attempt, status)
-                continue
-
-            stats = aj["data"]["attributes"].get("stats", {})
+            stats = analysis.stats
             malicious  = stats.get("malicious",  0)
             suspicious = stats.get("suspicious", 0)
             undetected = stats.get("undetected", 0)
             harmless   = stats.get("harmless",   0)
             total      = malicious + suspicious + undetected + harmless
-
-            # Collect engine names that flagged it
-            results_map = aj["data"]["attributes"].get("results", {})
-            detections  = sorted([
+            detections = sorted([
                 f"{eng}: {res.get('result','?')}"
-                for eng, res in results_map.items()
+                for eng, res in (analysis.results or {}).items()
                 if res.get("category") in ("malicious", "suspicious")
-            ])
-
+            ])[:20]
             verdict = ("malicious"  if malicious  > 0 else
                        "suspicious" if suspicious > 0 else "clean")
-            log.info("VT result: %s  %d/%d malicious", verdict, malicious, total)
-            return {
-                "malicious":  malicious,
-                "suspicious": suspicious,
-                "clean":      undetected + harmless,
-                "total":      total,
-                "verdict":    verdict,
-                "detections": detections[:20],
-                "analysis_id": analysis_id,
-            }
-
-        return {"error": "تحلیل VirusTotal تمام نشد — بعداً دوباره امتحان کنید"}
-
+            log.info("VT file result: %s  %d/%d", verdict, malicious, total)
+            # Get SHA256 for report link
+            sha256 = ""
+            try:
+                file_obj = client.get_object(f"/files/{analysis.id.split('-')[1]}")
+                sha256 = getattr(file_obj, "sha256", "")
+            except Exception:
+                pass
+            return {"malicious": malicious, "suspicious": suspicious,
+                    "clean": undetected + harmless, "total": total,
+                    "verdict": verdict, "detections": detections,
+                    "sha256": sha256, "analysis_id": analysis.id}
+        finally:
+            client.close()
+    except ImportError:
+        log.error("vt-py not installed — run: pip install vt-py --break-system-packages")
+        return None
     except Exception as e:
         log.error("virustotal_scan_file: %s", e)
+        if "WrongCredentialsError" in type(e).__name__ or "401" in str(e):
+            return {"error": "کلید API VirusTotal نامعتبر است"}
+        if "QuotaExceededError" in type(e).__name__ or "429" in str(e):
+            return {"error": "محدودیت روزانه VirusTotal تمام شد (500 اسکن/روز)"}
         return None
 
 
 def virustotal_scan_url(url: str) -> Optional[dict]:
-    """Scan a URL with VirusTotal. Returns same dict structure as file scan."""
+    """Scan a URL with VirusTotal via vt-py."""
     if not VIRUSTOTAL_API_KEY:
         return None
     log.info("virustotal_scan_url: %s", url)
     try:
-        import base64 as _b64
-        # Submit URL
-        r = WEB.post(f"{VT_BASE}/urls", headers=_vt_headers(),
-                     data={"url": url}, timeout=20)
-        if r.status_code == 429:
-            return {"error": "محدودیت نرخ VirusTotal — لطفاً یک دقیقه صبر کنید"}
-        if not r.ok:
-            return None
-        analysis_id = r.json().get("data", {}).get("id", "")
-        if not analysis_id:
-            return None
+        import vt
+        client = vt.Client(VIRUSTOTAL_API_KEY)
+        try:
+            analysis = client.scan_url(url)
+            for _ in range(18):
+                time.sleep(5)
+                analysis = client.get_object(f"/analyses/{analysis.id}")
+                if analysis.status == "completed":
+                    break
+            if analysis.status != "completed":
+                return {"error": "تحلیل VirusTotal تمام نشد"}
 
-        for attempt in range(12):
-            time.sleep(5)
-            ar = WEB.get(f"{VT_BASE}/analyses/{analysis_id}",
-                         headers=_vt_headers(), timeout=20)
-            if not ar.ok:
-                continue
-            aj = ar.json()
-            status = aj.get("data", {}).get("attributes", {}).get("status", "")
-            if status != "completed":
-                continue
-            stats      = aj["data"]["attributes"].get("stats", {})
+            stats      = analysis.stats
             malicious  = stats.get("malicious",  0)
             suspicious = stats.get("suspicious", 0)
             undetected = stats.get("undetected", 0)
             harmless   = stats.get("harmless",   0)
             total      = malicious + suspicious + undetected + harmless
-            results_map = aj["data"]["attributes"].get("results", {})
-            detections  = sorted([
+            detections = sorted([
                 f"{eng}: {res.get('result','?')}"
-                for eng, res in results_map.items()
+                for eng, res in (analysis.results or {}).items()
                 if res.get("category") in ("malicious", "suspicious")
-            ])
+            ])[:20]
             verdict = ("malicious" if malicious > 0 else
                        "suspicious" if suspicious > 0 else "clean")
+            log.info("VT url result: %s  %d/%d", verdict, malicious, total)
             return {"malicious": malicious, "suspicious": suspicious,
                     "clean": undetected + harmless, "total": total,
-                    "verdict": verdict, "detections": detections[:20],
-                    "analysis_id": analysis_id}
-        return {"error": "تحلیل VirusTotal تمام نشد"}
+                    "verdict": verdict, "detections": detections,
+                    "sha256": "", "analysis_id": analysis.id}
+        finally:
+            client.close()
+    except ImportError:
+        log.error("vt-py not installed")
+        return None
     except Exception as e:
         log.error("virustotal_scan_url: %s", e)
+        if "QuotaExceededError" in type(e).__name__ or "429" in str(e):
+            return {"error": "محدودیت روزانه VirusTotal تمام شد"}
         return None
 
 
@@ -6398,37 +6408,32 @@ def _format_vt_result(result: dict, name: str) -> str:
     if result.get("error"):
         return f"⚠️ خطا: {result['error']}"
 
-    verdict   = result.get("verdict", "unknown")
-    malicious = result.get("malicious",  0)
-    suspicious= result.get("suspicious", 0)
-    total     = result.get("total",      0)
-    clean     = result.get("clean",      0)
-    aid       = result.get("analysis_id","")
+    verdict    = result.get("verdict", "unknown")
+    malicious  = result.get("malicious",  0)
+    suspicious = result.get("suspicious", 0)
+    total      = result.get("total",      0)
+    clean      = result.get("clean",      0)
+    sha256     = result.get("sha256",     "")
 
     emoji = "✅" if verdict == "clean" else "⚠️" if verdict == "suspicious" else "🚨"
     verdict_fa = {"clean": "پاک", "suspicious": "مشکوک", "malicious": "مخرب"}.get(verdict, verdict)
 
     lines = [
         f"{emoji} *نتیجه بررسی:* {verdict_fa}",
-        f"📄 فایل/آدرس: `{name[:60]}`",
-        f"",
+        f"📄 `{name[:60]}`",
+        "",
         f"🔴 مخرب: {malicious} آنتی‌ویروس",
         f"🟡 مشکوک: {suspicious} آنتی‌ویروس",
         f"🟢 پاک: {clean} آنتی‌ویروس",
-        f"📊 مجموع بررسی‌شده: {total} آنتی‌ویروس",
+        f"📊 مجموع: {total} آنتی‌ویروس",
     ]
     if result.get("detections"):
-        lines.append(f"\n⚠️ *موارد شناسایی‌شده:*")
+        lines.append("\n⚠️ *موارد شناسایی‌شده:*")
         for d in result["detections"][:10]:
-            lines.append(f"  • {d}")
-    if aid:
-        # Build VT report link from analysis ID
-        try:
-            import base64 as _b64
-            # Analysis IDs for files are file-SHA256-timestamp or url-base64
-            lines.append(f"\n🔗 [گزارش کامل در VirusTotal](https://www.virustotal.com/gui/file-analysis/{aid})")
-        except Exception:
-            pass
+            lines.append(f"  • `{d}`")
+    if sha256:
+        lines.append(f"\n🔗 [گزارش کامل]"
+                     f"(https://www.virustotal.com/gui/file/{sha256})")
     return "\n".join(lines)
 
 
@@ -6471,12 +6476,6 @@ def do_virusscan_url(cid: int, url: str):
     if result is None:
         send_message(cid, "❌ خطا در ارتباط با VirusTotal.", reply_markup=home_kb())
         return
-    msg = _format_vt_result(result, url)
-    send_message(cid, msg, parse_mode="Markdown", reply_markup=home_kb())
-    clear_state(cid)
-
-
-    return
     msg = _format_vt_result(result, url)
     send_message(cid, msg, parse_mode="Markdown", reply_markup=home_kb())
     clear_state(cid)
@@ -7132,8 +7131,13 @@ def handle_message(msg: dict):
                 send_message(cid, "❌ دانلود فایل ناموفق بود.", reply_markup=home_kb())
                 return
             fname = doc.get("file_name") or f"file_{doc['file_id'][:8]}"
-            threading.Thread(target=do_virusscan, args=(cid, file_data, fname),
-                             daemon=True).start()
+            # Capture platform BEFORE spawning thread — _ctx is thread-local,
+            # the new thread would otherwise have no context and send to the wrong API
+            captured_platform = _platform()
+            def _scan_thread(cid=cid, data=file_data, name=fname, plat=captured_platform):
+                _set_platform_ctx(plat)
+                do_virusscan(cid, data, name)
+            threading.Thread(target=_scan_thread, daemon=True).start()
             return
 
     if not text: return
