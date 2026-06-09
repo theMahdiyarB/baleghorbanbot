@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.11)
+بله قربان — Bale Bot  (v2.12)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -144,14 +144,18 @@ COBALT_URL = os.getenv("COBALT_URL", "http://localhost:9000")
 VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
 
 ZLIB_DOMAINS = [
+    "https://z-lib.sk",
     "https://z-library.sk",
     "https://z-lib.fm",
-    "https://z-lib.id",
-    "https://zlibrary.to",
+    "https://z-lib.gd",
+    "https://1lib.sk",
+    "https://zlib.li",
+    "https://z-library.ec",
 ]
 ZLIB_EMAIL    = os.getenv("ZLIB_EMAIL", "")
 ZLIB_PASSWORD = os.getenv("ZLIB_PASSWORD", "")
-_zlib_client  = None   # shared AsyncZlib instance (initialized on first use)
+_zlib_client  = None   # cached login state: {"cookies": dict, "mirror": str, "uid": str, "key": str}
+_zlib_lock    = _threading.Lock() if hasattr(_threading, 'Lock') else None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3610,60 +3614,40 @@ def instagram_download_all(url: str) -> list[dict]:
 
 def instagram_get_profile(username: str) -> list[dict]:
     """
-    Get recent Instagram posts from a public profile.
-    Uses Instagram's public web API — no login required for public accounts.
-    Falls back to instaloader if credentials are set.
+    Get recent posts from a public Instagram profile.
+    Uses WARP proxy if available to bypass datacenter IP blocks.
     """
     log.info("instagram_get_profile: @%s", username)
     username = username.strip().lstrip("@")
+    sess = _get_web(use_warp=bool(WARP_PROXY))
 
-    # Strategy 1: Instagram public GraphQL / web API (no auth needed for public)
-    try:
-        headers = {
-            "User-Agent": ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                           "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                           "Version/17.0 Mobile/15E148 Safari/604.1"),
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "X-IG-App-ID": "936619743392459",
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": f"https://www.instagram.com/{username}/",
-        }
-        r = WEB.get(
-            f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
-            headers=headers, timeout=15)
-        if r.status_code == 200:
-            j = r.json()
-            user = j.get("data", {}).get("user", {})
-            if user:
-                posts = []
-                edges = (user.get("edge_owner_to_timeline_media", {})
-                         .get("edges", []))
-                for edge in edges[:12]:
-                    node = edge.get("node", {})
-                    sc   = node.get("shortcode", "")
-                    cap  = ""
-                    cap_edges = (node.get("edge_media_to_caption", {})
-                                 .get("edges", []))
-                    if cap_edges:
-                        cap = cap_edges[0].get("node", {}).get("text", "")
-                    posts.append({
-                        "url":         f"https://www.instagram.com/p/{sc}/",
-                        "shortcode":   sc,
-                        "text":        cap,
-                        "date":        str(node.get("taken_at_timestamp", ""))[:10],
-                        "is_video":    node.get("is_video", False),
-                        "likes":       node.get("edge_liked_by", {}).get("count", 0),
-                        "typename":    node.get("__typename", ""),
-                        "display_url": node.get("display_url", ""),
-                    })
-                if posts:
-                    log.info("instagram_get_profile (web API): %d posts", len(posts))
-                    return posts
-    except Exception as e:
-        log.warning("instagram_get_profile web API: %s", e)
+    # Strategy 1: web_profile_info API
+    user = _ig_fetch_user_info(username)
+    if user and not user.get("_oembed_only"):
+        posts = []
+        edges = (user.get("edge_owner_to_timeline_media", {}).get("edges", []))
+        for edge in edges[:12]:
+            node = edge.get("node", {})
+            sc   = node.get("shortcode", "")
+            cap  = ""
+            cap_edges = node.get("edge_media_to_caption", {}).get("edges", [])
+            if cap_edges:
+                cap = cap_edges[0].get("node", {}).get("text", "")
+            posts.append({
+                "url":         f"https://www.instagram.com/p/{sc}/",
+                "shortcode":   sc,
+                "text":        cap,
+                "date":        str(node.get("taken_at_timestamp", ""))[:10],
+                "is_video":    node.get("is_video", False),
+                "likes":       node.get("edge_liked_by", {}).get("count", 0),
+                "typename":    node.get("__typename", ""),
+                "display_url": node.get("display_url", ""),
+            })
+        if posts:
+            log.info("instagram_get_profile: %d posts via web API", len(posts))
+            return posts
 
-    # Strategy 2: instaloader (requires login for most accounts)
+    # Strategy 2: instaloader (needs credentials)
     if INSTAGRAM_USER and INSTAGRAM_PASS:
         try:
             import instaloader
@@ -3675,7 +3659,6 @@ def instagram_get_profile(username: str) -> list[dict]:
             profile = instaloader.Profile.from_username(L.context, username)
             posts = []
             for post in profile.get_posts():
-                display_url = getattr(post, "url", "") or getattr(post, "display_url", "")
                 posts.append({
                     "url":         f"https://www.instagram.com/p/{post.shortcode}/",
                     "shortcode":   post.shortcode,
@@ -3684,7 +3667,7 @@ def instagram_get_profile(username: str) -> list[dict]:
                     "is_video":    post.is_video,
                     "likes":       post.likes,
                     "typename":    post.typename,
-                    "display_url": display_url,
+                    "display_url": getattr(post, "url", "") or getattr(post, "display_url", ""),
                 })
                 if len(posts) >= 12:
                     break
@@ -4294,228 +4277,265 @@ def apk_download(app_id: str) -> Optional[tuple[bytes, str]]:
 
 
 
-def _zlib_run(coro):
-    """Run async coroutine in a fresh loop — safe from ThreadPoolExecutor threads."""
-    import asyncio
-    return asyncio.run(coro)
+def _zlib_session() -> requests.Session:
+    """Return session routed through WARP proxy if available."""
+    return _get_web(use_warp=bool(WARP_PROXY))
 
 
-def _zlib_login() -> "AsyncZlib | None":
-    """Login and return an AsyncZlib client with .cookies dict and .mirror set.
-
-    After login the library sets:
-      client.cookies  → dict  e.g. {'remix_userid': '...', 'remix_userkey': '...', ...}
-      client.mirror   → str   e.g. 'https://z-library.sk'
-    _r is an async *method*, not a session — we use requests+cookies for HTTP.
+def _zlib_login() -> Optional[dict]:
+    """
+    Login to Z-Library via eAPI (mobile app API) then web rpc fallback.
+    Returns {"cookies": dict, "mirror": str, "uid": str, "key": str} or None.
+    Tries all known mirrors until one succeeds.
     """
     global _zlib_client
-    if _zlib_client is not None and _zlib_client.cookies:
+    if _zlib_client is not None:
         return _zlib_client
 
     if not ZLIB_EMAIL or not ZLIB_PASSWORD:
-        log.error("_zlib_login: ZLIB_EMAIL/ZLIB_PASSWORD not set")
+        log.error("_zlib_login: ZLIB_EMAIL/ZLIB_PASSWORD not set in .env")
         return None
 
-    async def _do_login():
-        from zlibrary import AsyncZlib
-        client = AsyncZlib()
-        await client.login(ZLIB_EMAIL, ZLIB_PASSWORD)
-        return client
+    sess = _zlib_session()
+    payload = {"email": ZLIB_EMAIL, "password": ZLIB_PASSWORD,
+               "name": "libApp", "appVersion": "3.27.1", "platform": "android"}
 
-    try:
-        client = _zlib_run(_do_login())
-        _zlib_client = client
-        log.info("_zlib_login: OK  mirror=%s  cookies=%s",
-                 client.mirror, list(client.cookies.keys()))
-        return client
-    except Exception as e:
-        log.error("_zlib_login: failed: %s", e)
-        _zlib_client = None
-        return None
+    for mirror in ZLIB_DOMAINS:
+        # Try eAPI login
+        try:
+            r = sess.post(f"{mirror}/eapi/user/login", json=payload,
+                          headers={"Content-Type": "application/json",
+                                   "User-Agent": "okhttp/4.11.0"},
+                          timeout=15)
+            if r.status_code == 200:
+                j = r.json()
+                if j.get("success"):
+                    uid = str(j.get("user", {}).get("id", ""))
+                    key = j.get("user", {}).get("remix_userkey", "")
+                    _zlib_client = {"cookies": {"remix_userid": uid, "remix_userkey": key},
+                                    "mirror": mirror, "uid": uid, "key": key}
+                    log.info("_zlib_login: OK via eAPI %s", mirror)
+                    return _zlib_client
+        except Exception as e:
+            log.debug("_zlib_login eAPI %s: %s", mirror, e)
+
+        # Try web rpc.php login
+        try:
+            r2 = sess.post(f"{mirror}/rpc.php",
+                           data={"isModal": True, "email": ZLIB_EMAIL,
+                                 "password": ZLIB_PASSWORD, "action": "login",
+                                 "redirectUrl": "/"},
+                           headers={"User-Agent": UA_DESK,
+                                    "Content-Type": "application/x-www-form-urlencoded"},
+                           timeout=15)
+            if r2.status_code == 200:
+                j2 = r2.json()
+                if j2.get("user_id"):
+                    uid = str(j2["user_id"])
+                    key = j2.get("user_key", "")
+                    cookies = dict(r2.cookies)
+                    cookies.update({"remix_userid": uid, "remix_userkey": key})
+                    _zlib_client = {"cookies": cookies, "mirror": mirror,
+                                    "uid": uid, "key": key}
+                    log.info("_zlib_login: OK via web rpc %s", mirror)
+                    return _zlib_client
+        except Exception as e:
+            log.debug("_zlib_login web %s: %s", mirror, e)
+
+    log.error("_zlib_login: all mirrors failed")
+    return None
 
 
 def zlib_search(query: str, count: int = 10,
                 extensions: list = None, exact: bool = False) -> list[dict]:
-    """Search Z-Library.  Login via zlibrary lib, HTTP+parse done by us."""
+    """Search Z-Library via eAPI then web scrape fallback."""
     log.info("zlib_search: %r  ext=%s", query, extensions)
-    if not query or not query.strip():
+    if not query.strip():
         return []
 
-    client = _zlib_login()
-    if not client:
-        log.error("zlib_search: login failed")
+    state = _zlib_login()
+    if not state:
         return []
 
-    cookies = client.cookies          # plain dict — correct attribute
-    mirror  = client.mirror.rstrip("/")
+    mirror  = state["mirror"]
+    cookies = state["cookies"]
+    sess    = _zlib_session()
 
+    # Strategy 1: eAPI search
+    try:
+        payload: dict = {"message": query, "count": count, "type": "books"}
+        if extensions:
+            payload["extensions"] = [e.lower() for e in extensions]
+        r = sess.post(f"{mirror}/eapi/book/search", json=payload,
+                      headers={"User-Agent": "okhttp/4.11.0",
+                               "Content-Type": "application/json"},
+                      cookies=cookies, timeout=20)
+        if r.status_code == 200:
+            books = r.json().get("books", [])
+            if books:
+                results = []
+                for b in books[:count]:
+                    bid   = str(b.get("id", ""))
+                    title = b.get("title", "")
+                    ext   = (b.get("extension") or b.get("fileType") or "").lower()
+                    cover = b.get("cover") or b.get("coverUrl") or ""
+                    auths = b.get("authors", [])
+                    if isinstance(auths, list):
+                        authors = [a.get("name","") if isinstance(a,dict) else str(a) for a in auths]
+                    else:
+                        authors = [str(auths)]
+                    slug  = re.sub(r"[^\w\s-]", "", title).strip().replace(" ", "-")[:60]
+                    burl  = f"{mirror}/book/{bid}/{slug}"
+                    results.append({"id": bid, "name": title, "authors": authors,
+                                    "year": str(b.get("year","")), "publisher": "",
+                                    "language": b.get("language",""),
+                                    "extension": ext, "cover": cover, "url": burl})
+                log.info("zlib_search: %d results via eAPI", len(results))
+                return results
+    except Exception as e:
+        log.warning("zlib_search eAPI: %s", e)
+
+    # Strategy 2: web scrape
     import urllib.parse as up
-    params = f"?page=1"
-    if exact:
-        params += "&e=1"
+    web_cookies = {**cookies, "remix_userid": state["uid"], "remix_userkey": state["key"]}
+    params = "?page=1"
+    if exact: params += "&e=1"
     if extensions:
         for ext in extensions:
             params += f"&extensions%5B%5D={ext.upper()}"
     search_url = f"{mirror}/s/{up.quote(query)}{params}"
-    log.info("zlib_search: GET %s", search_url)
-
+    log.info("zlib_search: web fallback GET %s", search_url)
     try:
-        r = WEB.get(search_url, cookies=cookies,
-                    headers={"User-Agent": UA_DESK,
-                             "Accept": "text/html",
-                             "Referer": mirror},
-                    timeout=20)
-        log.debug("zlib_search: status=%d  len=%d", r.status_code, len(r.text))
+        r = sess.get(search_url, cookies=web_cookies,
+                     headers={"User-Agent": UA_DESK, "Accept": "text/html",
+                              "Referer": mirror}, timeout=20)
     except Exception as e:
-        log.error("zlib_search: request error: %s", e)
-        return []
+        log.error("zlib_search web: %s", e); return []
 
     if r.status_code != 200:
-        log.error("zlib_search: HTTP %d", r.status_code)
-        _zlib_client = None   # force re-login next time
-        return []
+        log.error("zlib_search web: HTTP %d", r.status_code)
+        global _zlib_client; _zlib_client = None; return []
 
     soup = BeautifulSoup(r.text, "html.parser")
     results = []
-
-    # Z-Library uses <z-bookcard> web components (current layout)
-    cards = soup.select("z-bookcard")
-    if not cards:
-        # Fallback: old layout
-        cards = soup.select(".book-item, .bookRow, .resItemBox")
-    log.debug("zlib_search: %d cards found", len(cards))
-
+    cards = soup.select("z-bookcard") or soup.select(".book-item,.bookRow,.resItemBox")
     for card in cards:
-        if len(results) >= count:
-            break
+        if len(results) >= count: break
         try:
-            href  = card.get("href") or card.get("url") or ""
-            name  = card.get("title") or card.get("name") or ""
+            href = card.get("href") or card.get("url") or ""
+            name = card.get("title") or card.get("name") or ""
             if not href:
                 a = card.select_one("a[href*='/book/']") or card.select_one("h3 a,h2 a")
-                if a:
-                    href = a.get("href", "")
-                    name = name or a.get_text(strip=True)
-            if not href:
-                continue
-            url = href if href.startswith("http") else f"{mirror}{href}"
-            name = name or url.rstrip("/").split("/")[-1].replace("-", " ").title()
-
-            authors_raw = card.get("authors", "")
-            authors = [a.strip() for a in authors_raw.split(",") if a.strip()] if authors_raw else []
-
-            year = card.get("year") or card.get("date") or ""
-            ext  = (card.get("extension") or card.get("format") or "").lower()
+                if a: href = a.get("href",""); name = name or a.get_text(strip=True)
+            if not href: continue
+            url  = href if href.startswith("http") else f"{mirror}{href}"
+            name = name or url.rstrip("/").split("/")[-1].replace("-"," ").title()
+            auths_raw = card.get("authors","")
+            authors = [a.strip() for a in auths_raw.split(",") if a.strip()]
+            ext   = (card.get("extension") or card.get("format") or "").lower()
             cover = card.get("cover") or card.get("image") or ""
-            if cover and not cover.startswith("http"):
-                cover = f"{mirror}{cover}"
-
-            results.append({
-                "id":        url.rstrip("/").split("/")[-1],
-                "name":      name,
-                "authors":   authors,
-                "year":      str(year),
-                "publisher": "",
-                "language":  card.get("language", ""),
-                "extension": ext,
-                "size":      card.get("size", ""),
-                "cover":     cover,
-                "url":       url,
-                "rating":    card.get("rating", ""),
-            })
-        except Exception as exc:
-            log.debug("zlib_search: card error: %s", exc)
-            continue
-
-    log.info("zlib_search: %d results", len(results))
+            if cover and not cover.startswith("http"): cover = f"{mirror}{cover}"
+            results.append({"id": url.rstrip("/").split("/")[-1], "name": name,
+                            "authors": authors, "year": card.get("year",""),
+                            "publisher": "", "language": card.get("language",""),
+                            "extension": ext, "cover": cover, "url": url})
+        except Exception: continue
+    log.info("zlib_search: %d results via web scrape", len(results))
     return results
 
 
-def zlib_download(book_url: str) -> "tuple[bytes,str] | None":
-    """Download a book.  Fetches book page → finds /dl/ link → downloads."""
+def zlib_download(book_url: str) -> Optional[tuple[bytes, str]]:
+    """Download a book from Z-Library via eAPI then web scrape."""
     log.info("zlib_download: %s", book_url)
+    state = _zlib_login()
+    if not state: return None
 
-    client = _zlib_login()
-    if not client:
-        log.error("zlib_download: login failed")
-        return None
-
-    cookies = client.cookies
-    mirror  = client.mirror.rstrip("/")
+    mirror  = state["mirror"]
+    cookies = state["cookies"]
+    uid, key = state["uid"], state["key"]
+    sess    = _zlib_session()
     hdrs    = {"User-Agent": UA_DESK, "Referer": mirror}
 
-    # ── 1. Fetch book page ────────────────────────────────────────────────
+    m = re.search(r"/book/?(\d+)", book_url)
+    book_id = m.group(1) if m else ""
+
+    # Strategy 1: eAPI formats endpoint
+    if book_id:
+        try:
+            r = sess.post(f"{mirror}/eapi/book/{book_id}/formats", json={},
+                          headers={"User-Agent": "okhttp/4.11.0",
+                                   "Content-Type": "application/json"},
+                          cookies=cookies, timeout=20)
+            if r.status_code == 200:
+                j = r.json()
+                formats = j.get("books", [j])
+                for fmt in formats:
+                    dl_url = fmt.get("href") or fmt.get("url") or ""
+                    if not dl_url: continue
+                    if not dl_url.startswith("http"): dl_url = f"{mirror}{dl_url}"
+                    resp = sess.get(dl_url, cookies=cookies, headers=hdrs,
+                                   timeout=120, allow_redirects=True)
+                    if resp.status_code == 200 and len(resp.content) > 500:
+                        ext   = (fmt.get("extension","") or
+                                 dl_url.rsplit(".",1)[-1].split("?")[0] or "pdf")
+                        title = fmt.get("title","book")[:80]
+                        safe  = re.sub(r"[^\w\s\-.]","_",title)
+                        log.info("zlib_download eAPI OK: %.1fMB", len(resp.content)/1024/1024)
+                        return resp.content, f"{safe}.{ext}"
+        except Exception as e:
+            log.warning("zlib_download eAPI: %s", e)
+
+    # Strategy 2: web scrape
+    web_cookies = {**cookies, "remix_userid": uid, "remix_userkey": key}
     try:
-        r = WEB.get(book_url, cookies=cookies, headers=hdrs, timeout=20)
-        log.debug("zlib_download: book page status=%d len=%d", r.status_code, len(r.text))
+        r = sess.get(book_url, cookies=web_cookies, headers=hdrs, timeout=20)
     except Exception as e:
-        log.error("zlib_download: book page error: %s", e)
-        return None
+        log.error("zlib_download web get: %s", e); return None
     if r.status_code != 200:
-        log.error("zlib_download: book page HTTP %d", r.status_code)
-        return None
+        log.error("zlib_download web: HTTP %d", r.status_code); return None
 
     soup = BeautifulSoup(r.text, "html.parser")
-
-    # ── 2. Extract title/ext for filename ────────────────────────────────
-    title_el = soup.select_one("h1[itemprop='name'], .book-title, h1")
-    page_title = title_el.get_text(strip=True) if title_el else ""
-    ext_el = soup.select_one(".property__file, .property_files .property_value")
-    page_ext = "pdf"
+    title_el  = soup.select_one("h1[itemprop='name'],.book-title,h1")
+    page_title = title_el.get_text(strip=True) if title_el else "book"
+    ext_el    = soup.select_one(".property__file,.property_files .property_value")
+    page_ext  = "pdf"
     if ext_el:
-        raw = ext_el.get_text(strip=True).split(",")[0].strip().lower().lstrip("\n")
-        if raw:
-            page_ext = raw
+        raw = ext_el.get_text(strip=True).split(",")[0].strip().lower()
+        if raw: page_ext = raw
 
-    # ── 3. Find download link ─────────────────────────────────────────────
-    # Library source shows: a.btn.btn-default.addDownloadedBook  → href="/dl/..."
-    dl_el = (
-        soup.select_one("a.btn.btn-default.addDownloadedBook") or
-        soup.select_one("a[href*='/dl/']") or
-        soup.select_one("a[class*='download']") or
-        soup.select_one(".download-buttons a")
-    )
+    dl_el = (soup.select_one("a.btn.btn-default.addDownloadedBook") or
+             soup.select_one("a[href*='/dl/']") or
+             soup.select_one("a[class*='download']") or
+             soup.select_one(".download-buttons a"))
     if not dl_el or not dl_el.get("href"):
-        log.error("zlib_download: no download link on %s", book_url)
-        return None
+        log.error("zlib_download: no download link"); return None
 
     dl_href = dl_el["href"]
     dl_url  = dl_href if dl_href.startswith("http") else f"{mirror}{dl_href}"
-    log.info("zlib_download: dl_url=%s", dl_url)
-
-    # ── 4. Download file ──────────────────────────────────────────────────
     try:
-        resp = WEB.get(dl_url, cookies=cookies,
-                       headers={**hdrs, "Referer": book_url},
-                       timeout=120, allow_redirects=True)
-        log.debug("zlib_download: file status=%d  size=%d  ct=%s",
-                  resp.status_code, len(resp.content),
-                  resp.headers.get("Content-Type", ""))
+        resp = sess.get(dl_url, cookies=web_cookies,
+                        headers={**hdrs, "Referer": book_url},
+                        timeout=120, allow_redirects=True)
     except Exception as e:
-        log.error("zlib_download: file download error: %s", e)
-        return None
+        log.error("zlib_download file dl: %s", e); return None
 
     if resp.status_code != 200 or len(resp.content) < 500:
-        log.error("zlib_download: bad response status=%d size=%d",
-                  resp.status_code, len(resp.content))
+        log.error("zlib_download: bad resp %d %d", resp.status_code, len(resp.content))
         return None
 
-    # ── 5. Build filename ─────────────────────────────────────────────────
-    cd = resp.headers.get("Content-Disposition", "")
+    cd = resp.headers.get("Content-Disposition","")
     fname = ""
     if "filename=" in cd:
-        import re as _re
-        m = _re.search(r"filename=([^\s;]+)", cd)
-        if m:
-            fname = m.group(1).strip('"').strip("'").strip()
+        mf = re.search(r'filename=([^\s;]+)', cd)
+        if mf: fname = mf.group(1).strip('"').strip("'")
     if not fname:
-        ct = resp.headers.get("Content-Type", "")
-        ct_ext = {"application/pdf": "pdf", "application/epub+zip": "epub",
-                  "application/x-mobipocket-ebook": "mobi",
-                  "application/x-fictionbook+xml": "fb2",
-                  "application/octet-stream": page_ext}
-        inferred = next((v for k, v in ct_ext.items() if k in ct), page_ext)
-        safe = re.sub(r"[^\w\s\-.]", "_", page_title or "book")[:80]
+        ct = resp.headers.get("Content-Type","")
+        ct_ext = {"application/pdf":"pdf","application/epub+zip":"epub",
+                  "application/x-mobipocket-ebook":"mobi",
+                  "application/x-fictionbook+xml":"fb2",
+                  "application/octet-stream":page_ext}
+        inferred = next((v for k,v in ct_ext.items() if k in ct), page_ext)
+        safe  = re.sub(r"[^\w\s\-.]","_",page_title)[:80]
         fname = f"{safe}.{inferred}"
 
     log.info("zlib_download OK: %s  %.1fMB", fname, len(resp.content)/1024/1024)
@@ -6041,9 +6061,9 @@ def _render_tweet_card(tw: dict, tweet_url: str) -> Optional[bytes]:
 
         # Divider
         draw.line([(PAD,ty),(W-PAD,ty)], fill=BORDER, width=1)
-        ty += PAD//2
+        ty += PAD//2 + 2
 
-        # Stats — use text labels instead of emoji (emoji need special font)
+        # Stats — draw custom icons using Pillow shapes (no emoji font needed)
         def _fmt(n):
             try:
                 n = int(n or 0)
@@ -6052,34 +6072,58 @@ def _render_tweet_card(tw: dict, tweet_url: str) -> Optional[bytes]:
                 return str(n)
             except: return "0"
 
-        stat_items = [
-            ("Reply",    tw.get("replies",  0), MUTED,   (5, 10, 5)),    # circle
-            ("Repost",   tw.get("retweets", 0), MUTED,   (5, 10, 5)),
-            ("Like",     tw.get("likes",    0), LIKE_C,  (5, 10, 5)),
-            ("View",     tw.get("views",    0), MUTED,   (5, 10, 5)),
+        def _draw_icon(ix, iy, kind, color):
+            """Draw a small recognisable icon at (ix, iy) using Pillow primitives."""
+            S = 10  # icon bounding box
+            if kind == "bubble":
+                # Speech bubble: circle + small triangle at bottom-left
+                draw.ellipse([(ix, iy), (ix+S, iy+S)], outline=color, width=1)
+                draw.polygon([(ix+1, iy+S-2), (ix+4, iy+S+3), (ix+5, iy+S-2)],
+                             fill=color)
+            elif kind == "repost":
+                # Two curved arrows: simplified as two small L-shapes
+                draw.line([(ix+2,iy+S-1),(ix+2,iy+2),(ix+S-2,iy+2)],
+                          fill=color, width=1)
+                draw.line([(ix+S-3,iy),(ix+S-1,iy+2),(ix+S-3,iy+4)],
+                          fill=color, width=1)
+                draw.line([(ix+S-2,iy+1),(ix+S-2,iy+S-2),(ix+2,iy+S-2)],
+                          fill=color, width=1)
+                draw.line([(ix+3,iy+S-1),(ix+1,iy+S-3),(ix+3,iy+S-4)],
+                          fill=color, width=1)
+            elif kind == "heart":
+                # Heart: two overlapping circles + downward triangle
+                h = S // 2
+                draw.ellipse([(ix,     iy), (ix+h, iy+h)], fill=color)
+                draw.ellipse([(ix+h-1, iy), (ix+S, iy+h)], fill=color)
+                draw.polygon([(ix, iy+h-2), (ix+S//2, iy+S+1), (ix+S, iy+h-2)],
+                             fill=color)
+            elif kind == "eye":
+                # Eye: almond shape + pupil
+                draw.ellipse([(ix, iy+2), (ix+S, iy+S-2)], outline=color, width=1)
+                draw.ellipse([(ix+S//2-2, iy+3), (ix+S//2+2, iy+S-3)], fill=color)
+
+        stats = [
+            ("bubble", tw.get("replies",  0), MUTED),
+            ("repost", tw.get("retweets", 0), MUTED),
+            ("heart",  tw.get("likes",    0), LIKE_C),
+            ("eye",    tw.get("views",    0), MUTED),
         ]
-        # Draw small colored dot + label + count per stat
+        stat_labels = ["Reply", "Repost", "Like", "View"]
         sx, col_w = PAD, INNER // 4
-        DOT_R = 5
-        for label, val, color, _ in stat_items:
-            dot_x, dot_y = sx, ty + fn_stats.size // 2 - DOT_R + 2
-            draw.ellipse([(dot_x, dot_y),
-                          (dot_x + DOT_R*2, dot_y + DOT_R*2)], fill=color)
-            draw.text((sx + DOT_R*2 + 5, ty),
-                      f"{_fmt(val)}", font=fn_stats, fill=color)
-            # small muted label below count
-            draw.text((sx + DOT_R*2 + 5, ty + fn_stats.size + 1),
-                      label, font=fn_small, fill=MUTED)
+        for (kind, val, color), label in zip(stats, stat_labels):
+            _draw_icon(sx, ty + 2, kind, color)
+            draw.text((sx + 14, ty), _fmt(val), font=fn_stats, fill=color)
+            draw.text((sx + 14, ty + fn_stats.size + 1), label, font=fn_small, fill=MUTED)
             sx += col_w
 
-        # If tweet has multiple media, show badge on top-right of card
+        # Badge showing 1/N when tweet has multiple media
         media_count = len(tw.get("_media_count_hint", []))
         if media_count > 1:
             badge = f"1/{media_count}"
             bw, bh = _bb(badge, fn_small)
             bx, by = W - PAD - bw - 10, PAD + 6
             draw.rounded_rectangle([(bx-4, by-3), (bx+bw+4, by+bh+3)],
-                                   radius=6, fill=(0, 0, 0, 180))
+                                   radius=6, fill=(0, 0, 0))
             draw.text((bx, by), badge, font=fn_small, fill=TEXT)
 
         buf = _BIO()
@@ -6650,24 +6694,91 @@ def do_youtube_stats(cid: int, url: str):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _ig_fetch_user_info(username: str) -> dict:
-    """Fetch Instagram user info via public web API. Returns user dict or {}."""
+    """
+    Fetch Instagram user info via multiple public strategies.
+    Automatically uses WARP proxy if configured (bypasses Hetzner datacenter blocks).
+    """
     username = username.strip().lstrip("@")
-    headers = {
-        "User-Agent": ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                       "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                       "Version/17.0 Mobile/15E148 Safari/604.1"),
-        "X-IG-App-ID": "936619743392459",
-        "Accept": "*/*",
-        "Referer": f"https://www.instagram.com/{username}/",
-    }
+    sess = _get_web(use_warp=bool(WARP_PROXY))
+
+    # Strategy 1: Instagram internal web API (requires residential/WARP IP)
+    for ua in [
+        ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+         "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"),
+        ("Instagram 289.0.0.77.109 Android (33/13; 420dpi; 1080x2400; "
+         "samsung; SM-G991B; o1s; exynos2100; en_US; 481895820)"),
+    ]:
+        try:
+            r = sess.get(
+                f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
+                headers={
+                    "User-Agent": ua,
+                    "X-IG-App-ID": "936619743392459",
+                    "Accept": "*/*",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Referer": f"https://www.instagram.com/{username}/",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                timeout=15)
+            if r.status_code == 200:
+                j = r.json()
+                user = j.get("data", {}).get("user", {})
+                if user:
+                    log.info("_ig_fetch_user_info: OK via web API (%d edges)",
+                             len(user.get("edge_owner_to_timeline_media",{}).get("edges",[])))
+                    return user
+            if r.status_code == 429:
+                log.warning("_ig_fetch_user_info: 429 rate limit")
+                time.sleep(2)
+        except Exception as e:
+            log.warning("_ig_fetch_user_info: %s", e)
+
+    # Strategy 2: Instagram oEmbed (works without auth for public accounts)
     try:
-        r = WEB.get(
-            f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
-            headers=headers, timeout=15)
+        r = sess.get(
+            f"https://www.instagram.com/api/v1/oembed/?url=https://instagram.com/{username}/",
+            headers={"User-Agent": UA_MOB, "Accept": "application/json"},
+            timeout=10)
         if r.status_code == 200:
-            return r.json().get("data", {}).get("user", {})
+            j = r.json()
+            if j.get("author_name"):
+                # Build minimal user dict from oembed
+                return {
+                    "full_name": j.get("author_name", ""),
+                    "biography": "",
+                    "edge_followed_by": {"count": 0},
+                    "edge_follow": {"count": 0},
+                    "edge_owner_to_timeline_media": {"count": 0, "edges": []},
+                    "external_url": "",
+                    "is_verified": False,
+                    "profile_pic_url": j.get("thumbnail_url", ""),
+                    "profile_pic_url_hd": j.get("thumbnail_url", ""),
+                    "_oembed_only": True,
+                }
     except Exception as e:
-        log.warning("_ig_fetch_user_info: %s", e)
+        log.warning("_ig_fetch_user_info oEmbed: %s", e)
+
+    # Strategy 3: public graphql endpoint
+    try:
+        r = sess.get(
+            f"https://www.instagram.com/{username}/?__a=1&__d=dis",
+            headers={
+                "User-Agent": UA_MOB,
+                "Accept": "*/*",
+                "X-IG-App-ID": "936619743392459",
+            },
+            timeout=15)
+        if r.status_code == 200:
+            j = r.json()
+            user = (j.get("graphql", {}).get("user") or
+                    j.get("data", {}).get("user") or {})
+            if user:
+                log.info("_ig_fetch_user_info: OK via graphql")
+                return user
+    except Exception as e:
+        log.warning("_ig_fetch_user_info graphql: %s", e)
+
+    log.error("_ig_fetch_user_info: all strategies failed for @%s", username)
     return {}
 
 
