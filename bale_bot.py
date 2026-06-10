@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.12)
+بله قربان — Bale Bot  (v2.13)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -155,7 +155,7 @@ ZLIB_DOMAINS = [
 ZLIB_EMAIL    = os.getenv("ZLIB_EMAIL", "")
 ZLIB_PASSWORD = os.getenv("ZLIB_PASSWORD", "")
 _zlib_client  = None   # cached login state: {"cookies": dict, "mirror": str, "uid": str, "key": str}
-_zlib_lock    = _threading.Lock() if hasattr(_threading, 'Lock') else None
+_zlib_lock    = threading.Lock()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
