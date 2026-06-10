@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.14)
+بله قربان — Bale Bot  (v2.15)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -144,8 +144,6 @@ COBALT_URL = os.getenv("COBALT_URL", "http://localhost:9000")
 VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
 
 ZLIB_DOMAINS = [
-    "https://singlelogin.re",   # official eAPI gateway (most reliable)
-    "https://singlelogin.me",   # official eAPI gateway mirror
     "https://z-lib.sk",
     "https://z-library.sk",
     "https://z-lib.fm",
@@ -187,7 +185,9 @@ def _make_session(proxy: str = "") -> requests.Session:
     s.mount("http://",  HTTPAdapter(max_retries=r))
     if proxy:
         try:
-            s.proxies = {"http": proxy, "https": proxy}
+            # Use socks5h so DNS is resolved through the proxy (needed for geo-blocked domains)
+            _proxy = proxy.replace("socks5://", "socks5h://") if proxy.startswith("socks5://") else proxy
+            s.proxies = {"http": _proxy, "https": _proxy}
             # Test SOCKS support early to give a clear error
             import socks  # noqa — just check it's importable
         except ImportError:
@@ -4310,9 +4310,10 @@ def _zlib_login(force: bool = False) -> Optional[dict]:
         try:
             r = sess.post(f"{mirror}/eapi/user/login", json=payload,
                           headers={"Content-Type": "application/json",
-                                   "User-Agent": "okhttp/4.11.0"},
+                                   "User-Agent": "okhttp/4.11.0",
+                                   "Accept": "application/json"},
                           timeout=15)
-            log.debug("_zlib_login eAPI %s: HTTP %d", mirror, r.status_code)
+            log.debug("_zlib_login eAPI %s: HTTP %d body=%r", mirror, r.status_code, r.text[:120])
             if r.status_code == 200:
                 try:
                     j = r.json()
@@ -4331,21 +4332,30 @@ def _zlib_login(force: bool = False) -> Optional[dict]:
         except Exception as e:
             log.debug("_zlib_login eAPI %s: %s", mirror, e)
 
-        # Try web rpc.php login
+        # Try web rpc.php login — GET homepage first to acquire session cookies
+        try:
+            sess.get(mirror, headers={"User-Agent": UA_DESK}, timeout=10)
+        except Exception:
+            pass
         try:
             r2 = sess.post(f"{mirror}/rpc.php",
                            data={"isModal": True, "email": ZLIB_EMAIL,
                                  "password": ZLIB_PASSWORD, "action": "login",
                                  "redirectUrl": "/"},
                            headers={"User-Agent": UA_DESK,
-                                    "Content-Type": "application/x-www-form-urlencoded"},
+                                    "Content-Type": "application/x-www-form-urlencoded",
+                                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                                    "X-Requested-With": "XMLHttpRequest",
+                                    "Origin": mirror,
+                                    "Referer": f"{mirror}/"},
                            timeout=15)
-            log.debug("_zlib_login web %s: HTTP %d", mirror, r2.status_code)
+            log.debug("_zlib_login web %s: HTTP %d body=%r", mirror, r2.status_code, r2.text[:120])
             if r2.status_code == 200:
                 try:
                     j2 = r2.json()
                 except Exception:
-                    log.debug("_zlib_login web %s: non-JSON body (len=%d)", mirror, len(r2.content))
+                    log.debug("_zlib_login web %s: non-JSON body (len=%d) body=%r",
+                              mirror, len(r2.content), r2.text[:80])
                     continue
                 if j2.get("user_id"):
                     uid = str(j2["user_id"])
@@ -4357,7 +4367,8 @@ def _zlib_login(force: bool = False) -> Optional[dict]:
                     log.info("_zlib_login: OK via web rpc %s", mirror)
                     return _zlib_client
                 else:
-                    log.debug("_zlib_login web %s: no user_id in response", mirror)
+                    log.debug("_zlib_login web %s: no user_id in response — %s",
+                              mirror, j2.get("error",""))
         except Exception as e:
             log.debug("_zlib_login web %s: %s", mirror, e)
 
@@ -6773,6 +6784,7 @@ def _ig_fetch_user_info(username: str) -> dict:
             f"https://www.instagram.com/api/v1/oembed/?url=https://instagram.com/{username}/",
             headers={"User-Agent": UA_MOB, "Accept": "application/json"},
             timeout=10)
+        log.debug("_ig_fetch_user_info oEmbed: HTTP %d", r.status_code)
         if r.status_code == 200:
             j = r.json()
             if j.get("author_name"):
@@ -6802,6 +6814,7 @@ def _ig_fetch_user_info(username: str) -> dict:
                 "X-IG-App-ID": "936619743392459",
             },
             timeout=15)
+        log.debug("_ig_fetch_user_info graphql: HTTP %d", r.status_code)
         if r.status_code == 200:
             j = r.json()
             user = (j.get("graphql", {}).get("user") or
@@ -6811,6 +6824,34 @@ def _ig_fetch_user_info(username: str) -> dict:
                 return user
     except Exception as e:
         log.warning("_ig_fetch_user_info graphql: %s", e)
+
+    # Strategy 4: instaloader (authenticated, uses its own session management)
+    if INSTAGRAM_USER and INSTAGRAM_PASS:
+        try:
+            import instaloader
+            L = instaloader.Instaloader(quiet=True, download_pictures=False,
+                                        download_videos=False, download_video_thumbnails=False)
+            try:
+                L.login(INSTAGRAM_USER, INSTAGRAM_PASS)
+            except Exception as le:
+                log.warning("_ig_fetch_user_info instaloader login: %s", le)
+            profile = instaloader.Profile.from_username(L.context, username)
+            log.info("_ig_fetch_user_info: OK via instaloader")
+            return {
+                "full_name":    profile.full_name,
+                "username":     profile.username,
+                "biography":    profile.biography or "",
+                "edge_followed_by": {"count": profile.followers},
+                "edge_follow":      {"count": profile.followees},
+                "edge_owner_to_timeline_media": {"count": profile.mediacount, "edges": []},
+                "external_url": profile.external_url or "",
+                "is_verified":  profile.is_verified,
+                "profile_pic_url":    profile.profile_pic_url,
+                "profile_pic_url_hd": profile.profile_pic_url,
+                "_from_instaloader": True,
+            }
+        except Exception as e:
+            log.warning("_ig_fetch_user_info instaloader: %s", e)
 
     log.error("_ig_fetch_user_info: all strategies failed for @%s", username)
     return {}
