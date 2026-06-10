@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.13)
+بله قربان — Bale Bot  (v2.14)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -144,6 +144,8 @@ COBALT_URL = os.getenv("COBALT_URL", "http://localhost:9000")
 VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
 
 ZLIB_DOMAINS = [
+    "https://singlelogin.re",   # official eAPI gateway (most reliable)
+    "https://singlelogin.me",   # official eAPI gateway mirror
     "https://z-lib.sk",
     "https://z-library.sk",
     "https://z-lib.fm",
@@ -176,8 +178,10 @@ logging.getLogger("requests").setLevel(logging.WARNING)
 # ═══════════════════════════════════════════════════════════════════════════════
 def _make_session(proxy: str = "") -> requests.Session:
     s = requests.Session()
+    # Do NOT include 429 in status_forcelist — retrying rate-limit responses
+    # immediately makes rate-limiting worse (burns quota faster).
     r = Retry(total=3, backoff_factor=0.4,
-              status_forcelist=[429, 500, 502, 503, 504],
+              status_forcelist=[500, 502, 503, 504],
               allowed_methods=["GET", "POST", "HEAD"])
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.mount("http://",  HTTPAdapter(max_retries=r))
@@ -4282,15 +4286,16 @@ def _zlib_session() -> requests.Session:
     return _get_web(use_warp=bool(WARP_PROXY))
 
 
-def _zlib_login() -> Optional[dict]:
+def _zlib_login(force: bool = False) -> Optional[dict]:
     """
     Login to Z-Library via eAPI (mobile app API) then web rpc fallback.
     Returns {"cookies": dict, "mirror": str, "uid": str, "key": str} or None.
     Tries all known mirrors until one succeeds.
     """
     global _zlib_client
-    if _zlib_client is not None:
+    if _zlib_client is not None and not force:
         return _zlib_client
+    _zlib_client = None  # reset before fresh attempt
 
     if not ZLIB_EMAIL or not ZLIB_PASSWORD:
         log.error("_zlib_login: ZLIB_EMAIL/ZLIB_PASSWORD not set in .env")
@@ -4307,8 +4312,13 @@ def _zlib_login() -> Optional[dict]:
                           headers={"Content-Type": "application/json",
                                    "User-Agent": "okhttp/4.11.0"},
                           timeout=15)
+            log.debug("_zlib_login eAPI %s: HTTP %d", mirror, r.status_code)
             if r.status_code == 200:
-                j = r.json()
+                try:
+                    j = r.json()
+                except Exception:
+                    log.debug("_zlib_login eAPI %s: non-JSON body", mirror)
+                    j = {}
                 if j.get("success"):
                     uid = str(j.get("user", {}).get("id", ""))
                     key = j.get("user", {}).get("remix_userkey", "")
@@ -4316,6 +4326,8 @@ def _zlib_login() -> Optional[dict]:
                                     "mirror": mirror, "uid": uid, "key": key}
                     log.info("_zlib_login: OK via eAPI %s", mirror)
                     return _zlib_client
+                else:
+                    log.debug("_zlib_login eAPI %s: success=false — %s", mirror, j.get("error", ""))
         except Exception as e:
             log.debug("_zlib_login eAPI %s: %s", mirror, e)
 
@@ -4328,8 +4340,13 @@ def _zlib_login() -> Optional[dict]:
                            headers={"User-Agent": UA_DESK,
                                     "Content-Type": "application/x-www-form-urlencoded"},
                            timeout=15)
+            log.debug("_zlib_login web %s: HTTP %d", mirror, r2.status_code)
             if r2.status_code == 200:
-                j2 = r2.json()
+                try:
+                    j2 = r2.json()
+                except Exception:
+                    log.debug("_zlib_login web %s: non-JSON body (len=%d)", mirror, len(r2.content))
+                    continue
                 if j2.get("user_id"):
                     uid = str(j2["user_id"])
                     key = j2.get("user_key", "")
@@ -4339,6 +4356,8 @@ def _zlib_login() -> Optional[dict]:
                                     "uid": uid, "key": key}
                     log.info("_zlib_login: OK via web rpc %s", mirror)
                     return _zlib_client
+                else:
+                    log.debug("_zlib_login web %s: no user_id in response", mirror)
         except Exception as e:
             log.debug("_zlib_login web %s: %s", mirror, e)
 
@@ -4370,6 +4389,17 @@ def zlib_search(query: str, count: int = 10,
                       headers={"User-Agent": "okhttp/4.11.0",
                                "Content-Type": "application/json"},
                       cookies=cookies, timeout=20)
+        log.debug("zlib_search eAPI: HTTP %d", r.status_code)
+        if r.status_code in (401, 403):
+            # Session expired — force re-login and retry once
+            log.warning("zlib_search eAPI: %d, forcing re-login", r.status_code)
+            state = _zlib_login(force=True)
+            if state:
+                mirror = state["mirror"]; cookies = state["cookies"]
+                r = sess.post(f"{mirror}/eapi/book/search", json=payload,
+                              headers={"User-Agent": "okhttp/4.11.0",
+                                       "Content-Type": "application/json"},
+                              cookies=cookies, timeout=20)
         if r.status_code == 200:
             books = r.json().get("books", [])
             if books:
@@ -6697,9 +6727,12 @@ def _ig_fetch_user_info(username: str) -> dict:
     """
     Fetch Instagram user info via multiple public strategies.
     Automatically uses WARP proxy if configured (bypasses Hetzner datacenter blocks).
+    Uses a fresh session per call to avoid sharing 429-tainted state.
     """
     username = username.strip().lstrip("@")
-    sess = _get_web(use_warp=bool(WARP_PROXY))
+    # Always create a fresh session for Instagram (avoids reusing 429-tainted connection state)
+    proxy = WARP_PROXY or ""
+    sess = _make_session(proxy)
 
     # Strategy 1: Instagram internal web API (requires residential/WARP IP)
     for ua in [
@@ -6720,6 +6753,7 @@ def _ig_fetch_user_info(username: str) -> dict:
                     "X-Requested-With": "XMLHttpRequest",
                 },
                 timeout=15)
+            log.debug("_ig_fetch_user_info web_profile_info: HTTP %d", r.status_code)
             if r.status_code == 200:
                 j = r.json()
                 user = j.get("data", {}).get("user", {})
@@ -6728,8 +6762,8 @@ def _ig_fetch_user_info(username: str) -> dict:
                              len(user.get("edge_owner_to_timeline_media",{}).get("edges",[])))
                     return user
             if r.status_code == 429:
-                log.warning("_ig_fetch_user_info: 429 rate limit")
-                time.sleep(2)
+                log.warning("_ig_fetch_user_info: 429 rate limit (ua=%s…)", ua[:30])
+                time.sleep(3)
         except Exception as e:
             log.warning("_ig_fetch_user_info: %s", e)
 
