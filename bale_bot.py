@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.16)
+بله قربان — Bale Bot  (v2.17)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -859,7 +859,7 @@ def main_menu_kb():
         [{"text": "📺 یوتیوب",            "callback_data": "mode_youtube"},
          {"text": "🎵 دانلود موزیک",     "callback_data": "mode_music"}],
         [{"text": "📱 دانلود APK",        "callback_data": "mode_apk"},
-         {"text": "📚 Z-Library کتاب",   "callback_data": "mode_zlib"}],
+         {"text": "📚 دانلود کتاب و مقاله",   "callback_data": "mode_zlib"}],
         [{"text": "🖼 دانلود عکس",        "callback_data": "mode_images"},
          {"text": "🐙 GitHub",            "callback_data": "mode_github"}],
         [{"text": "📰 اخبار RSS",         "callback_data": "mode_rss"},
@@ -868,7 +868,6 @@ def main_menu_kb():
          {"text": "🌐 IP / دامنه",        "callback_data": "mode_iplookup"}],
         [{"text": "🛡 تشخیص ویروس",      "callback_data": "mode_virusscan"},
          {"text": "🔒 حریم خصوصی",       "callback_data": "privacy"}],
-        # Full-width social networks button
         [{"text": "📲  شبکه‌های اجتماعی  📲", "callback_data": "mode_social"}],
         [{"text": "📊 آمار کاربری",       "callback_data": "stats"},
          {"text": "❓ راهنما",             "callback_data": "help"}],
@@ -964,7 +963,7 @@ def tiktok_kb():
     ]}
 
 def zlib_kb():
-    """منوی اصلی Z-Library."""
+    """منوی دانلود کتاب و مقاله."""
     return {"inline_keyboard": [
         [{"text": "🔍 جستجوی کتاب",   "callback_data": "zlib_search"},
          {"text": "🔍 جستجوی مقاله",  "callback_data": "zlib_search_art"}],
@@ -976,7 +975,7 @@ def zlib_kb():
 
 
 def zlib_results_kb(results: list, cache_key: str) -> dict:
-    """نتایج Z-Library به‌صورت دکمه."""
+    """نتایج جستجوی کتاب به‌صورت دکمه."""
     rows = []
     for i, book in enumerate(results[:10]):
         name    = book.get("name", f"کتاب {i+1}")[:38]
@@ -4290,146 +4289,178 @@ def _libgen_session() -> requests.Session:
 def libgen_search(query: str, count: int = 10,
                   extensions: list = None) -> list[dict]:
     """
-    Search Library Genesis — no login needed.
-    Strategy 1: libgen.li search.php (HTML scrape) + json.php metadata
-    Strategy 2: libgen.is as mirror fallback
-    Returns list of dicts with keys: id, name, authors, year, publisher,
-    language, extension, size, cover, md5, url
+    Search for books using multiple strategies:
+    1. Open Library JSON API (no auth, no IP blocks, always reachable)
+    2. libgen.li catalog via WARP (HTML scrape + json.php)
+    Returns list of dicts: id, name, authors, year, publisher,
+    language, extension, size, cover, md5, url, _source
     """
     log.info("libgen_search: %r  ext=%s", query, extensions)
     if not query.strip():
         return []
 
     sess = _libgen_session()
-    import urllib.parse as _up
+    results = []
 
+    # ── Strategy 1: Open Library (always reachable, no blocks) ──────────────
+    try:
+        params = {"q": query, "limit": count * 2, "fields": (
+            "key,title,author_name,first_publish_year,publisher,"
+            "language,isbn,cover_i,subject")}
+        r = sess.get("https://openlibrary.org/search.json", params=params,
+                     headers={"User-Agent": "BaleBot/1.0 (bot@example.com)",
+                              "Accept": "application/json"},
+                     timeout=15)
+        log.debug("libgen_search OpenLibrary: HTTP %d", r.status_code)
+        if r.status_code == 200:
+            data = r.json()
+            for doc in data.get("docs", []):
+                title = (doc.get("title") or "").strip()
+                if not title:
+                    continue
+                authors  = doc.get("author_name", [])[:3]
+                year     = str(doc.get("first_publish_year") or "")
+                pub_list = doc.get("publisher", [])
+                pub      = pub_list[0] if pub_list else ""
+                lang_raw = doc.get("language", [])
+                language = lang_raw[0].upper() if lang_raw else ""
+                cover_id = doc.get("cover_i")
+                cover    = f"https://covers.openlibrary.org/b/id/{cover_id}-M.jpg" if cover_id else ""
+                isbn_list = doc.get("isbn", [])
+                isbn     = isbn_list[0] if isbn_list else ""
+                ol_key   = doc.get("key", "")  # e.g. /works/OL12345W
+                ol_url   = f"https://openlibrary.org{ol_key}" if ol_key else ""
+
+                # Extension filter: Open Library doesn't have files directly,
+                # so skip extension filtering here — user will get metadata only
+                results.append({
+                    "id":        ol_key.split("/")[-1] if ol_key else "",
+                    "name":      title,
+                    "authors":   authors,
+                    "year":      year,
+                    "publisher": pub,
+                    "language":  language,
+                    "extension": "",   # no direct file
+                    "size":      "",
+                    "cover":     cover,
+                    "md5":       "",   # populated later by libgen lookup if available
+                    "isbn":      isbn,
+                    "url":       ol_url,
+                    "_source":   "openlibrary",
+                })
+                if len(results) >= count:
+                    break
+    except Exception as e:
+        log.warning("libgen_search OpenLibrary: %s", e)
+
+    # If we got enough from OL, try to enrich with MD5 from libgen for downloadable results
+    if results:
+        # Try to find MD5 for download via libgen search in background
+        try:
+            _libgen_enrich_md5(results, sess, extensions)
+        except Exception as e:
+            log.debug("libgen_search enrich: %s", e)
+        log.info("libgen_search: %d results via OpenLibrary", len(results))
+        return results
+
+    # ── Strategy 2: libgen.li catalog (needs WARP) ───────────────────────────
     for mirror in LIBGEN_MIRRORS:
         try:
-            # Build search URL — libgen search.php
-            params = {
-                "req": query,
-                "res": min(count * 2, 25),
-                "page": 1,
-                "sort": "def",
-                "sortmode": "DESC",
-                "columns[]": "t,a,s,y,p,i",
-            }
+            params = {"req": query, "res": min(count * 2, 25),
+                      "page": 1, "sort": "def", "sortmode": "DESC"}
             r = sess.get(f"{mirror}/index.php", params=params,
-                         headers={"User-Agent": UA_DESK, "Accept": "text/html"},
-                         timeout=20)
-            log.debug("libgen_search %s: HTTP %d", mirror, r.status_code)
-            if r.status_code != 200:
+                         headers={"User-Agent": UA_DESK}, timeout=20)
+            log.debug("libgen_search %s: HTTP %d  len=%d", mirror, r.status_code, len(r.content))
+            if r.status_code != 200 or len(r.content) < 500:
                 continue
 
             soup = BeautifulSoup(r.text, "html.parser")
 
-            # Collect edition IDs from search results table
+            # libgen.li uses table.catalog with edition links
             ids = []
-            for a in soup.select("table.catalog tr td a[href*='/edition.php']"):
-                href = a.get("href","")
-                m = re.search(r"id=(\d+)", href)
-                if m:
-                    ids.append(m.group(1))
-            # Fallback: libgen.is style table
-            if not ids:
-                for a in soup.select("table#tablelibgen tr td a[href*='book/index.php']"):
-                    href = a.get("href","")
-                    m = re.search(r"id=(\d+)", href)
-                    if m:
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if "edition.php" in href or ("index.php" in href and "id=" in href):
+                    m = re.search(r"[?&]id=(\d+)", href)
+                    if m and m.group(1) not in ids:
                         ids.append(m.group(1))
+                if len(ids) >= count:
+                    break
 
             if not ids:
-                log.debug("libgen_search: no IDs found at %s", mirror)
+                log.debug("libgen_search: no IDs at %s (body: %r…)", mirror, r.text[:80])
                 continue
 
-            ids = ids[:count]
-
             # Fetch metadata via JSON API
-            j_url = f"{mirror}/json.php?object=e&ids={','.join(ids)}&fields=*&addkeys=101,401,863"
-            jr = sess.get(j_url, headers={"User-Agent": UA_DESK}, timeout=15)
+            jr = sess.get(
+                f"{mirror}/json.php?object=e&ids={','.join(ids)}&fields=*&addkeys=101,401,863",
+                headers={"User-Agent": UA_DESK}, timeout=15)
             if jr.status_code != 200:
-                log.debug("libgen_search json %s: HTTP %d", mirror, jr.status_code)
                 continue
 
             items = jr.json()
             if not isinstance(items, list):
                 items = list(items.values()) if isinstance(items, dict) else []
 
-            results = []
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                e_id    = str(item.get("e_id", ""))
-                title   = item.get("title", "").strip()
+                title = (item.get("title") or "").strip()
                 if not title:
                     continue
-                year    = str(item.get("year", "") or "")
-                pub     = item.get("publisher", "").strip()
-                lang_raw = item.get("add", {})
+                e_id  = str(item.get("e_id", ""))
+                year  = str(item.get("year") or "")
+                pub   = (item.get("publisher") or "").strip()
+                add   = item.get("add") or {}
+
                 language = ""
-                if isinstance(lang_raw, dict):
-                    lang_entry = lang_raw.get("101")
-                    if isinstance(lang_entry, list) and lang_entry:
-                        language = lang_entry[0].get("value", "") if isinstance(lang_entry[0], dict) else str(lang_entry[0])
-                    elif isinstance(lang_entry, str):
-                        language = lang_entry
+                lang_e = add.get("101")
+                if isinstance(lang_e, list) and lang_e:
+                    language = (lang_e[0].get("value","") if isinstance(lang_e[0],dict)
+                                else str(lang_e[0]))
 
-                # Authors from add key 401
                 authors = []
-                if isinstance(lang_raw, dict):
-                    auth_entry = lang_raw.get("401", [])
-                    if isinstance(auth_entry, list):
-                        for ae in auth_entry:
-                            if isinstance(ae, dict):
-                                parts = [ae.get("family",""), ae.get("name","")]
-                                aname = " ".join(p for p in parts if p).strip()
-                                if aname: authors.append(aname)
-                            elif isinstance(ae, str) and ae.strip():
-                                authors.append(ae.strip())
+                for ae in (add.get("401") or []):
+                    if isinstance(ae, dict):
+                        n = " ".join(p for p in [ae.get("family",""), ae.get("name","")] if p)
+                        if n: authors.append(n)
+                    elif isinstance(ae, str) and ae.strip():
+                        authors.append(ae.strip())
 
-                # Cover from add key 863
                 cover = ""
-                if isinstance(lang_raw, dict):
-                    cov_entry = lang_raw.get("863", [])
-                    if isinstance(cov_entry, list) and cov_entry:
-                        ce = cov_entry[0]
-                        if isinstance(ce, dict):
-                            cpath = ce.get("cover","") or ce.get("url","")
-                            if cpath:
-                                cover = cpath if cpath.startswith("http") else f"{mirror}/{cpath.lstrip('/')}"
+                for ce in (add.get("863") or []):
+                    if isinstance(ce, dict):
+                        cp = ce.get("cover","") or ce.get("url","")
+                        if cp:
+                            cover = cp if cp.startswith("http") else f"{mirror}/{cp.lstrip('/')}"
+                            break
 
-                # Files attached to this edition — get MD5 for download
-                md5 = ""
-                ext = ""
-                size_str = ""
-                files = item.get("files", [])
-                if isinstance(files, list) and files:
-                    # Prefer file matching requested extension
-                    chosen = None
-                    for f in files:
-                        fext = (f.get("extension","") or "").lower()
-                        if extensions:
-                            if fext in [e.lower() for e in extensions]:
-                                chosen = f; break
-                        else:
-                            chosen = f; break
-                    if not chosen:
-                        chosen = files[0]
-                    md5      = (chosen.get("md5","") or "").lower()
-                    ext      = (chosen.get("extension","") or "").lower()
-                    fsz      = chosen.get("filesize", 0) or 0
-                    if fsz:
-                        size_str = f"{fsz/1024/1024:.1f} MB" if fsz > 1024*1024 else f"{fsz//1024} KB"
+                md5, ext, size_str = "", "", ""
+                for f in (item.get("files") or []):
+                    fext = (f.get("extension","") or "").lower()
+                    if extensions and fext not in [e.lower() for e in extensions]:
+                        continue
+                    md5 = (f.get("md5","") or "").lower()
+                    ext = fext
+                    fsz = f.get("filesize", 0) or 0
+                    size_str = (f"{fsz/1024/1024:.1f} MB" if fsz > 1024*1024
+                                else f"{fsz//1024} KB") if fsz else ""
+                    break
+                if not md5 and item.get("files"):
+                    f = item["files"][0]
+                    md5 = (f.get("md5","") or "").lower()
+                    ext = (f.get("extension","") or "").lower()
 
                 if not md5:
-                    continue  # can't download without MD5
+                    continue
 
-                book_url = f"{mirror}/edition.php?id={e_id}"
                 results.append({
                     "id": e_id, "name": title, "authors": authors,
                     "year": year, "publisher": pub, "language": language,
                     "extension": ext, "size": size_str,
-                    "cover": cover, "md5": md5, "url": book_url,
+                    "cover": cover, "md5": md5,
+                    "url": f"{mirror}/edition.php?id={e_id}",
+                    "_source": "libgen",
                 })
                 if len(results) >= count:
                     break
@@ -4440,66 +4471,153 @@ def libgen_search(query: str, count: int = 10,
 
         except Exception as e:
             log.warning("libgen_search %s: %s", mirror, e)
-            continue
 
-    log.error("libgen_search: all mirrors failed for %r", query)
+    log.error("libgen_search: all sources failed for %r", query)
     return []
+
+
+def _libgen_enrich_md5(results: list, sess: requests.Session,
+                        extensions: list = None) -> None:
+    """
+    Try to enrich Open Library results with MD5 from libgen
+    so the download button works. Best-effort — silently skips on failure.
+    """
+    for book in results:
+        if book.get("md5"):
+            continue
+        title   = book.get("name","")
+        authors = book.get("authors",[""])
+        author  = authors[0] if authors else ""
+        q       = f"{title} {author}".strip()[:80]
+        try:
+            for mirror in LIBGEN_MIRRORS:
+                r = sess.get(
+                    f"{mirror}/index.php",
+                    params={"req": q, "res": 5, "page": 1},
+                    headers={"User-Agent": UA_DESK}, timeout=10)
+                if r.status_code != 200 or len(r.content) < 500:
+                    continue
+                soup = BeautifulSoup(r.text, "html.parser")
+                ids = []
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    if "edition.php" in href or ("index.php" in href and "id=" in href):
+                        m = re.search(r"[?&]id=(\d+)", href)
+                        if m and m.group(1) not in ids:
+                            ids.append(m.group(1))
+                    if len(ids) >= 3:
+                        break
+                if not ids:
+                    continue
+                jr = sess.get(
+                    f"{mirror}/json.php?object=e&ids={','.join(ids)}&fields=*",
+                    headers={"User-Agent": UA_DESK}, timeout=10)
+                if jr.status_code != 200:
+                    continue
+                items = jr.json()
+                if not isinstance(items, list):
+                    items = list(items.values()) if isinstance(items, dict) else []
+                for item in items:
+                    for f in (item.get("files") or []):
+                        fext = (f.get("extension","") or "").lower()
+                        if extensions and fext not in [e.lower() for e in extensions]:
+                            continue
+                        md5 = (f.get("md5","") or "").lower()
+                        if md5:
+                            book["md5"]       = md5
+                            book["extension"] = fext
+                            book["_source"]   = "libgen"
+                            fsz = f.get("filesize",0) or 0
+                            book["size"] = (f"{fsz/1024/1024:.1f} MB"
+                                           if fsz > 1024*1024 else f"{fsz//1024} KB") if fsz else ""
+                            break
+                    if book.get("md5"):
+                        break
+                if book.get("md5"):
+                    break
+        except Exception:
+            pass
 
 
 def libgen_download(md5: str, title: str = "book",
                     ext: str = "pdf") -> Optional[tuple[bytes, str]]:
     """
-    Download a book from Library Genesis using its MD5.
-    Tries library.lol/main/{MD5} then mirror fallbacks.
+    Download a book by MD5 from libgen.
+    Uses ads.php → get.php pattern documented in libgen mirrors table.
     """
     log.info("libgen_download: md5=%s", md5)
     if not md5:
         return None
 
-    sess = _libgen_session()
-    md5l = md5.lower()
-    safe_title = re.sub(r"[^\w\s\-.]", "_", title)[:80]
-    fname = f"{safe_title}.{ext}" if ext else f"{safe_title}.bin"
+    sess  = _libgen_session()
+    md5l  = md5.lower()
+    safe  = re.sub(r"[^\w\s\-.]", "_", title)[:80]
+    fname = f"{safe}.{ext}" if ext else f"{safe}.bin"
     hdrs  = {"User-Agent": UA_DESK}
 
-    for dl_mirror in LIBGEN_DL_MIRRORS:
+    # Per libgen mirrors doc: default download is /ads.php?md5=... → /get.php?...
+    for mirror in LIBGEN_MIRRORS:
         try:
-            # Step 1: get the actual download page to find direct link
-            page_url = f"{dl_mirror}/main/{md5l}"
-            rp = sess.get(page_url, headers=hdrs, timeout=15)
-            log.debug("libgen_download page %s: HTTP %d", dl_mirror, rp.status_code)
-            if rp.status_code != 200:
+            ads_url = f"{mirror}/ads.php?md5={md5l}"
+            rp = sess.get(ads_url, headers=hdrs, timeout=15)
+            log.debug("libgen_download ads %s: HTTP %d  len=%d",
+                      mirror, rp.status_code, len(rp.content))
+            if rp.status_code != 200 or len(rp.content) < 200:
                 continue
 
             soup = BeautifulSoup(rp.text, "html.parser")
-            # library.lol has "GET" button with direct link
-            dl_a = (soup.select_one("a[href*='/get.php']") or
-                    soup.select_one("a[href*='cloudflare-ipfs']") or
-                    soup.select_one("#download a") or
-                    soup.select_one("a[href*=md5]"))
+            # Find the GET/download link — libgen ads page has <a href="/get.php?...">
+            dl_a = (soup.select_one("a[href*='get.php']") or
+                    soup.select_one("a[href*='/main/']") or
+                    soup.select_one("#download h2 a") or
+                    soup.select_one("a[href*='md5']"))
             if not dl_a:
-                log.debug("libgen_download: no link found at %s", dl_mirror)
+                log.debug("libgen_download: no get link at %s, body: %r…",
+                          mirror, rp.text[:120])
                 continue
 
-            href = dl_a.get("href","")
-            dl_url = href if href.startswith("http") else f"{dl_mirror}{href}"
+            href   = dl_a.get("href", "")
+            dl_url = href if href.startswith("http") else f"{mirror}{href}"
+            log.debug("libgen_download: fetching %s", dl_url)
 
-            # Step 2: download the actual file
-            resp = sess.get(dl_url, headers={**hdrs, "Referer": page_url},
+            resp = sess.get(dl_url, headers={**hdrs, "Referer": ads_url},
                             timeout=120, allow_redirects=True)
-            if resp.status_code == 200 and len(resp.content) > 1000:
-                # Try to get filename from Content-Disposition
-                cd = resp.headers.get("Content-Disposition","")
+            if resp.status_code == 200 and len(resp.content) > 5000:
+                cd = resp.headers.get("Content-Disposition", "")
                 if "filename=" in cd:
-                    mf = re.search(r"filename=[\"']?([^\"';\r\n]+)", cd)
+                    mf = re.search("filename=([^;\r\n]+)", cd)
                     if mf:
                         fname = mf.group(1).strip()
-                log.info("libgen_download OK: %s  %.1fMB", fname, len(resp.content)/1024/1024)
+                log.info("libgen_download OK: %s  %.1fMB",
+                         fname, len(resp.content)/1024/1024)
                 return resp.content, fname
 
         except Exception as e:
-            log.warning("libgen_download %s: %s", dl_mirror, e)
-            continue
+            log.warning("libgen_download %s: %s", mirror, e)
+
+    # Fallback: library.lol
+    for dl_mirror in LIBGEN_DL_MIRRORS:
+        try:
+            page_url = f"{dl_mirror}/main/{md5l}"
+            rp = sess.get(page_url, headers=hdrs, timeout=15)
+            log.debug("libgen_download lol %s: HTTP %d", dl_mirror, rp.status_code)
+            if rp.status_code != 200:
+                continue
+            soup = BeautifulSoup(rp.text, "html.parser")
+            dl_a = (soup.select_one("a[href*='get.php']") or
+                    soup.select_one("#download a") or
+                    soup.select_one("a[href*='cloudflare-ipfs']"))
+            if not dl_a:
+                continue
+            href   = dl_a.get("href","")
+            dl_url = href if href.startswith("http") else f"{dl_mirror}{href}"
+            resp   = sess.get(dl_url, headers={**hdrs, "Referer": page_url},
+                              timeout=120, allow_redirects=True)
+            if resp.status_code == 200 and len(resp.content) > 5000:
+                log.info("libgen_download lol OK: %.1fMB", len(resp.content)/1024/1024)
+                return resp.content, fname
+        except Exception as e:
+            log.warning("libgen_download lol %s: %s", dl_mirror, e)
 
     log.error("libgen_download: all mirrors failed for md5=%s", md5)
     return None
@@ -4647,7 +4765,7 @@ HELP_TEXT = """❓ *راهنمای بله قربان*
 📸 *اینستاگرام* — پست‌های پروفایل + دانلود ریل/عکس خودکار
 🎵 *تیک‌تاک* — لیست ویدیوها + دانلود (لینک مستقیم هم کار می‌کند)
 📰 *اخبار RSS* — دریافت فید + کشف خودکار فید سایت
-📚 *Z-Library* — جستجو و دانلود کتاب/مقاله (PDF، EPUB، MOBI، FB2)
+📚 *دانلود کتاب و مقاله* — Library Genesis & Open Library (PDF، EPUB، MOBI، FB2)
 📱 *دانلود APK* — جستجوی Google Play + دانلود APK (APKPure / APKMirror / F-Droid)
 🌐 *ترجمه* — ۶ زبان، متن طولانی
 🖼 *OCR* — استخراج متن از عکس + PDF
@@ -5391,7 +5509,7 @@ def do_zlib_show_book(cid: int, book: dict):
             if img_bytes and len(img_bytes) > 500:
                 send_photo(cid, img_bytes, caption=name[:80])
         except Exception as e:
-            log.warning("zlib cover: %s", e)
+            log.warning("book cover: %s", e)
 
     # متن اطلاعات
     lines = [f"📚 *{name}*"]
@@ -7875,7 +7993,7 @@ def handle_callback(cb: dict):
 
     # ── Z-Library callbacks ───────────────────────────────────────────────
     if data == "mode_zlib":
-        send_message(cid, "📚 Z-Library:", reply_markup=zlib_kb()); return
+        send_message(cid, "📚 دانلود کتاب و مقاله:", reply_markup=zlib_kb()); return
 
     if data in ("zlib_search", "zlib_search_art"):
         prompt = ("🔍 عنوان کتاب یا نام نویسنده را بنویسید:"
