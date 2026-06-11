@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.15)
+بله قربان — Bale Bot  (v2.16)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -143,19 +143,20 @@ COBALT_URL = os.getenv("COBALT_URL", "http://localhost:9000")
 # Get your key at https://www.virustotal.com/gui/join-us
 VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
 
-ZLIB_DOMAINS = [
-    "https://z-lib.sk",
-    "https://z-library.sk",
-    "https://z-lib.fm",
-    "https://z-lib.gd",
-    "https://1lib.sk",
-    "https://zlib.li",
-    "https://z-library.ec",
+# Library Genesis — no login required, public API
+LIBGEN_MIRRORS = [
+    "https://libgen.li",
+    "https://libgen.is",
+    "https://libgen.st",
 ]
+LIBGEN_DL_MIRRORS = [
+    "https://library.lol",
+    "https://libgen.rocks",
+    "https://books.ms",
+]
+# Keep these for backward compat (no longer used for login)
 ZLIB_EMAIL    = os.getenv("ZLIB_EMAIL", "")
 ZLIB_PASSWORD = os.getenv("ZLIB_PASSWORD", "")
-_zlib_client  = None   # cached login state: {"cookies": dict, "mirror": str, "uid": str, "key": str}
-_zlib_lock    = threading.Lock()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4281,306 +4282,227 @@ def apk_download(app_id: str) -> Optional[tuple[bytes, str]]:
 
 
 
-def _zlib_session() -> requests.Session:
-    """Return session routed through WARP proxy if available."""
+def _libgen_session() -> requests.Session:
+    """Return HTTP session (WARP proxy if configured)."""
     return _get_web(use_warp=bool(WARP_PROXY))
 
 
-def _zlib_login(force: bool = False) -> Optional[dict]:
+def libgen_search(query: str, count: int = 10,
+                  extensions: list = None) -> list[dict]:
     """
-    Login to Z-Library via eAPI (mobile app API) then web rpc fallback.
-    Returns {"cookies": dict, "mirror": str, "uid": str, "key": str} or None.
-    Tries all known mirrors until one succeeds.
+    Search Library Genesis — no login needed.
+    Strategy 1: libgen.li search.php (HTML scrape) + json.php metadata
+    Strategy 2: libgen.is as mirror fallback
+    Returns list of dicts with keys: id, name, authors, year, publisher,
+    language, extension, size, cover, md5, url
     """
-    global _zlib_client
-    if _zlib_client is not None and not force:
-        return _zlib_client
-    _zlib_client = None  # reset before fresh attempt
-
-    if not ZLIB_EMAIL or not ZLIB_PASSWORD:
-        log.error("_zlib_login: ZLIB_EMAIL/ZLIB_PASSWORD not set in .env")
-        return None
-
-    sess = _zlib_session()
-    payload = {"email": ZLIB_EMAIL, "password": ZLIB_PASSWORD,
-               "name": "libApp", "appVersion": "3.27.1", "platform": "android"}
-
-    for mirror in ZLIB_DOMAINS:
-        # Try eAPI login
-        try:
-            r = sess.post(f"{mirror}/eapi/user/login", json=payload,
-                          headers={"Content-Type": "application/json",
-                                   "User-Agent": "okhttp/4.11.0",
-                                   "Accept": "application/json"},
-                          timeout=15)
-            log.debug("_zlib_login eAPI %s: HTTP %d body=%r", mirror, r.status_code, r.text[:120])
-            if r.status_code == 200:
-                try:
-                    j = r.json()
-                except Exception:
-                    log.debug("_zlib_login eAPI %s: non-JSON body", mirror)
-                    j = {}
-                if j.get("success"):
-                    uid = str(j.get("user", {}).get("id", ""))
-                    key = j.get("user", {}).get("remix_userkey", "")
-                    _zlib_client = {"cookies": {"remix_userid": uid, "remix_userkey": key},
-                                    "mirror": mirror, "uid": uid, "key": key}
-                    log.info("_zlib_login: OK via eAPI %s", mirror)
-                    return _zlib_client
-                else:
-                    log.debug("_zlib_login eAPI %s: success=false — %s", mirror, j.get("error", ""))
-        except Exception as e:
-            log.debug("_zlib_login eAPI %s: %s", mirror, e)
-
-        # Try web rpc.php login — GET homepage first to acquire session cookies
-        try:
-            sess.get(mirror, headers={"User-Agent": UA_DESK}, timeout=10)
-        except Exception:
-            pass
-        try:
-            r2 = sess.post(f"{mirror}/rpc.php",
-                           data={"isModal": True, "email": ZLIB_EMAIL,
-                                 "password": ZLIB_PASSWORD, "action": "login",
-                                 "redirectUrl": "/"},
-                           headers={"User-Agent": UA_DESK,
-                                    "Content-Type": "application/x-www-form-urlencoded",
-                                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                                    "X-Requested-With": "XMLHttpRequest",
-                                    "Origin": mirror,
-                                    "Referer": f"{mirror}/"},
-                           timeout=15)
-            log.debug("_zlib_login web %s: HTTP %d body=%r", mirror, r2.status_code, r2.text[:120])
-            if r2.status_code == 200:
-                try:
-                    j2 = r2.json()
-                except Exception:
-                    log.debug("_zlib_login web %s: non-JSON body (len=%d) body=%r",
-                              mirror, len(r2.content), r2.text[:80])
-                    continue
-                if j2.get("user_id"):
-                    uid = str(j2["user_id"])
-                    key = j2.get("user_key", "")
-                    cookies = dict(r2.cookies)
-                    cookies.update({"remix_userid": uid, "remix_userkey": key})
-                    _zlib_client = {"cookies": cookies, "mirror": mirror,
-                                    "uid": uid, "key": key}
-                    log.info("_zlib_login: OK via web rpc %s", mirror)
-                    return _zlib_client
-                else:
-                    log.debug("_zlib_login web %s: no user_id in response — %s",
-                              mirror, j2.get("error",""))
-        except Exception as e:
-            log.debug("_zlib_login web %s: %s", mirror, e)
-
-    log.error("_zlib_login: all mirrors failed")
-    return None
-
-
-def zlib_search(query: str, count: int = 10,
-                extensions: list = None, exact: bool = False) -> list[dict]:
-    """Search Z-Library via eAPI then web scrape fallback."""
-    log.info("zlib_search: %r  ext=%s", query, extensions)
+    log.info("libgen_search: %r  ext=%s", query, extensions)
     if not query.strip():
         return []
 
-    state = _zlib_login()
-    if not state:
-        return []
+    sess = _libgen_session()
+    import urllib.parse as _up
 
-    mirror  = state["mirror"]
-    cookies = state["cookies"]
-    sess    = _zlib_session()
+    for mirror in LIBGEN_MIRRORS:
+        try:
+            # Build search URL — libgen search.php
+            params = {
+                "req": query,
+                "res": min(count * 2, 25),
+                "page": 1,
+                "sort": "def",
+                "sortmode": "DESC",
+                "columns[]": "t,a,s,y,p,i",
+            }
+            r = sess.get(f"{mirror}/index.php", params=params,
+                         headers={"User-Agent": UA_DESK, "Accept": "text/html"},
+                         timeout=20)
+            log.debug("libgen_search %s: HTTP %d", mirror, r.status_code)
+            if r.status_code != 200:
+                continue
 
-    # Strategy 1: eAPI search
-    try:
-        payload: dict = {"message": query, "count": count, "type": "books"}
-        if extensions:
-            payload["extensions"] = [e.lower() for e in extensions]
-        r = sess.post(f"{mirror}/eapi/book/search", json=payload,
-                      headers={"User-Agent": "okhttp/4.11.0",
-                               "Content-Type": "application/json"},
-                      cookies=cookies, timeout=20)
-        log.debug("zlib_search eAPI: HTTP %d", r.status_code)
-        if r.status_code in (401, 403):
-            # Session expired — force re-login and retry once
-            log.warning("zlib_search eAPI: %d, forcing re-login", r.status_code)
-            state = _zlib_login(force=True)
-            if state:
-                mirror = state["mirror"]; cookies = state["cookies"]
-                r = sess.post(f"{mirror}/eapi/book/search", json=payload,
-                              headers={"User-Agent": "okhttp/4.11.0",
-                                       "Content-Type": "application/json"},
-                              cookies=cookies, timeout=20)
-        if r.status_code == 200:
-            books = r.json().get("books", [])
-            if books:
-                results = []
-                for b in books[:count]:
-                    bid   = str(b.get("id", ""))
-                    title = b.get("title", "")
-                    ext   = (b.get("extension") or b.get("fileType") or "").lower()
-                    cover = b.get("cover") or b.get("coverUrl") or ""
-                    auths = b.get("authors", [])
-                    if isinstance(auths, list):
-                        authors = [a.get("name","") if isinstance(a,dict) else str(a) for a in auths]
-                    else:
-                        authors = [str(auths)]
-                    slug  = re.sub(r"[^\w\s-]", "", title).strip().replace(" ", "-")[:60]
-                    burl  = f"{mirror}/book/{bid}/{slug}"
-                    results.append({"id": bid, "name": title, "authors": authors,
-                                    "year": str(b.get("year","")), "publisher": "",
-                                    "language": b.get("language",""),
-                                    "extension": ext, "cover": cover, "url": burl})
-                log.info("zlib_search: %d results via eAPI", len(results))
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            # Collect edition IDs from search results table
+            ids = []
+            for a in soup.select("table.catalog tr td a[href*='/edition.php']"):
+                href = a.get("href","")
+                m = re.search(r"id=(\d+)", href)
+                if m:
+                    ids.append(m.group(1))
+            # Fallback: libgen.is style table
+            if not ids:
+                for a in soup.select("table#tablelibgen tr td a[href*='book/index.php']"):
+                    href = a.get("href","")
+                    m = re.search(r"id=(\d+)", href)
+                    if m:
+                        ids.append(m.group(1))
+
+            if not ids:
+                log.debug("libgen_search: no IDs found at %s", mirror)
+                continue
+
+            ids = ids[:count]
+
+            # Fetch metadata via JSON API
+            j_url = f"{mirror}/json.php?object=e&ids={','.join(ids)}&fields=*&addkeys=101,401,863"
+            jr = sess.get(j_url, headers={"User-Agent": UA_DESK}, timeout=15)
+            if jr.status_code != 200:
+                log.debug("libgen_search json %s: HTTP %d", mirror, jr.status_code)
+                continue
+
+            items = jr.json()
+            if not isinstance(items, list):
+                items = list(items.values()) if isinstance(items, dict) else []
+
+            results = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                e_id    = str(item.get("e_id", ""))
+                title   = item.get("title", "").strip()
+                if not title:
+                    continue
+                year    = str(item.get("year", "") or "")
+                pub     = item.get("publisher", "").strip()
+                lang_raw = item.get("add", {})
+                language = ""
+                if isinstance(lang_raw, dict):
+                    lang_entry = lang_raw.get("101")
+                    if isinstance(lang_entry, list) and lang_entry:
+                        language = lang_entry[0].get("value", "") if isinstance(lang_entry[0], dict) else str(lang_entry[0])
+                    elif isinstance(lang_entry, str):
+                        language = lang_entry
+
+                # Authors from add key 401
+                authors = []
+                if isinstance(lang_raw, dict):
+                    auth_entry = lang_raw.get("401", [])
+                    if isinstance(auth_entry, list):
+                        for ae in auth_entry:
+                            if isinstance(ae, dict):
+                                parts = [ae.get("family",""), ae.get("name","")]
+                                aname = " ".join(p for p in parts if p).strip()
+                                if aname: authors.append(aname)
+                            elif isinstance(ae, str) and ae.strip():
+                                authors.append(ae.strip())
+
+                # Cover from add key 863
+                cover = ""
+                if isinstance(lang_raw, dict):
+                    cov_entry = lang_raw.get("863", [])
+                    if isinstance(cov_entry, list) and cov_entry:
+                        ce = cov_entry[0]
+                        if isinstance(ce, dict):
+                            cpath = ce.get("cover","") or ce.get("url","")
+                            if cpath:
+                                cover = cpath if cpath.startswith("http") else f"{mirror}/{cpath.lstrip('/')}"
+
+                # Files attached to this edition — get MD5 for download
+                md5 = ""
+                ext = ""
+                size_str = ""
+                files = item.get("files", [])
+                if isinstance(files, list) and files:
+                    # Prefer file matching requested extension
+                    chosen = None
+                    for f in files:
+                        fext = (f.get("extension","") or "").lower()
+                        if extensions:
+                            if fext in [e.lower() for e in extensions]:
+                                chosen = f; break
+                        else:
+                            chosen = f; break
+                    if not chosen:
+                        chosen = files[0]
+                    md5      = (chosen.get("md5","") or "").lower()
+                    ext      = (chosen.get("extension","") or "").lower()
+                    fsz      = chosen.get("filesize", 0) or 0
+                    if fsz:
+                        size_str = f"{fsz/1024/1024:.1f} MB" if fsz > 1024*1024 else f"{fsz//1024} KB"
+
+                if not md5:
+                    continue  # can't download without MD5
+
+                book_url = f"{mirror}/edition.php?id={e_id}"
+                results.append({
+                    "id": e_id, "name": title, "authors": authors,
+                    "year": year, "publisher": pub, "language": language,
+                    "extension": ext, "size": size_str,
+                    "cover": cover, "md5": md5, "url": book_url,
+                })
+                if len(results) >= count:
+                    break
+
+            if results:
+                log.info("libgen_search: %d results via %s", len(results), mirror)
                 return results
-    except Exception as e:
-        log.warning("zlib_search eAPI: %s", e)
 
-    # Strategy 2: web scrape
-    import urllib.parse as up
-    web_cookies = {**cookies, "remix_userid": state["uid"], "remix_userkey": state["key"]}
-    params = "?page=1"
-    if exact: params += "&e=1"
-    if extensions:
-        for ext in extensions:
-            params += f"&extensions%5B%5D={ext.upper()}"
-    search_url = f"{mirror}/s/{up.quote(query)}{params}"
-    log.info("zlib_search: web fallback GET %s", search_url)
-    try:
-        r = sess.get(search_url, cookies=web_cookies,
-                     headers={"User-Agent": UA_DESK, "Accept": "text/html",
-                              "Referer": mirror}, timeout=20)
-    except Exception as e:
-        log.error("zlib_search web: %s", e); return []
-
-    if r.status_code != 200:
-        log.error("zlib_search web: HTTP %d", r.status_code)
-        global _zlib_client; _zlib_client = None; return []
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    results = []
-    cards = soup.select("z-bookcard") or soup.select(".book-item,.bookRow,.resItemBox")
-    for card in cards:
-        if len(results) >= count: break
-        try:
-            href = card.get("href") or card.get("url") or ""
-            name = card.get("title") or card.get("name") or ""
-            if not href:
-                a = card.select_one("a[href*='/book/']") or card.select_one("h3 a,h2 a")
-                if a: href = a.get("href",""); name = name or a.get_text(strip=True)
-            if not href: continue
-            url  = href if href.startswith("http") else f"{mirror}{href}"
-            name = name or url.rstrip("/").split("/")[-1].replace("-"," ").title()
-            auths_raw = card.get("authors","")
-            authors = [a.strip() for a in auths_raw.split(",") if a.strip()]
-            ext   = (card.get("extension") or card.get("format") or "").lower()
-            cover = card.get("cover") or card.get("image") or ""
-            if cover and not cover.startswith("http"): cover = f"{mirror}{cover}"
-            results.append({"id": url.rstrip("/").split("/")[-1], "name": name,
-                            "authors": authors, "year": card.get("year",""),
-                            "publisher": "", "language": card.get("language",""),
-                            "extension": ext, "cover": cover, "url": url})
-        except Exception: continue
-    log.info("zlib_search: %d results via web scrape", len(results))
-    return results
-
-
-def zlib_download(book_url: str) -> Optional[tuple[bytes, str]]:
-    """Download a book from Z-Library via eAPI then web scrape."""
-    log.info("zlib_download: %s", book_url)
-    state = _zlib_login()
-    if not state: return None
-
-    mirror  = state["mirror"]
-    cookies = state["cookies"]
-    uid, key = state["uid"], state["key"]
-    sess    = _zlib_session()
-    hdrs    = {"User-Agent": UA_DESK, "Referer": mirror}
-
-    m = re.search(r"/book/?(\d+)", book_url)
-    book_id = m.group(1) if m else ""
-
-    # Strategy 1: eAPI formats endpoint
-    if book_id:
-        try:
-            r = sess.post(f"{mirror}/eapi/book/{book_id}/formats", json={},
-                          headers={"User-Agent": "okhttp/4.11.0",
-                                   "Content-Type": "application/json"},
-                          cookies=cookies, timeout=20)
-            if r.status_code == 200:
-                j = r.json()
-                formats = j.get("books", [j])
-                for fmt in formats:
-                    dl_url = fmt.get("href") or fmt.get("url") or ""
-                    if not dl_url: continue
-                    if not dl_url.startswith("http"): dl_url = f"{mirror}{dl_url}"
-                    resp = sess.get(dl_url, cookies=cookies, headers=hdrs,
-                                   timeout=120, allow_redirects=True)
-                    if resp.status_code == 200 and len(resp.content) > 500:
-                        ext   = (fmt.get("extension","") or
-                                 dl_url.rsplit(".",1)[-1].split("?")[0] or "pdf")
-                        title = fmt.get("title","book")[:80]
-                        safe  = re.sub(r"[^\w\s\-.]","_",title)
-                        log.info("zlib_download eAPI OK: %.1fMB", len(resp.content)/1024/1024)
-                        return resp.content, f"{safe}.{ext}"
         except Exception as e:
-            log.warning("zlib_download eAPI: %s", e)
+            log.warning("libgen_search %s: %s", mirror, e)
+            continue
 
-    # Strategy 2: web scrape
-    web_cookies = {**cookies, "remix_userid": uid, "remix_userkey": key}
-    try:
-        r = sess.get(book_url, cookies=web_cookies, headers=hdrs, timeout=20)
-    except Exception as e:
-        log.error("zlib_download web get: %s", e); return None
-    if r.status_code != 200:
-        log.error("zlib_download web: HTTP %d", r.status_code); return None
+    log.error("libgen_search: all mirrors failed for %r", query)
+    return []
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    title_el  = soup.select_one("h1[itemprop='name'],.book-title,h1")
-    page_title = title_el.get_text(strip=True) if title_el else "book"
-    ext_el    = soup.select_one(".property__file,.property_files .property_value")
-    page_ext  = "pdf"
-    if ext_el:
-        raw = ext_el.get_text(strip=True).split(",")[0].strip().lower()
-        if raw: page_ext = raw
 
-    dl_el = (soup.select_one("a.btn.btn-default.addDownloadedBook") or
-             soup.select_one("a[href*='/dl/']") or
-             soup.select_one("a[class*='download']") or
-             soup.select_one(".download-buttons a"))
-    if not dl_el or not dl_el.get("href"):
-        log.error("zlib_download: no download link"); return None
-
-    dl_href = dl_el["href"]
-    dl_url  = dl_href if dl_href.startswith("http") else f"{mirror}{dl_href}"
-    try:
-        resp = sess.get(dl_url, cookies=web_cookies,
-                        headers={**hdrs, "Referer": book_url},
-                        timeout=120, allow_redirects=True)
-    except Exception as e:
-        log.error("zlib_download file dl: %s", e); return None
-
-    if resp.status_code != 200 or len(resp.content) < 500:
-        log.error("zlib_download: bad resp %d %d", resp.status_code, len(resp.content))
+def libgen_download(md5: str, title: str = "book",
+                    ext: str = "pdf") -> Optional[tuple[bytes, str]]:
+    """
+    Download a book from Library Genesis using its MD5.
+    Tries library.lol/main/{MD5} then mirror fallbacks.
+    """
+    log.info("libgen_download: md5=%s", md5)
+    if not md5:
         return None
 
-    cd = resp.headers.get("Content-Disposition","")
-    fname = ""
-    if "filename=" in cd:
-        mf = re.search(r'filename=([^\s;]+)', cd)
-        if mf: fname = mf.group(1).strip('"').strip("'")
-    if not fname:
-        ct = resp.headers.get("Content-Type","")
-        ct_ext = {"application/pdf":"pdf","application/epub+zip":"epub",
-                  "application/x-mobipocket-ebook":"mobi",
-                  "application/x-fictionbook+xml":"fb2",
-                  "application/octet-stream":page_ext}
-        inferred = next((v for k,v in ct_ext.items() if k in ct), page_ext)
-        safe  = re.sub(r"[^\w\s\-.]","_",page_title)[:80]
-        fname = f"{safe}.{inferred}"
+    sess = _libgen_session()
+    md5l = md5.lower()
+    safe_title = re.sub(r"[^\w\s\-.]", "_", title)[:80]
+    fname = f"{safe_title}.{ext}" if ext else f"{safe_title}.bin"
+    hdrs  = {"User-Agent": UA_DESK}
 
-    log.info("zlib_download OK: %s  %.1fMB", fname, len(resp.content)/1024/1024)
-    return resp.content, fname
+    for dl_mirror in LIBGEN_DL_MIRRORS:
+        try:
+            # Step 1: get the actual download page to find direct link
+            page_url = f"{dl_mirror}/main/{md5l}"
+            rp = sess.get(page_url, headers=hdrs, timeout=15)
+            log.debug("libgen_download page %s: HTTP %d", dl_mirror, rp.status_code)
+            if rp.status_code != 200:
+                continue
+
+            soup = BeautifulSoup(rp.text, "html.parser")
+            # library.lol has "GET" button with direct link
+            dl_a = (soup.select_one("a[href*='/get.php']") or
+                    soup.select_one("a[href*='cloudflare-ipfs']") or
+                    soup.select_one("#download a") or
+                    soup.select_one("a[href*=md5]"))
+            if not dl_a:
+                log.debug("libgen_download: no link found at %s", dl_mirror)
+                continue
+
+            href = dl_a.get("href","")
+            dl_url = href if href.startswith("http") else f"{dl_mirror}{href}"
+
+            # Step 2: download the actual file
+            resp = sess.get(dl_url, headers={**hdrs, "Referer": page_url},
+                            timeout=120, allow_redirects=True)
+            if resp.status_code == 200 and len(resp.content) > 1000:
+                # Try to get filename from Content-Disposition
+                cd = resp.headers.get("Content-Disposition","")
+                if "filename=" in cd:
+                    mf = re.search(r"filename=[\"']?([^\"';\r\n]+)", cd)
+                    if mf:
+                        fname = mf.group(1).strip()
+                log.info("libgen_download OK: %s  %.1fMB", fname, len(resp.content)/1024/1024)
+                return resp.content, fname
+
+        except Exception as e:
+            log.warning("libgen_download %s: %s", dl_mirror, e)
+            continue
+
+    log.error("libgen_download: all mirrors failed for md5=%s", md5)
+    return None
 
 
 # ─── RSS ───────────────────────────────────────────────────────────────────────
@@ -5426,18 +5348,12 @@ def do_qr(cid: int, text: str):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def do_zlib_search(cid: int, query: str, extensions: list = None):
-    """جستجوی کتاب در Z-Library و نمایش نتایج به‌صورت دکمه."""
+    """Search Library Genesis and show results as buttons."""
     bump(cid, "searches")
-    if not ZLIB_EMAIL or not ZLIB_PASSWORD:
-        log.error("do_zlib_search: ZLIB_EMAIL/PASSWORD not configured")
-        send_message(cid, "❌ جستجوی کتاب در حال حاضر در دسترس نیست.",
-                     reply_markup=home_kb())
-        return
-
-    send_message(cid, f"⏳ در حال جستجو در Z-Library: _{query}_…",
+    send_message(cid, f"⏳ در حال جستجو در Library Genesis: _{query}_…",
                  parse_mode="Markdown")
     chat_action(cid)
-    results = zlib_search(query, count=10, extensions=extensions)
+    results = libgen_search(query, count=10, extensions=extensions)
 
     if not results:
         log.warning("do_zlib_search: no results for %r", query)
@@ -5451,10 +5367,9 @@ def do_zlib_search(cid: int, query: str, extensions: list = None):
               zlib_ext=extensions)
 
     ext_str = f" [{', '.join(extensions)}]" if extensions else ""
-    text = f"📚 *نتایج Z-Library{ext_str}:* _{query}_\nروی کتاب کلیک کنید:"
+    text = f"📚 *نتایج Library Genesis{ext_str}:* _{query}_\nروی کتاب کلیک کنید:"
     kb = zlib_results_kb(results, key)
     send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
-
 
 def do_zlib_show_book(cid: int, book: dict):
     """نمایش اطلاعات کامل کتاب + دکمه دانلود."""
@@ -5501,21 +5416,48 @@ def do_zlib_show_book(cid: int, book: dict):
 
 
 def do_zlib_download(cid: int, book_url: str):
-    """دانلود فایل کتاب از Z-Library و ارسال به کاربر."""
+    """Download a book from Library Genesis and send to user."""
     bump(cid, "downloads")
-    send_message(cid, "⏳ در حال دانلود کتاب از Z-Library…\n_(ممکن است چند ثانیه طول بکشد)_",
+    send_message(cid, "⏳ در حال دانلود کتاب از Library Genesis…\n_(ممکن است چند ثانیه طول بکشد)_",
                  parse_mode="Markdown")
     chat_action(cid, "upload_document")
 
-    result = zlib_download(book_url)
+    # Get md5/ext/title from cached search results
+    st = get_state(cid)
+    cache_key = st.get("cache_key", "")
+    md5, ext, title = "", "pdf", "book"
+    if cache_key:
+        cached = cache_get(cache_key)
+        if isinstance(cached, list):
+            for b in cached:
+                b_url_key = store_url(b.get("url", "")) if b.get("url") else ""
+                if b.get("url") == book_url or b_url_key == book_url:
+                    md5   = b.get("md5", "")
+                    ext   = b.get("extension", "pdf") or "pdf"
+                    title = b.get("name", "book")
+                    break
+
+    # Fallback: extract md5 directly from book_url
+    if not md5:
+        m = re.search(r"[a-fA-F0-9]{32}", book_url)
+        if m:
+            md5 = m.group(0).lower()
+
+    if not md5:
+        log.error("do_zlib_download: no md5 for %s", book_url)
+        send_message(cid, "❌ اطلاعات دانلود یافت نشد. دوباره جستجو کنید.",
+                     reply_markup=home_kb())
+        return
+
+    result = libgen_download(md5, title=title, ext=ext)
     if not result:
-        log.error("do_zlib_download: download failed for %s", book_url)
+        log.error("do_zlib_download: download failed md5=%s", md5)
         send_message(cid, "❌ دانلود ناموفق بود. دوباره امتحان کنید.",
                      reply_markup=home_kb())
         return
 
     data, fname = result
-    log.info("zlib: sending %s  %.1fMB", fname, len(data)/1024/1024)
+    log.info("libgen: sending %s  %.1fMB", fname, len(data)/1024/1024)
     if smart_send(cid, data, fname, caption=f"📚 {fname[:80]}"):
         send_message(cid, "✅ کتاب ارسال شد.", reply_markup=home_kb())
     else:
