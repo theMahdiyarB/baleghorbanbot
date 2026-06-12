@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.17)
+بله قربان — Bale Bot  (v2.18)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -145,9 +145,7 @@ VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
 
 # Library Genesis — no login required, public API
 LIBGEN_MIRRORS = [
-    "https://libgen.li",
-    "https://libgen.is",
-    "https://libgen.st",
+    "https://libgen.li",   # only one reachable from Hetzner; .is/.st time out
 ]
 LIBGEN_DL_MIRRORS = [
     "https://library.lol",
@@ -859,7 +857,7 @@ def main_menu_kb():
         [{"text": "📺 یوتیوب",            "callback_data": "mode_youtube"},
          {"text": "🎵 دانلود موزیک",     "callback_data": "mode_music"}],
         [{"text": "📱 دانلود APK",        "callback_data": "mode_apk"},
-         {"text": "📚 دانلود کتاب و مقاله",   "callback_data": "mode_zlib"}],
+         {"text": "📚 دانلود کتاب و مقاله",   "callback_data": "mode_book"}],
         [{"text": "🖼 دانلود عکس",        "callback_data": "mode_images"},
          {"text": "🐙 GitHub",            "callback_data": "mode_github"}],
         [{"text": "📰 اخبار RSS",         "callback_data": "mode_rss"},
@@ -868,6 +866,7 @@ def main_menu_kb():
          {"text": "🌐 IP / دامنه",        "callback_data": "mode_iplookup"}],
         [{"text": "🛡 تشخیص ویروس",      "callback_data": "mode_virusscan"},
          {"text": "🔒 حریم خصوصی",       "callback_data": "privacy"}],
+        # Full-width social networks button
         [{"text": "📲  شبکه‌های اجتماعی  📲", "callback_data": "mode_social"}],
         [{"text": "📊 آمار کاربری",       "callback_data": "stats"},
          {"text": "❓ راهنما",             "callback_data": "help"}],
@@ -962,19 +961,19 @@ def tiktok_kb():
         [{"text": "❌ انصراف",            "callback_data": "cancel"}],
     ]}
 
-def zlib_kb():
+def book_kb():
     """منوی دانلود کتاب و مقاله."""
     return {"inline_keyboard": [
-        [{"text": "🔍 جستجوی کتاب",   "callback_data": "zlib_search"},
-         {"text": "🔍 جستجوی مقاله",  "callback_data": "zlib_search_art"}],
-        [{"text": "📄 فقط PDF",        "callback_data": "zlib_filter_pdf"},
-         {"text": "📖 فقط EPUB",       "callback_data": "zlib_filter_epub"}],
-        [{"text": "📝 فقط FB2/MOBI",   "callback_data": "zlib_filter_other"}],
+        [{"text": "🔍 جستجوی کتاب",   "callback_data": "book_search"},
+         {"text": "🔍 جستجوی مقاله",  "callback_data": "book_search_art"}],
+        [{"text": "📄 فقط PDF",        "callback_data": "book_filter_pdf"},
+         {"text": "📖 فقط EPUB",       "callback_data": "book_filter_epub"}],
+        [{"text": "📝 فقط FB2/MOBI",   "callback_data": "book_filter_other"}],
         [{"text": "❌ انصراف",          "callback_data": "cancel"}],
     ]}
 
 
-def zlib_results_kb(results: list, cache_key: str) -> dict:
+def book_results_kb(results: list, cache_key: str) -> dict:
     """نتایج جستجوی کتاب به‌صورت دکمه."""
     rows = []
     for i, book in enumerate(results[:10]):
@@ -985,16 +984,16 @@ def zlib_results_kb(results: list, cache_key: str) -> dict:
         if ext:  label += f" [{ext}]"
         if size: label += f" {size}"
         rows.append([{"text": label[:60],
-                       "callback_data": f"zlib_item_{cache_key}_{i}"}])
+                       "callback_data": f"book_item_{cache_key}_{i}"}])
     rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
     return {"inline_keyboard": rows}
 
 
-def zlib_book_kb(book_url_key: str) -> dict:
+def book_book_kb(book_url_key: str) -> dict:
     """دکمه دانلود کتاب."""
     return {"inline_keyboard": [
-        [{"text": "📥 دانلود کتاب",  "callback_data": f"zlib_dl_{book_url_key}"}],
-        [{"text": "🔙 برگشت",        "callback_data": "zlib_back"},
+        [{"text": "📥 دانلود کتاب",  "callback_data": f"book_dl_{book_url_key}"}],
+        [{"text": "🔙 برگشت",        "callback_data": "book_back"},
          {"text": "🏠 منوی اصلی",   "callback_data": "home"}],
     ]}
 
@@ -4398,9 +4397,14 @@ def libgen_search(query: str, count: int = 10,
             if jr.status_code != 200:
                 continue
 
-            items = jr.json()
-            if not isinstance(items, list):
-                items = list(items.values()) if isinstance(items, dict) else []
+            raw = jr.json()
+            # json.php returns a dict keyed by edition id — normalise
+            if isinstance(raw, dict):
+                items = list(raw.values())
+            elif isinstance(raw, list):
+                items = raw
+            else:
+                items = []
 
             for item in items:
                 if not isinstance(item, dict):
@@ -4479,22 +4483,25 @@ def libgen_search(query: str, count: int = 10,
 def _libgen_enrich_md5(results: list, sess: requests.Session,
                         extensions: list = None) -> None:
     """
-    Try to enrich Open Library results with MD5 from libgen
-    so the download button works. Best-effort — silently skips on failure.
+    Enrich Open Library results with MD5 from libgen.li only
+    (libgen.is/.st time out from Hetzner). Best-effort.
     """
+    # Only use libgen.li — others block Hetzner
+    enrich_mirrors = [m for m in LIBGEN_MIRRORS if "libgen.li" in m]
+    if not enrich_mirrors:
+        enrich_mirrors = [LIBGEN_MIRRORS[0]]
+
     for book in results:
         if book.get("md5"):
             continue
-        title   = book.get("name","")
-        authors = book.get("authors",[""])
-        author  = authors[0] if authors else ""
-        q       = f"{title} {author}".strip()[:80]
+        title  = book.get("name", "")
+        author = (book.get("authors") or [""])[0]
+        q      = f"{title} {author}".strip()[:80]
         try:
-            for mirror in LIBGEN_MIRRORS:
-                r = sess.get(
-                    f"{mirror}/index.php",
-                    params={"req": q, "res": 5, "page": 1},
-                    headers={"User-Agent": UA_DESK}, timeout=10)
+            for mirror in enrich_mirrors:
+                r = sess.get(f"{mirror}/index.php",
+                             params={"req": q, "res": 5, "page": 1},
+                             headers={"User-Agent": UA_DESK}, timeout=10)
                 if r.status_code != 200 or len(r.content) < 500:
                     continue
                 soup = BeautifulSoup(r.text, "html.parser")
@@ -4514,29 +4521,39 @@ def _libgen_enrich_md5(results: list, sess: requests.Session,
                     headers={"User-Agent": UA_DESK}, timeout=10)
                 if jr.status_code != 200:
                     continue
-                items = jr.json()
-                if not isinstance(items, list):
-                    items = list(items.values()) if isinstance(items, dict) else []
+                raw = jr.json()
+                # json.php returns dict keyed by id — normalise to list
+                if isinstance(raw, dict):
+                    items = list(raw.values())
+                elif isinstance(raw, list):
+                    items = raw
+                else:
+                    continue
                 for item in items:
+                    if not isinstance(item, dict):
+                        continue
                     for f in (item.get("files") or []):
-                        fext = (f.get("extension","") or "").lower()
+                        if not isinstance(f, dict):
+                            continue
+                        fext = (f.get("extension") or "").lower()
                         if extensions and fext not in [e.lower() for e in extensions]:
                             continue
-                        md5 = (f.get("md5","") or "").lower()
+                        md5 = (f.get("md5") or "").lower()
                         if md5:
                             book["md5"]       = md5
                             book["extension"] = fext
                             book["_source"]   = "libgen"
-                            fsz = f.get("filesize",0) or 0
+                            fsz = f.get("filesize", 0) or 0
                             book["size"] = (f"{fsz/1024/1024:.1f} MB"
-                                           if fsz > 1024*1024 else f"{fsz//1024} KB") if fsz else ""
+                                            if fsz > 1024*1024
+                                            else f"{fsz//1024} KB") if fsz else ""
                             break
                     if book.get("md5"):
                         break
                 if book.get("md5"):
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("_libgen_enrich_md5: %s", e)
 
 
 def libgen_download(md5: str, title: str = "book",
@@ -5465,7 +5482,7 @@ def do_qr(cid: int, text: str):
 # SOCIAL MEDIA HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def do_zlib_search(cid: int, query: str, extensions: list = None):
+def do_book_search(cid: int, query: str, extensions: list = None):
     """Search Library Genesis and show results as buttons."""
     bump(cid, "searches")
     send_message(cid, f"⏳ در حال جستجو در Library Genesis: _{query}_…",
@@ -5474,22 +5491,22 @@ def do_zlib_search(cid: int, query: str, extensions: list = None):
     results = libgen_search(query, count=10, extensions=extensions)
 
     if not results:
-        log.warning("do_zlib_search: no results for %r", query)
+        log.warning("do_book_search: no results for %r", query)
         send_message(cid, "❌ نتیجه‌ای یافت نشد. کلمات دیگری امتحان کنید.",
                      reply_markup=home_kb())
         return
 
     key = make_cache_key("zl", query, 0)
     cache_set(key, results)
-    set_state(cid, mode="zlib", last_query=query, cache_key=key,
+    set_state(cid, mode="book", last_query=query, cache_key=key,
               zlib_ext=extensions)
 
     ext_str = f" [{', '.join(extensions)}]" if extensions else ""
     text = f"📚 *نتایج Library Genesis{ext_str}:* _{query}_\nروی کتاب کلیک کنید:"
-    kb = zlib_results_kb(results, key)
+    kb = book_results_kb(results, key)
     send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
 
-def do_zlib_show_book(cid: int, book: dict):
+def do_book_show_book(cid: int, book: dict):
     """نمایش اطلاعات کامل کتاب + دکمه دانلود."""
     name      = book.get("name", "نامشخص")
     authors   = book.get("authors", [])
@@ -5530,10 +5547,10 @@ def do_zlib_show_book(cid: int, book: dict):
     url_key = store_url(url) if url else ""
 
     send_message(cid, "\n".join(lines), parse_mode="Markdown",
-                 reply_markup=zlib_book_kb(url_key) if url_key else home_kb())
+                 reply_markup=book_book_kb(url_key) if url_key else home_kb())
 
 
-def do_zlib_download(cid: int, book_url: str):
+def do_book_download(cid: int, book_url: str):
     """Download a book from Library Genesis and send to user."""
     bump(cid, "downloads")
     send_message(cid, "⏳ در حال دانلود کتاب از Library Genesis…\n_(ممکن است چند ثانیه طول بکشد)_",
@@ -5562,14 +5579,14 @@ def do_zlib_download(cid: int, book_url: str):
             md5 = m.group(0).lower()
 
     if not md5:
-        log.error("do_zlib_download: no md5 for %s", book_url)
+        log.error("do_book_download: no md5 for %s", book_url)
         send_message(cid, "❌ اطلاعات دانلود یافت نشد. دوباره جستجو کنید.",
                      reply_markup=home_kb())
         return
 
     result = libgen_download(md5, title=title, ext=ext)
     if not result:
-        log.error("do_zlib_download: download failed md5=%s", md5)
+        log.error("do_book_download: download failed md5=%s", md5)
         send_message(cid, "❌ دانلود ناموفق بود. دوباره امتحان کنید.",
                      reply_markup=home_kb())
         return
@@ -5578,6 +5595,161 @@ def do_zlib_download(cid: int, book_url: str):
     log.info("libgen: sending %s  %.1fMB", fname, len(data)/1024/1024)
     if smart_send(cid, data, fname, caption=f"📚 {fname[:80]}"):
         send_message(cid, "✅ کتاب ارسال شد.", reply_markup=home_kb())
+    else:
+        send_message(cid, "❌ ارسال فایل ناموفق بود.", reply_markup=home_kb())
+    clear_state(cid)
+
+
+
+# ── Sci-Hub paper search + download ─────────────────────────────────────────
+
+SCIHUB_MIRRORS = [
+    "https://sci-hub.se",
+    "https://sci-hub.st",
+    "https://sci-hub.ru",
+]
+
+def _extract_doi(text: str) -> str:
+    """Extract a DOI from free text or URL."""
+    m = re.search(r"\b(10\.\d{4,}/[^\s\"'<>]+)", text)
+    return m.group(1).rstrip(".,)") if m else ""
+
+
+def _scholar_search(query: str, sess: requests.Session) -> list[dict]:
+    """
+    Search Semantic Scholar public API (no key needed, no IP blocks).
+    Returns list of {title, authors, year, doi, url}.
+    """
+    try:
+        r = sess.get(
+            "https://api.semanticscholar.org/graph/v1/paper/search",
+            params={"query": query, "limit": 8,
+                    "fields": "title,authors,year,externalIds,openAccessPdf,url"},
+            headers={"User-Agent": "BaleBot/1.0"},
+            timeout=15)
+        log.debug("_scholar_search: HTTP %d", r.status_code)
+        if r.status_code != 200:
+            return []
+        items = r.json().get("data", [])
+        results = []
+        for it in items:
+            doi = (it.get("externalIds") or {}).get("DOI", "")
+            oa  = (it.get("openAccessPdf") or {}).get("url", "")
+            results.append({
+                "title":   it.get("title", ""),
+                "authors": [a.get("name","") for a in (it.get("authors") or [])[:3]],
+                "year":    str(it.get("year") or ""),
+                "doi":     doi,
+                "oa_url":  oa,
+                "url":     it.get("url",""),
+            })
+        return results
+    except Exception as e:
+        log.warning("_scholar_search: %s", e)
+        return []
+
+
+def _scihub_download(doi_or_url: str, sess: requests.Session) -> Optional[tuple[bytes, str]]:
+    """
+    Download a paper PDF via Sci-Hub mirrors.
+    Accepts a DOI string or a full URL.
+    """
+    if not doi_or_url:
+        return None
+    hdrs = {"User-Agent": UA_DESK}
+    for mirror in SCIHUB_MIRRORS:
+        try:
+            page_url = f"{mirror}/{doi_or_url}"
+            rp = sess.get(page_url, headers=hdrs, timeout=15, allow_redirects=True)
+            log.debug("_scihub_download %s: HTTP %d", mirror, rp.status_code)
+            if rp.status_code != 200:
+                continue
+            soup = BeautifulSoup(rp.text, "html.parser")
+            # Sci-Hub embeds PDF in <embed src=...> or <iframe src=...>
+            pdf_url = ""
+            for tag in soup.select("embed[src], iframe[src], #pdf[src], a[href$='.pdf']"):
+                src = tag.get("src") or tag.get("href","")
+                if src:
+                    pdf_url = src if src.startswith("http") else f"https:{src}" if src.startswith("//") else f"{mirror}/{src.lstrip('/')}"
+                    break
+            if not pdf_url:
+                # Try button link
+                btn = soup.select_one("button[onclick*='location.href']")
+                if btn:
+                    m = re.search(r"location\.href='([^']+)'", btn.get("onclick",""))
+                    if m:
+                        src = m.group(1)
+                        pdf_url = src if src.startswith("http") else f"https:{src}"
+            if not pdf_url:
+                log.debug("_scihub_download: no PDF link at %s", mirror)
+                continue
+            resp = sess.get(pdf_url, headers={**hdrs, "Referer": page_url},
+                            timeout=60, allow_redirects=True)
+            if resp.status_code == 200 and len(resp.content) > 5000:
+                # Derive filename from DOI
+                safe = re.sub(r"[^\w\-]", "_", doi_or_url)[:60]
+                fname = f"{safe}.pdf"
+                cd = resp.headers.get("Content-Disposition","")
+                if "filename=" in cd:
+                    mf = re.search(r"filename=([^;\r\n]+)", cd)
+                    if mf: fname = mf.group(1).strip().strip('"\'')
+                log.info("_scihub_download OK: %.1fMB via %s", len(resp.content)/1024/1024, mirror)
+                return resp.content, fname
+        except Exception as e:
+            log.warning("_scihub_download %s: %s", mirror, e)
+    return None
+
+
+def do_paper_search(cid: int, query: str):
+    """جستجوی مقاله علمی via Semantic Scholar + دانلود از Sci-Hub."""
+    bump(cid, "searches")
+    send_message(cid, f"⏳ در حال جستجوی مقاله: _{query}_…", parse_mode="Markdown")
+    chat_action(cid)
+
+    sess = _libgen_session()
+
+    # If query looks like a DOI, skip search and go straight to download
+    doi = _extract_doi(query)
+    if doi:
+        _do_paper_dl_doi(cid, doi, title=query, sess=sess)
+        return
+
+    results = _scholar_search(query, sess)
+    if not results:
+        send_message(cid, "❌ مقاله‌ای یافت نشد. DOI یا عنوان دقیق‌تری امتحان کنید.",
+                     reply_markup=home_kb())
+        return
+
+    key = make_cache_key("art", query, 0)
+    cache_set(key, results)
+    set_state(cid, mode="book_art", last_query=query, cache_key=key)
+
+    rows = []
+    for i, p in enumerate(results):
+        label = f"{p['title'][:45]}…" if len(p['title']) > 45 else p['title']
+        rows.append([{"text": label, "callback_data": f"paper_item_{key}_{i}"}])
+    rows.append([{"text": "🏠 خانه", "callback_data": "home"}])
+    kb = {"inline_keyboard": rows}
+    send_message(cid,
+                 f"📄 *نتایج Semantic Scholar:* _{query}_\nروی مقاله کلیک کنید:",
+                 parse_mode="Markdown", reply_markup=kb)
+
+
+def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
+    """Download paper by DOI via Sci-Hub and send to user."""
+    if sess is None:
+        sess = _libgen_session()
+    send_message(cid, f"⏳ در حال دانلود از Sci-Hub: `{doi[:60]}`…", parse_mode="Markdown")
+    chat_action(cid, "upload_document")
+    result = _scihub_download(doi, sess)
+    if not result:
+        send_message(cid, "❌ دانلود ناموفق بود. مقاله ممکن است در Sci-Hub موجود نباشد.",
+                     reply_markup=home_kb())
+        return
+    data, fname = result
+    cap = f"📄 {title[:80] or fname}"
+    if smart_send(cid, data, fname, caption=cap):
+        send_message(cid, "✅ مقاله ارسال شد.", reply_markup=home_kb())
     else:
         send_message(cid, "❌ ارسال فایل ناموفق بود.", reply_markup=home_kb())
     clear_state(cid)
@@ -7546,7 +7718,8 @@ def handle_message(msg: dict):
         "yt_thumb":             lambda: do_youtube_thumbnail(cid, text),
         "yt_stats":             lambda: do_youtube_stats(cid, text),
         "rss":                  lambda: do_rss(cid, text),
-        "zlib":                 lambda: do_zlib_search(cid, text, st.get("zlib_ext")),
+        "book":                 lambda: do_book_search(cid, text, st.get("zlib_ext")),
+        "book_art":             lambda: do_paper_search(cid, text),
         "apk":                  lambda: do_apk_search(cid, text),
     }
 
@@ -7936,6 +8109,74 @@ def handle_callback(cb: dict):
         query = st.get("last_query","")
         do_images(cid, query, source, page); return
 
+    # paper_item_{cache_key}_{idx} — user clicked a paper in results
+    m = re.match(r"paper_item_(\w+)_(\d+)$", data)
+    if m:
+        key, idx = m.group(1), int(m.group(2))
+        results = cache_get(key)
+        if not results or idx >= len(results):
+            send_message(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید."); return
+        paper = results[idx]
+        title   = paper.get("title","")
+        authors = ", ".join(paper.get("authors",[]))
+        year    = paper.get("year","")
+        doi     = paper.get("doi","")
+        oa_url  = paper.get("oa_url","")
+
+        lines = [f"📄 *{title}*"]
+        if authors: lines.append(f"✍️ {authors}")
+        if year:    lines.append(f"📅 {year}")
+        if doi:     lines.append(f"🔗 DOI: `{doi}`")
+
+        rows = []
+        if doi:
+            doi_key = store_url(doi)
+            rows.append([{"text": "📥 دانلود از Sci-Hub", "callback_data": f"paper_dl_{doi_key}"}])
+        if oa_url:
+            oa_key = store_url(oa_url)
+            rows.append([{"text": "🔓 دانلود Open Access", "callback_data": f"paper_oa_{oa_key}"}])
+        rows.append([{"text": "🔙 برگشت", "callback_data": "book_back"},
+                     {"text": "🏠 خانه", "callback_data": "home"}])
+        send_message(cid, "\n".join(lines), parse_mode="Markdown",
+                     reply_markup={"inline_keyboard": rows})
+        return
+
+    # paper_dl_{doi_key} — download from Sci-Hub
+    m = re.match(r"paper_dl_(\w+)$", data)
+    if m:
+        doi = get_url(m.group(1)) or ""
+        if not doi:
+            send_message(cid, "❌ DOI یافت نشد."); return
+        _do_paper_dl_doi(cid, doi)
+        return
+
+    # paper_oa_{url_key} — download open access PDF directly
+    m = re.match(r"paper_oa_(\w+)$", data)
+    if m:
+        oa_url = get_url(m.group(1)) or ""
+        if not oa_url:
+            send_message(cid, "❌ لینک یافت نشد."); return
+        send_message(cid, "⏳ در حال دانلود Open Access PDF…")
+        chat_action(cid, "upload_document")
+        sess = _libgen_session()
+        try:
+            resp = sess.get(oa_url, headers={"User-Agent": UA_DESK},
+                            timeout=60, allow_redirects=True)
+            if resp.status_code == 200 and len(resp.content) > 5000:
+                fname = re.sub(r"[^\w\-.]", "_", oa_url.split("/")[-1])[:60] or "paper.pdf"
+                if not fname.endswith(".pdf"): fname += ".pdf"
+                if smart_send(cid, resp.content, fname, caption=f"📄 {fname}"):
+                    send_message(cid, "✅ مقاله ارسال شد.", reply_markup=home_kb())
+                else:
+                    send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+            else:
+                send_message(cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb())
+        except Exception as e:
+            log.warning("paper_oa: %s", e)
+            send_message(cid, "❌ خطا در دانلود.", reply_markup=home_kb())
+        clear_state(cid)
+        return
+
     # ── APK callbacks ─────────────────────────────────────────────────────
     if data == "mode_apk":
         set_state(cid, mode="apk")
@@ -7992,35 +8233,37 @@ def handle_callback(cb: dict):
         return
 
     # ── Z-Library callbacks ───────────────────────────────────────────────
-    if data == "mode_zlib":
-        send_message(cid, "📚 دانلود کتاب و مقاله:", reply_markup=zlib_kb()); return
+    if data == "mode_book":
+        send_message(cid, "📚 دانلود کتاب و مقاله:", reply_markup=book_kb()); return
 
-    if data in ("zlib_search", "zlib_search_art"):
-        prompt = ("🔍 عنوان کتاب یا نام نویسنده را بنویسید:"
-                  if data == "zlib_search" else
-                  "🔍 عنوان مقاله یا نام نویسنده را بنویسید:")
-        set_state(cid, mode="zlib", zlib_ext=None)
-        send_message(cid, prompt, reply_markup=cancel_kb()); return
+    if data in ("book_search", "book_search_art"):
+        if data == "book_search":
+            set_state(cid, mode="book", zlib_ext=None)
+            send_message(cid, "🔍 عنوان کتاب یا نام نویسنده را بنویسید:", reply_markup=cancel_kb())
+        else:
+            set_state(cid, mode="book_art")
+            send_message(cid, "🔍 عنوان مقاله، DOI، یا نام نویسنده را بنویسید:", reply_markup=cancel_kb())
+        return
 
-    if data == "zlib_filter_pdf":
-        set_state(cid, mode="zlib", zlib_ext=["PDF"])
+    if data == "book_filter_pdf":
+        set_state(cid, mode="book", zlib_ext=["PDF"])
         send_message(cid, "🔍 عنوان کتاب (فقط PDF):", reply_markup=cancel_kb()); return
 
-    if data == "zlib_filter_epub":
-        set_state(cid, mode="zlib", zlib_ext=["EPUB"])
+    if data == "book_filter_epub":
+        set_state(cid, mode="book", zlib_ext=["EPUB"])
         send_message(cid, "🔍 عنوان کتاب (فقط EPUB):", reply_markup=cancel_kb()); return
 
-    if data == "zlib_filter_other":
-        set_state(cid, mode="zlib", zlib_ext=["FB2", "MOBI", "AZW3"])
+    if data == "book_filter_other":
+        set_state(cid, mode="book", zlib_ext=["FB2", "MOBI", "AZW3"])
         send_message(cid, "🔍 عنوان کتاب (FB2/MOBI/AZW3):",
                      reply_markup=cancel_kb()); return
 
-    if data == "zlib_back":
+    if data == "book_back":
         query   = st.get("last_query", "")
         key     = st.get("cache_key", "")
         results = cache_get(key) if key else []
         if results:
-            kb = zlib_results_kb(results, key)
+            kb = book_results_kb(results, key)
             send_message(cid, f"📚 نتایج: _{query}_",
                          parse_mode="Markdown", reply_markup=kb)
         else:
@@ -8028,22 +8271,22 @@ def handle_callback(cb: dict):
         return
 
     # zlib_item_{cache_key}_{idx}  — کلیک روی کتاب
-    m = re.match(r"zlib_item_(\w+)_(\d+)$", data)
+    m = re.match(r"book_item_(\w+)_(\d+)$", data)
     if m:
         key, idx = m.group(1), int(m.group(2))
         results = cache_get(key)
         if not results or idx >= len(results):
             send_message(cid, "❌ نتیجه منقضی."); return
-        do_zlib_show_book(cid, results[idx]); return
+        do_book_show_book(cid, results[idx]); return
 
     # zlib_dl_{url_key}  — دانلود کتاب
-    m = re.match(r"zlib_dl_(\w+)$", data)
+    m = re.match(r"book_dl_(\w+)$", data)
     if m:
         url_key  = m.group(1)
         book_url = (get_url(url_key) or "")
         if not book_url:
             send_message(cid, "❌ لینک منقضی."); return
-        do_zlib_download(cid, book_url); return
+        do_book_download(cid, book_url); return
 
     # ── RSS callbacks ─────────────────────────────────────────────────────
     if data == "mode_rss" or data.startswith("rss_"):
