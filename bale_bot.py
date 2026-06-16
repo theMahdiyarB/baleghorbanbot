@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.18)
+بله قربان — Bale Bot  (v2.19)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -4352,14 +4352,15 @@ def libgen_search(query: str, count: int = 10,
     except Exception as e:
         log.warning("libgen_search OpenLibrary: %s", e)
 
-    # If we got enough from OL, try to enrich with MD5 from libgen for downloadable results
+    # Got OL results — try to enrich with MD5 from libgen.li then return regardless
     if results:
-        # Try to find MD5 for download via libgen search in background
         try:
             _libgen_enrich_md5(results, sess, extensions)
         except Exception as e:
             log.debug("libgen_search enrich: %s", e)
-        log.info("libgen_search: %d results via OpenLibrary", len(results))
+        downloadable = sum(1 for r in results if r.get("md5"))
+        log.info("libgen_search: %d results via OpenLibrary (%d downloadable)",
+                 len(results), downloadable)
         return results
 
     # ── Strategy 2: libgen.li catalog (needs WARP) ───────────────────────────
@@ -4375,19 +4376,85 @@ def libgen_search(query: str, count: int = 10,
 
             soup = BeautifulSoup(r.text, "html.parser")
 
-            # libgen.li uses table.catalog with edition links
-            ids = []
+            # libgen.li XHTML search results use various link patterns:
+            # /book/index.php?md5=HASH  (old style)
+            # edition.php?id=NNN        (new style)
+            # ads.php?md5=HASH          (direct download)
+            md5s = []
+            ids  = []
             for a in soup.find_all("a", href=True):
                 href = a["href"]
+                # MD5 style (32 hex chars)
+                mm = re.search(r"[?&]md5=([a-fA-F0-9]{32})", href)
+                if mm:
+                    md5 = mm.group(1).lower()
+                    if md5 not in md5s:
+                        md5s.append(md5)
+                    continue
+                # Edition ID style
                 if "edition.php" in href or ("index.php" in href and "id=" in href):
-                    m = re.search(r"[?&]id=(\d+)", href)
-                    if m and m.group(1) not in ids:
-                        ids.append(m.group(1))
-                if len(ids) >= count:
+                    im = re.search(r"[?&]id=(\d+)", href)
+                    if im and im.group(1) not in ids:
+                        ids.append(im.group(1))
+                if len(md5s) + len(ids) >= count * 2:
                     break
 
-            if not ids:
-                log.debug("libgen_search: no IDs at %s (body: %r…)", mirror, r.text[:80])
+            log.debug("libgen_search %s: md5s=%d ids=%d", mirror, len(md5s), len(ids))
+
+            if not md5s and not ids:
+                log.debug("libgen_search: no IDs at %s (body: %r…)", mirror, r.text[:120])
+                continue
+
+            # If we got MD5s directly, build results without json.php
+            if md5s and not ids:
+                for md5 in md5s[:count]:
+                    results.append({
+                        "id": md5, "name": "", "authors": [], "year": "",
+                        "publisher": "", "language": "", "extension": "",
+                        "size": "", "cover": "", "md5": md5,
+                        "url": f"{mirror}/ads.php?md5={md5}",
+                        "_source": "libgen",
+                    })
+                # Enrich titles via json.php using file MD5 lookup
+                try:
+                    for i, bk in enumerate(results):
+                        if not bk["name"]:
+                            fr = sess.get(
+                                f"{mirror}/json.php?object=f&md5={bk['md5']}&fields=*",
+                                headers={"User-Agent": UA_DESK}, timeout=8)
+                            if fr.status_code == 200:
+                                fraw = fr.json()
+                                flist = list(fraw.values()) if isinstance(fraw, dict) else (fraw if isinstance(fraw, list) else [])
+                                for fitem in flist:
+                                    if not isinstance(fitem, dict): continue
+                                    eids = []
+                                    for ek in ("editions", "edition"):
+                                        ev = fitem.get(ek)
+                                        if isinstance(ev, list):
+                                            eids += [str(e.get("e_id","")) for e in ev if isinstance(e,dict)]
+                                        elif isinstance(ev, dict):
+                                            eids.append(str(ev.get("e_id","")))
+                                    if eids:
+                                        er = sess.get(
+                                            f"{mirror}/json.php?object=e&ids={eids[0]}&fields=title,author,year,publisher",
+                                            headers={"User-Agent": UA_DESK}, timeout=8)
+                                        if er.status_code == 200:
+                                            eraw = er.json()
+                                            edata = list(eraw.values())[0] if isinstance(eraw, dict) and eraw else {}
+                                            bk["name"] = (edata.get("title") or "").strip()
+                                            bk["authors"] = [edata.get("author","")] if edata.get("author") else []
+                                            bk["year"] = str(edata.get("year","") or "")
+                                    bk["extension"] = (fitem.get("extension") or "").lower()
+                                    fsz = fitem.get("filesize", 0) or 0
+                                    bk["size"] = (f"{fsz/1024/1024:.1f} MB" if fsz > 1024*1024 else f"{fsz//1024} KB") if fsz else ""
+                                    break
+                except Exception as e:
+                    log.debug("libgen md5 enrich: %s", e)
+                # Filter out results with no title
+                results = [b for b in results if b.get("name")]
+                if results:
+                    log.info("libgen_search: %d results via %s (md5 mode)", len(results), mirror)
+                    return results
                 continue
 
             # Fetch metadata via JSON API
@@ -5543,11 +5610,21 @@ def do_book_show_book(cid: int, book: dict):
     if size:      lines.append(f"💾 حجم: {size}")
     if rating:    lines.append(f"⭐ امتیاز: {rating}")
 
-    # کلید دانلود با URL کتاب
-    url_key = store_url(url) if url else ""
-
+    # Download button — only if we have an MD5 (libgen source)
+    md5  = book.get("md5", "")
+    rows = []
+    if md5:
+        url_key = store_url(url) if url else ""
+        rows.append([{"text": "📥 دانلود", "callback_data": f"book_dl_{url_key}"}])
+    else:
+        # No file on libgen — link to Open Library page
+        if url:
+            rows.append([{"text": "🌐 مشاهده در Open Library", "callback_data": f"book_dl_{store_url(url)}"}])
+        lines.append("\n⚠️ فایل مستقیم در دسترس نیست — ممکن است در libgen موجود نباشد.")
+    rows.append([{"text": "🔙 برگشت", "callback_data": "book_back"},
+                 {"text": "🏠 خانه",  "callback_data": "home"}])
     send_message(cid, "\n".join(lines), parse_mode="Markdown",
-                 reply_markup=book_book_kb(url_key) if url_key else home_kb())
+                 reply_markup={"inline_keyboard": rows})
 
 
 def do_book_download(cid: int, book_url: str):
@@ -5617,25 +5694,14 @@ def _extract_doi(text: str) -> str:
 
 def _scholar_search(query: str, sess: requests.Session) -> list[dict]:
     """
-    Search Semantic Scholar public API (no key needed, no IP blocks).
-    Returns list of {title, authors, year, doi, url}.
+    Search papers via Semantic Scholar API with CrossRef fallback.
     """
-    try:
-        r = sess.get(
-            "https://api.semanticscholar.org/graph/v1/paper/search",
-            params={"query": query, "limit": 8,
-                    "fields": "title,authors,year,externalIds,openAccessPdf,url"},
-            headers={"User-Agent": "BaleBot/1.0"},
-            timeout=15)
-        log.debug("_scholar_search: HTTP %d", r.status_code)
-        if r.status_code != 200:
-            return []
-        items = r.json().get("data", [])
-        results = []
+    def _parse_s2(items):
+        out = []
         for it in items:
             doi = (it.get("externalIds") or {}).get("DOI", "")
             oa  = (it.get("openAccessPdf") or {}).get("url", "")
-            results.append({
+            out.append({
                 "title":   it.get("title", ""),
                 "authors": [a.get("name","") for a in (it.get("authors") or [])[:3]],
                 "year":    str(it.get("year") or ""),
@@ -5643,10 +5709,60 @@ def _scholar_search(query: str, sess: requests.Session) -> list[dict]:
                 "oa_url":  oa,
                 "url":     it.get("url",""),
             })
-        return results
+        return out
+
+    # Strategy 1: Semantic Scholar (retry once after 429)
+    for attempt in range(2):
+        try:
+            r = sess.get(
+                "https://api.semanticscholar.org/graph/v1/paper/search",
+                params={"query": query, "limit": 8,
+                        "fields": "title,authors,year,externalIds,openAccessPdf,url"},
+                headers={"User-Agent": "BaleBot/1.0"},
+                timeout=15)
+            log.debug("_scholar_search S2 attempt %d: HTTP %d", attempt+1, r.status_code)
+            if r.status_code == 200:
+                return _parse_s2(r.json().get("data", []))
+            if r.status_code == 429:
+                time.sleep(3)
+                continue
+            break
+        except Exception as e:
+            log.warning("_scholar_search S2: %s", e)
+            break
+
+    # Strategy 2: CrossRef (no auth, very permissive)
+    try:
+        r = sess.get(
+            "https://api.crossref.org/works",
+            params={"query": query, "rows": 8,
+                    "select": "title,author,published,DOI,URL,link"},
+            headers={"User-Agent": "BaleBot/1.0 (mailto:bot@example.com)"},
+            timeout=15)
+        log.debug("_scholar_search CrossRef: HTTP %d", r.status_code)
+        if r.status_code == 200:
+            items = r.json().get("message", {}).get("items", [])
+            results = []
+            for it in items:
+                title   = (it.get("title") or [""])[0]
+                authors = [f"{a.get('given','')} {a.get('family','')}".strip()
+                           for a in (it.get("author") or [])[:3]]
+                pub     = it.get("published", {})
+                year    = str((pub.get("date-parts") or [[""]])[0][0])
+                doi     = it.get("DOI","")
+                oa_url  = ""
+                for lnk in (it.get("link") or []):
+                    if "pdf" in lnk.get("content-type","").lower():
+                        oa_url = lnk.get("URL",""); break
+                results.append({
+                    "title": title, "authors": authors, "year": year,
+                    "doi": doi, "oa_url": oa_url, "url": it.get("URL",""),
+                })
+            return results
     except Exception as e:
-        log.warning("_scholar_search: %s", e)
-        return []
+        log.warning("_scholar_search CrossRef: %s", e)
+
+    return []
 
 
 def _scihub_download(doi_or_url: str, sess: requests.Session) -> Optional[tuple[bytes, str]]:
