@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.21)
+بله قربان — Bale Bot  (v2.22)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -4376,15 +4376,11 @@ def libgen_search(query: str, count: int = 10,
 
             soup = BeautifulSoup(r.text, "html.parser")
 
-            # libgen.li XHTML search results link patterns:
-            # /edition.php?e_id=NNN   (libgen.li non-fiction — NOTE: e_id not id!)
-            # /fiction/?md5=HASH      (fiction)
-            # /ads.php?md5=HASH       (direct download)
-            # /book/index.php?md5=HASH (old style)
+            all_hrefs_book = [a["href"] for a in soup.find_all("a", href=True)]
+            log.debug("libgen_search %s links sample: %s", mirror, all_hrefs_book[:20])
             md5s = []
             ids  = []
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
+            for href in all_hrefs_book:
                 # MD5 style (32 hex chars in any param)
                 mm = re.search(r"[?&/]md5=([a-fA-F0-9]{32})", href)
                 if mm:
@@ -5685,9 +5681,9 @@ def do_book_download(cid: int, md5_ext: str):
 # ── Sci-Hub paper search + download ─────────────────────────────────────────
 
 SCIHUB_MIRRORS = [
-    "https://sci-hub.ru",   # returns 200 in logs
-    "https://sci-hub.st",   # returns 403 but worth trying
-    "https://sci-hub.se",   # DNS fails on Hetzner
+    "https://sci-hub.ru",   # 200 but JS challenge — needs cookie workaround
+    "https://sci-hub.st",   # 403
+    # sci-hub.se excluded: DNS fails on Hetzner even with WARP
 ]
 
 def _extract_doi(text: str) -> str:
@@ -5777,13 +5773,20 @@ def _scihub_download(doi_or_url: str, sess: requests.Session) -> Optional[tuple[
     if not doi_or_url:
         return None
     # Clean up DOI
-    doi = doi_or_url.strip().lstrip("https://doi.org/").lstrip("http://dx.doi.org/")
+    doi = re.sub(r"^https?://(dx\.)?doi\.org/", "", doi_or_url.strip())
     hdrs = {"User-Agent": UA_DESK, "Accept": "text/html,application/xhtml+xml,*/*"}
 
     for mirror in SCIHUB_MIRRORS:
         try:
+            # Seed session cookies via homepage visit
+            try:
+                sess.get(mirror, headers=hdrs, timeout=8)
+            except Exception:
+                pass
+
             page_url = f"{mirror}/{doi}"
-            rp = sess.get(page_url, headers=hdrs, timeout=20, allow_redirects=True)
+            rp = sess.get(page_url, headers={**hdrs, "Referer": mirror + "/"},
+                          timeout=20, allow_redirects=True)
             log.debug("_scihub_download %s: HTTP %d  len=%d",
                       mirror, rp.status_code, len(rp.content))
             if rp.status_code not in (200, 301, 302):
@@ -5792,35 +5795,47 @@ def _scihub_download(doi_or_url: str, sess: requests.Session) -> Optional[tuple[
             soup = BeautifulSoup(rp.text, "html.parser")
             pdf_url = ""
 
-            # Pattern 1: <embed src="...pdf..."> or <iframe src="...">
-            for tag in soup.select("embed[src], iframe#pdf[src]"):
+            # Log all links and embeds to diagnose structure
+            all_tags = [(t.name, t.get("src",""), t.get("href",""))
+                        for t in soup.find_all(["embed","iframe","a","button"])
+                        if t.get("src") or t.get("href") or t.get("onclick")]
+            log.debug("_scihub_download %s tags: %s", mirror, all_tags[:10])
+
+            # Pattern 1: embed or iframe with src
+            for tag in soup.select("embed[src], iframe[src]"):
                 src = tag.get("src", "")
-                if src and (".pdf" in src or "download" in src or src.startswith("//")):
+                if src:
                     pdf_url = src; break
 
-            # Pattern 2: div#article > a, div#buttons > a
+            # Pattern 2: #article, #buttons, download divs
             if not pdf_url:
-                for tag in soup.select("#article a, #buttons a, #pdf-buttons a"):
-                    href = tag.get("href", "")
-                    if href:
-                        pdf_url = href; break
+                for sel in ("#article a", "#buttons a", "#pdf-buttons a",
+                            "div[id*='download'] a", "a[href*='.pdf']"):
+                    el = soup.select_one(sel)
+                    if el and el.get("href"):
+                        pdf_url = el["href"]; break
 
-            # Pattern 3: onclick="location.href=..."
+            # Pattern 3: onclick location.href
             if not pdf_url:
                 for tag in soup.find_all(onclick=True):
                     m = re.search(r"location\.href\s*=\s*['\"]([^'\"]+)['\"]",
-                                  tag["onclick"])
+                                  tag.get("onclick",""))
                     if m:
                         pdf_url = m.group(1); break
 
-            # Pattern 4: any link ending in .pdf
+            # Pattern 4: any src/href containing the DOI hash or .pdf
             if not pdf_url:
-                for a in soup.find_all("a", href=True):
-                    if ".pdf" in a["href"]:
-                        pdf_url = a["href"]; break
+                for tag in soup.find_all(True):
+                    for attr in ("src", "href", "data-src"):
+                        val = tag.get(attr,"")
+                        if val and (".pdf" in val or "sci-hub" in val) and len(val) > 10:
+                            pdf_url = val; break
+                    if pdf_url:
+                        break
 
             if not pdf_url:
-                log.debug("_scihub_download: no PDF link found at %s", mirror)
+                log.debug("_scihub_download: no PDF link found at %s (body len=%d)",
+                          mirror, len(rp.content))
                 continue
 
             # Normalise URL
@@ -5911,10 +5926,11 @@ def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
             if r.status_code != 200 or len(r.content) < 500:
                 continue
             soup = BeautifulSoup(r.text, "html.parser")
-            # Extract md5 from any link
+            all_hrefs = [a["href"] for a in soup.find_all("a", href=True)]
+            log.debug("_do_paper_dl_doi scimag links sample: %s", all_hrefs[:15])
             md5 = ""
-            for a in soup.find_all("a", href=True):
-                mm = re.search(r"[?&/]md5=([a-fA-F0-9]{32})", a["href"])
+            for href in all_hrefs:
+                mm = re.search(r"[?&/]md5=([a-fA-F0-9]{32})", href)
                 if mm:
                     md5 = mm.group(1).lower(); break
             if not md5:
