@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.19)
+بله قربان — Bale Bot  (v2.20)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -5612,58 +5612,60 @@ def do_book_show_book(cid: int, book: dict):
 
     # Download button — only if we have an MD5 (libgen source)
     md5  = book.get("md5", "")
+    ext  = book.get("extension", "pdf") or "pdf"
     rows = []
     if md5:
-        url_key = store_url(url) if url else ""
-        rows.append([{"text": "📥 دانلود", "callback_data": f"book_dl_{url_key}"}])
+        # Encode md5+ext directly in callback so download never needs cache lookup
+        rows.append([{"text": "📥 دانلود", "callback_data": f"book_dl_{md5}_{ext}"}])
     else:
-        # No file on libgen — link to Open Library page
-        if url:
-            rows.append([{"text": "🌐 مشاهده در Open Library", "callback_data": f"book_dl_{store_url(url)}"}])
         lines.append("\n⚠️ فایل مستقیم در دسترس نیست — ممکن است در libgen موجود نباشد.")
+        if url:
+            rows.append([{"text": "🌐 مشاهده در Open Library",
+                          "callback_data": f"book_ol_{store_url(url)}"}])
     rows.append([{"text": "🔙 برگشت", "callback_data": "book_back"},
                  {"text": "🏠 خانه",  "callback_data": "home"}])
     send_message(cid, "\n".join(lines), parse_mode="Markdown",
                  reply_markup={"inline_keyboard": rows})
 
 
-def do_book_download(cid: int, book_url: str):
-    """Download a book from Library Genesis and send to user."""
+def do_book_download(cid: int, md5_ext: str):
+    """
+    Download a book from Library Genesis.
+    md5_ext is '{md5}_{ext}' as encoded in the callback button.
+    """
     bump(cid, "downloads")
-    send_message(cid, "⏳ در حال دانلود کتاب از Library Genesis…\n_(ممکن است چند ثانیه طول بکشد)_",
-                 parse_mode="Markdown")
     chat_action(cid, "upload_document")
 
-    # Get md5/ext/title from cached search results
-    st = get_state(cid)
-    cache_key = st.get("cache_key", "")
-    md5, ext, title = "", "pdf", "book"
-    if cache_key:
-        cached = cache_get(cache_key)
-        if isinstance(cached, list):
-            for b in cached:
-                b_url_key = store_url(b.get("url", "")) if b.get("url") else ""
-                if b.get("url") == book_url or b_url_key == book_url:
-                    md5   = b.get("md5", "")
-                    ext   = b.get("extension", "pdf") or "pdf"
-                    title = b.get("name", "book")
-                    break
+    # Parse md5 and ext from the combined token
+    parts = md5_ext.split("_", 1)
+    md5 = parts[0].lower() if parts else ""
+    ext = parts[1] if len(parts) > 1 else "pdf"
 
-    # Fallback: extract md5 directly from book_url
-    if not md5:
-        m = re.search(r"[a-fA-F0-9]{32}", book_url)
-        if m:
-            md5 = m.group(0).lower()
-
-    if not md5:
-        log.error("do_book_download: no md5 for %s", book_url)
-        send_message(cid, "❌ اطلاعات دانلود یافت نشد. دوباره جستجو کنید.",
+    # Validate: md5 must be 32 hex chars
+    if not re.fullmatch(r"[a-f0-9]{32}", md5):
+        log.error("do_book_download: invalid md5_ext=%r", md5_ext)
+        send_message(cid, "❌ اطلاعات دانلود نامعتبر است. دوباره جستجو کنید.",
                      reply_markup=home_kb())
         return
 
+    # Try to get title from cache for a nicer filename
+    title = "book"
+    try:
+        st = get_state(cid)
+        cached = cache_get(st.get("cache_key", ""))
+        if isinstance(cached, list):
+            for b in cached:
+                if (b.get("md5") or "").lower() == md5:
+                    title = b.get("name", "book"); break
+    except Exception:
+        pass
+
+    send_message(cid, "⏳ در حال دانلود کتاب از Library Genesis…\n_(ممکن است چند ثانیه طول بکشد)_",
+                 parse_mode="Markdown")
+
     result = libgen_download(md5, title=title, ext=ext)
     if not result:
-        log.error("do_book_download: download failed md5=%s", md5)
+        log.error("do_book_download: failed md5=%s", md5)
         send_message(cid, "❌ دانلود ناموفق بود. دوباره امتحان کنید.",
                      reply_markup=home_kb())
         return
@@ -5681,9 +5683,9 @@ def do_book_download(cid: int, book_url: str):
 # ── Sci-Hub paper search + download ─────────────────────────────────────────
 
 SCIHUB_MIRRORS = [
-    "https://sci-hub.se",
-    "https://sci-hub.st",
-    "https://sci-hub.ru",
+    "https://sci-hub.ru",   # returns 200 in logs
+    "https://sci-hub.st",   # returns 403 but worth trying
+    "https://sci-hub.se",   # DNS fails on Hetzner
 ]
 
 def _extract_doi(text: str) -> str:
@@ -5768,48 +5770,81 @@ def _scholar_search(query: str, sess: requests.Session) -> list[dict]:
 def _scihub_download(doi_or_url: str, sess: requests.Session) -> Optional[tuple[bytes, str]]:
     """
     Download a paper PDF via Sci-Hub mirrors.
-    Accepts a DOI string or a full URL.
+    Uses WARP session (passed in) for DNS + IP bypass.
     """
     if not doi_or_url:
         return None
-    hdrs = {"User-Agent": UA_DESK}
+    # Clean up DOI
+    doi = doi_or_url.strip().lstrip("https://doi.org/").lstrip("http://dx.doi.org/")
+    hdrs = {"User-Agent": UA_DESK, "Accept": "text/html,application/xhtml+xml,*/*"}
+
     for mirror in SCIHUB_MIRRORS:
         try:
-            page_url = f"{mirror}/{doi_or_url}"
-            rp = sess.get(page_url, headers=hdrs, timeout=15, allow_redirects=True)
-            log.debug("_scihub_download %s: HTTP %d", mirror, rp.status_code)
-            if rp.status_code != 200:
+            page_url = f"{mirror}/{doi}"
+            rp = sess.get(page_url, headers=hdrs, timeout=20, allow_redirects=True)
+            log.debug("_scihub_download %s: HTTP %d  len=%d",
+                      mirror, rp.status_code, len(rp.content))
+            if rp.status_code not in (200, 301, 302):
                 continue
+
             soup = BeautifulSoup(rp.text, "html.parser")
-            # Sci-Hub embeds PDF in <embed src=...> or <iframe src=...>
             pdf_url = ""
-            for tag in soup.select("embed[src], iframe[src], #pdf[src], a[href$='.pdf']"):
-                src = tag.get("src") or tag.get("href","")
-                if src:
-                    pdf_url = src if src.startswith("http") else f"https:{src}" if src.startswith("//") else f"{mirror}/{src.lstrip('/')}"
-                    break
+
+            # Pattern 1: <embed src="...pdf..."> or <iframe src="...">
+            for tag in soup.select("embed[src], iframe#pdf[src]"):
+                src = tag.get("src", "")
+                if src and (".pdf" in src or "download" in src or src.startswith("//")):
+                    pdf_url = src; break
+
+            # Pattern 2: div#article > a, div#buttons > a
             if not pdf_url:
-                # Try button link
-                btn = soup.select_one("button[onclick*='location.href']")
-                if btn:
-                    m = re.search(r"location\.href='([^']+)'", btn.get("onclick",""))
+                for tag in soup.select("#article a, #buttons a, #pdf-buttons a"):
+                    href = tag.get("href", "")
+                    if href:
+                        pdf_url = href; break
+
+            # Pattern 3: onclick="location.href=..."
+            if not pdf_url:
+                for tag in soup.find_all(onclick=True):
+                    m = re.search(r"location\.href\s*=\s*['\"]([^'\"]+)['\"]",
+                                  tag["onclick"])
                     if m:
-                        src = m.group(1)
-                        pdf_url = src if src.startswith("http") else f"https:{src}"
+                        pdf_url = m.group(1); break
+
+            # Pattern 4: any link ending in .pdf
             if not pdf_url:
-                log.debug("_scihub_download: no PDF link at %s", mirror)
+                for a in soup.find_all("a", href=True):
+                    if ".pdf" in a["href"]:
+                        pdf_url = a["href"]; break
+
+            if not pdf_url:
+                log.debug("_scihub_download: no PDF link found at %s", mirror)
                 continue
+
+            # Normalise URL
+            if pdf_url.startswith("//"):
+                pdf_url = "https:" + pdf_url
+            elif pdf_url.startswith("/"):
+                pdf_url = mirror + pdf_url
+            elif not pdf_url.startswith("http"):
+                pdf_url = mirror + "/" + pdf_url
+
+            log.debug("_scihub_download: fetching PDF %s", pdf_url[:80])
             resp = sess.get(pdf_url, headers={**hdrs, "Referer": page_url},
-                            timeout=60, allow_redirects=True)
+                            timeout=90, allow_redirects=True)
+            ct = resp.headers.get("Content-Type", "")
+            log.debug("_scihub_download: PDF response HTTP %d  CT=%s  len=%d",
+                      resp.status_code, ct, len(resp.content))
             if resp.status_code == 200 and len(resp.content) > 5000:
-                # Derive filename from DOI
-                safe = re.sub(r"[^\w\-]", "_", doi_or_url)[:60]
+                safe = re.sub(r"[^\w\-]", "_", doi)[:60]
                 fname = f"{safe}.pdf"
-                cd = resp.headers.get("Content-Disposition","")
+                cd = resp.headers.get("Content-Disposition", "")
                 if "filename=" in cd:
                     mf = re.search(r"filename=([^;\r\n]+)", cd)
-                    if mf: fname = mf.group(1).strip().strip('"\'')
-                log.info("_scihub_download OK: %.1fMB via %s", len(resp.content)/1024/1024, mirror)
+                    if mf:
+                        fname = mf.group(1).strip().strip('"\'')
+                log.info("_scihub_download OK: %.1fMB via %s",
+                         len(resp.content)/1024/1024, mirror)
                 return resp.content, fname
         except Exception as e:
             log.warning("_scihub_download %s: %s", mirror, e)
@@ -8395,14 +8430,20 @@ def handle_callback(cb: dict):
             send_message(cid, "❌ نتیجه منقضی."); return
         do_book_show_book(cid, results[idx]); return
 
-    # zlib_dl_{url_key}  — دانلود کتاب
-    m = re.match(r"book_dl_(\w+)$", data)
+    # book_dl_{md5}_{ext}  — دانلود کتاب (md5 و ext مستقیم در callback)
+    m = re.match(r"book_dl_([a-f0-9]{32})_(\w+)$", data)
     if m:
-        url_key  = m.group(1)
-        book_url = (get_url(url_key) or "")
-        if not book_url:
-            send_message(cid, "❌ لینک منقضی."); return
-        do_book_download(cid, book_url); return
+        do_book_download(cid, f"{m.group(1)}_{m.group(2)}"); return
+
+    # book_ol_{url_key}  — باز کردن صفحه Open Library (بدون فایل مستقیم)
+    m = re.match(r"book_ol_(\w+)$", data)
+    if m:
+        url = get_url(m.group(1)) or ""
+        if url:
+            send_message(cid, f"🌐 لینک Open Library:\n{url}", reply_markup=home_kb())
+        else:
+            send_message(cid, "❌ لینک منقضی شده.", reply_markup=home_kb())
+        return
 
     # ── RSS callbacks ─────────────────────────────────────────────────────
     if data == "mode_rss" or data.startswith("rss_"):
