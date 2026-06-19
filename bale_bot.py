@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.20)
+بله قربان — Bale Bot  (v2.21)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -4376,26 +4376,28 @@ def libgen_search(query: str, count: int = 10,
 
             soup = BeautifulSoup(r.text, "html.parser")
 
-            # libgen.li XHTML search results use various link patterns:
-            # /book/index.php?md5=HASH  (old style)
-            # edition.php?id=NNN        (new style)
-            # ads.php?md5=HASH          (direct download)
+            # libgen.li XHTML search results link patterns:
+            # /edition.php?e_id=NNN   (libgen.li non-fiction — NOTE: e_id not id!)
+            # /fiction/?md5=HASH      (fiction)
+            # /ads.php?md5=HASH       (direct download)
+            # /book/index.php?md5=HASH (old style)
             md5s = []
             ids  = []
             for a in soup.find_all("a", href=True):
                 href = a["href"]
-                # MD5 style (32 hex chars)
-                mm = re.search(r"[?&]md5=([a-fA-F0-9]{32})", href)
+                # MD5 style (32 hex chars in any param)
+                mm = re.search(r"[?&/]md5=([a-fA-F0-9]{32})", href)
                 if mm:
                     md5 = mm.group(1).lower()
                     if md5 not in md5s:
                         md5s.append(md5)
                     continue
-                # Edition ID style
-                if "edition.php" in href or ("index.php" in href and "id=" in href):
-                    im = re.search(r"[?&]id=(\d+)", href)
-                    if im and im.group(1) not in ids:
-                        ids.append(im.group(1))
+                # Edition ID — libgen.li uses e_id=, libgen.rs uses id=
+                im = re.search(r"[?&]e?_?id=(\d+)", href)
+                if im and ("edition" in href or "index.php" in href):
+                    eid = im.group(1)
+                    if eid not in ids:
+                        ids.append(eid)
                 if len(md5s) + len(ids) >= count * 2:
                     break
 
@@ -5887,22 +5889,106 @@ def do_paper_search(cid: int, query: str):
 
 
 def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
-    """Download paper by DOI via Sci-Hub and send to user."""
+    """Download paper by DOI. Priority: libgen scimag → Unpaywall OA → Sci-Hub."""
     if sess is None:
         sess = _libgen_session()
-    send_message(cid, f"⏳ در حال دانلود از Sci-Hub: `{doi[:60]}`…", parse_mode="Markdown")
+    send_message(cid, f"⏳ در حال دانلود مقاله…\n`{doi[:60]}`", parse_mode="Markdown")
     chat_action(cid, "upload_document")
+
+    safe_title = re.sub(r"[^\w\-]", "_", title or doi)[:60]
+    fname = f"{safe_title}.pdf"
+
+    # ── Strategy 1: libgen scimag (search by DOI → md5 → download) ──────────
+    try:
+        for mirror in LIBGEN_MIRRORS:
+            # Search scimag collection by DOI
+            r = sess.get(f"{mirror}/index.php",
+                         params={"req": doi, "res": 5, "page": 1,
+                                 "topics[]": "a", "sort": "def", "sortmode": "DESC"},
+                         headers={"User-Agent": UA_DESK}, timeout=15)
+            log.debug("_do_paper_dl_doi scimag %s: HTTP %d len=%d",
+                      mirror, r.status_code, len(r.content))
+            if r.status_code != 200 or len(r.content) < 500:
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+            # Extract md5 from any link
+            md5 = ""
+            for a in soup.find_all("a", href=True):
+                mm = re.search(r"[?&/]md5=([a-fA-F0-9]{32})", a["href"])
+                if mm:
+                    md5 = mm.group(1).lower(); break
+            if not md5:
+                log.debug("_do_paper_dl_doi: no md5 in scimag results at %s", mirror)
+                continue
+            # Download via ads.php
+            ads = sess.get(f"{mirror}/ads.php?md5={md5}",
+                           headers={"User-Agent": UA_DESK}, timeout=15)
+            log.debug("_do_paper_dl_doi ads: HTTP %d len=%d", ads.status_code, len(ads.content))
+            if ads.status_code == 200 and len(ads.content) > 500:
+                ads_soup = BeautifulSoup(ads.text, "html.parser")
+                dl_a = (ads_soup.select_one("a[href*='get.php']") or
+                        ads_soup.select_one("a[href*='download']") or
+                        ads_soup.select_one("#download a"))
+                if dl_a:
+                    href = dl_a.get("href","")
+                    dl_url = href if href.startswith("http") else f"{mirror}{href}"
+                    resp = sess.get(dl_url, headers={"User-Agent": UA_DESK,
+                                                     "Referer": f"{mirror}/"},
+                                    timeout=90, allow_redirects=True)
+                    if resp.status_code == 200 and len(resp.content) > 5000:
+                        log.info("_do_paper_dl_doi: OK via libgen scimag %.1fMB",
+                                 len(resp.content)/1024/1024)
+                        data, f = resp.content, fname
+                        cd = resp.headers.get("Content-Disposition","")
+                        if "filename=" in cd:
+                            mf = re.search(r"filename=([^;\r\n]+)", cd)
+                            if mf: f = mf.group(1).strip().strip('"\'')
+                        if smart_send(cid, data, f, caption=f"📄 {title or doi}"):
+                            send_message(cid, "✅ مقاله ارسال شد.", reply_markup=home_kb())
+                        else:
+                            send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+                        clear_state(cid); return
+    except Exception as e:
+        log.warning("_do_paper_dl_doi scimag: %s", e)
+
+    # ── Strategy 2: Unpaywall (free OA PDF, no auth) ─────────────────────────
+    try:
+        up = sess.get(f"https://api.unpaywall.org/v2/{doi}",
+                      params={"email": "bot@example.com"},
+                      headers={"User-Agent": "BaleBot/1.0"},
+                      timeout=10)
+        log.debug("_do_paper_dl_doi Unpaywall: HTTP %d", up.status_code)
+        if up.status_code == 200:
+            oa_url = (up.json().get("best_oa_location") or {}).get("url_for_pdf","")
+            if oa_url:
+                resp = sess.get(oa_url, headers={"User-Agent": UA_DESK},
+                                timeout=60, allow_redirects=True)
+                if resp.status_code == 200 and len(resp.content) > 5000:
+                    log.info("_do_paper_dl_doi: OK via Unpaywall %.1fMB",
+                             len(resp.content)/1024/1024)
+                    if smart_send(cid, resp.content, fname, caption=f"📄 {title or doi}"):
+                        send_message(cid, "✅ مقاله ارسال شد (Open Access).", reply_markup=home_kb())
+                    else:
+                        send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+                    clear_state(cid); return
+    except Exception as e:
+        log.warning("_do_paper_dl_doi Unpaywall: %s", e)
+
+    # ── Strategy 3: Sci-Hub ──────────────────────────────────────────────────
     result = _scihub_download(doi, sess)
-    if not result:
-        send_message(cid, "❌ دانلود ناموفق بود. مقاله ممکن است در Sci-Hub موجود نباشد.",
-                     reply_markup=home_kb())
-        return
-    data, fname = result
-    cap = f"📄 {title[:80] or fname}"
-    if smart_send(cid, data, fname, caption=cap):
-        send_message(cid, "✅ مقاله ارسال شد.", reply_markup=home_kb())
-    else:
-        send_message(cid, "❌ ارسال فایل ناموفق بود.", reply_markup=home_kb())
+    if result:
+        data, f = result
+        if smart_send(cid, data, f, caption=f"📄 {title or doi}"):
+            send_message(cid, "✅ مقاله ارسال شد (Sci-Hub).", reply_markup=home_kb())
+        else:
+            send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+        clear_state(cid); return
+
+    send_message(cid,
+                 "❌ دانلود ناموفق بود.\n"
+                 "این مقاله ممکن است در هیچ‌کدام از منابع در دسترس نباشد.\n"
+                 f"می‌توانید DOI را مستقیماً در sci-hub.ru جستجو کنید:\n`{doi}`",
+                 parse_mode="Markdown", reply_markup=home_kb())
     clear_state(cid)
 
 
