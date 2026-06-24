@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.22)
+بله قربان — Bale Bot  (v2.23)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -4352,13 +4352,37 @@ def libgen_search(query: str, count: int = 10,
     except Exception as e:
         log.warning("libgen_search OpenLibrary: %s", e)
 
-    # Got OL results — try to enrich with MD5 from libgen.li then return regardless
     if results:
         try:
             _libgen_enrich_md5(results, sess, extensions)
         except Exception as e:
             log.debug("libgen_search enrich: %s", e)
-        downloadable = sum(1 for r in results if r.get("md5"))
+        # For books still without MD5, try Internet Archive via OL availability API
+        for book in results:
+            if book.get("md5") or book.get("ia_url"):
+                continue
+            try:
+                isbn = book.get("isbn", "")
+                ol_key = book.get("id", "")
+                check_id = f"ISBN:{isbn}" if isbn else f"olid:{ol_key}"
+                av = sess.get("https://openlibrary.org/api/books",
+                              params={"bibkeys": check_id, "format": "json",
+                                      "jscmd": "data"},
+                              headers={"User-Agent": "BaleBot/1.0"}, timeout=8)
+                if av.status_code == 200:
+                    bdata = av.json().get(check_id, {})
+                    for link in bdata.get("links", []):
+                        if "archive.org" in link.get("url", ""):
+                            book["ia_url"] = link["url"]; break
+                    if not book.get("ia_url"):
+                        ebs = bdata.get("ebooks", [{}])
+                        for fmt in ("pdf", "epub"):
+                            dl = ebs[0].get("formats", {}).get(fmt, {}) if ebs else {}
+                            if dl.get("url"):
+                                book["ia_url"] = dl["url"]; break
+            except Exception:
+                pass
+        downloadable = sum(1 for r in results if r.get("md5") or r.get("ia_url"))
         log.info("libgen_search: %d results via OpenLibrary (%d downloadable)",
                  len(results), downloadable)
         return results
@@ -4664,7 +4688,10 @@ def libgen_download(md5: str, title: str = "book",
 
             resp = sess.get(dl_url, headers={**hdrs, "Referer": ads_url},
                             timeout=120, allow_redirects=True)
-            if resp.status_code == 200 and len(resp.content) > 5000:
+            is_pdf = (resp.content[:4] == b"%PDF" or
+                      "pdf" in resp.headers.get("Content-Type","").lower() or
+                      "octet" in resp.headers.get("Content-Type","").lower())
+            if resp.status_code == 200 and len(resp.content) > 5000 and is_pdf:
                 cd = resp.headers.get("Content-Disposition", "")
                 if "filename=" in cd:
                     mf = re.search("filename=([^;\r\n]+)", cd)
@@ -5612,11 +5639,14 @@ def do_book_show_book(cid: int, book: dict):
     md5  = book.get("md5", "")
     ext  = book.get("extension", "pdf") or "pdf"
     rows = []
+    ia_url = book.get("ia_url", "")
     if md5:
-        # Encode md5+ext directly in callback so download never needs cache lookup
         rows.append([{"text": "📥 دانلود", "callback_data": f"book_dl_{md5}_{ext}"}])
+    elif ia_url:
+        rows.append([{"text": "📖 دانلود از Internet Archive",
+                      "callback_data": f"book_ia_{store_url(ia_url)}"}])
     else:
-        lines.append("\n⚠️ فایل مستقیم در دسترس نیست — ممکن است در libgen موجود نباشد.")
+        lines.append("\n⚠️ فایل مستقیم در دسترس نیست.")
         if url:
             rows.append([{"text": "🌐 مشاهده در Open Library",
                           "callback_data": f"book_ol_{store_url(url)}"}])
@@ -5847,8 +5877,12 @@ def _scihub_download(doi_or_url: str, sess: requests.Session) -> Optional[tuple[
                 pdf_url = mirror + "/" + pdf_url
 
             log.debug("_scihub_download: fetching PDF %s", pdf_url[:80])
-            resp = sess.get(pdf_url, headers={**hdrs, "Referer": page_url},
-                            timeout=90, allow_redirects=True)
+            resp = sess.get(pdf_url, headers={
+                "User-Agent": UA_DESK,
+                "Referer": page_url,
+                "Accept": "application/pdf,application/octet-stream,*/*",
+                "Origin": mirror,
+            }, timeout=90, allow_redirects=True)
             ct = resp.headers.get("Content-Type", "")
             log.debug("_scihub_download: PDF response HTTP %d  CT=%s  len=%d",
                       resp.status_code, ct, len(resp.content))
@@ -5917,9 +5951,10 @@ def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
     try:
         for mirror in LIBGEN_MIRRORS:
             # Search scimag collection by DOI
-            r = sess.get(f"{mirror}/index.php",
-                         params={"req": doi, "res": 5, "page": 1,
-                                 "topics[]": "a", "sort": "def", "sortmode": "DESC"},
+            scimag_url = (f"{mirror}/index.php?req={requests.utils.quote(doi)}"
+                          f"&res=5&page=1&sort=def&sortmode=DESC"
+                          f"&topics%5B%5D=a")
+            r = sess.get(scimag_url,
                          headers={"User-Agent": UA_DESK}, timeout=15)
             log.debug("_do_paper_dl_doi scimag %s: HTTP %d len=%d",
                       mirror, r.status_code, len(r.content))
@@ -5969,9 +6004,10 @@ def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
 
     # ── Strategy 2: Unpaywall (free OA PDF, no auth) ─────────────────────────
     try:
-        up = sess.get(f"https://api.unpaywall.org/v2/{doi}",
+        clean_doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi).strip().rstrip(".,)")
+        up = sess.get(f"https://api.unpaywall.org/v2/{clean_doi}",
                       params={"email": "bot@example.com"},
-                      headers={"User-Agent": "BaleBot/1.0"},
+                      headers={"User-Agent": "BaleBot/1.0 (mailto:bot@example.com)"},
                       timeout=10)
         log.debug("_do_paper_dl_doi Unpaywall: HTTP %d", up.status_code)
         if up.status_code == 200:
@@ -8362,6 +8398,41 @@ def handle_callback(cb: dict):
         query = st.get("last_query","")
         do_images(cid, query, source, page); return
 
+    # book_ia_{url_key} — download from Internet Archive
+    m = re.match(r"book_ia_(\w+)$", data)
+    if m:
+        ia_url = get_url(m.group(1)) or ""
+        if not ia_url:
+            send_message(cid, "❌ لینک منقضی شده.", reply_markup=home_kb()); return
+        send_message(cid, "⏳ در حال دانلود از Internet Archive…")
+        chat_action(cid, "upload_document")
+        sess = _libgen_session()
+        try:
+            resp = sess.get(ia_url, headers={"User-Agent": UA_DESK},
+                            timeout=90, allow_redirects=True)
+            if resp.status_code == 200 and len(resp.content) > 5000:
+                fname = ia_url.split("/")[-1].split("?")[0] or "book.pdf"
+                if smart_send(cid, resp.content, fname, caption=f"📚 {fname}"):
+                    send_message(cid, "✅ کتاب ارسال شد.", reply_markup=home_kb())
+                else:
+                    send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+            else:
+                send_message(cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb())
+        except Exception as e:
+            log.warning("book_ia: %s", e)
+            send_message(cid, "❌ خطا در دانلود.", reply_markup=home_kb())
+        clear_state(cid); return
+
+    # book_ol_{url_key} — show Open Library link
+    m = re.match(r"book_ol_(\w+)$", data)
+    if m:
+        ol_url = get_url(m.group(1)) or ""
+        if ol_url:
+            send_message(cid, f"🌐 لینک Open Library:\n{ol_url}", reply_markup=home_kb())
+        else:
+            send_message(cid, "❌ لینک منقضی شده.", reply_markup=home_kb())
+        return
+
     # paper_item_{cache_key}_{idx} — user clicked a paper in results
     m = re.match(r"paper_item_(\w+)_(\d+)$", data)
     if m:
@@ -8537,15 +8608,6 @@ def handle_callback(cb: dict):
     if m:
         do_book_download(cid, f"{m.group(1)}_{m.group(2)}"); return
 
-    # book_ol_{url_key}  — باز کردن صفحه Open Library (بدون فایل مستقیم)
-    m = re.match(r"book_ol_(\w+)$", data)
-    if m:
-        url = get_url(m.group(1)) or ""
-        if url:
-            send_message(cid, f"🌐 لینک Open Library:\n{url}", reply_markup=home_kb())
-        else:
-            send_message(cid, "❌ لینک منقضی شده.", reply_markup=home_kb())
-        return
 
     # ── RSS callbacks ─────────────────────────────────────────────────────
     if data == "mode_rss" or data.startswith("rss_"):

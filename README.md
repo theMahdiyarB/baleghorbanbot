@@ -1,32 +1,33 @@
 # 🤖 بله قربان — Bale Web Assistant Bot
 
-یک ربات جامع برای پیام‌رسان **بله** با قابلیت‌های متعدد جستجو، دانلود، شبکه‌های اجتماعی و بیشتر.
-
----
+یک ربات جامع برای پیام‌رسان **بله** با قابلیت‌های متعدد جستجو، دانلود، شبکه‌های sociais و بیشتر.
 
 ## ✨ قابلیت‌ها
 
 | ابزار | توضیح |
-|---|---|
+|------|--------|
 | 🔎 **جستجو در وب** | تا ۱۰ نتیجه از DuckDuckGo — نتایج قابل کلیک با صفحه‌بندی |
 | 🌐 **مشاهده سایت** | اسکرین‌شات ۱۹۲۰×۱۰۸۰ + دکمه‌های متن / HTML / ZIP / PDF |
 | 📚 **مقاله علمی** | جستجوی Google Scholar با صفحه‌بندی و نتایج قابل کلیک |
 | 📖 **ویکی‌پدیا** | جستجو + خواندن مقاله کامل (فارسی و انگلیسی) |
-| 📺 **یوتیوب** | جستجو با تامبنیل، **انتخاب کیفیت ویدیو** (360p–1080p+)، **انتخاب زیرنویس**، دانلود صدا، ۳ استراتژی yt-dlp + Cobalt fallback |
-| 🎵 **موسیقی MP3** | دانلود صوتی از YouTube Music / SoundCloud / Spotify |
+| 📺 **یوتیوب** | جستجو با تامبنیل، **انتخاب کیفیت ویدیو** (360p–1080p+)، **انتخاب زیرنویس**، دانلود صدا، **۳ استراتژی yt-dlp** + **Cobalt fallback** |
+| 🎵 **موسیقی MP3** | دانلود صوتی از YouTube Music / SoundCloud / Spotify / JioSaavn / Deezer |
 | 🖼 **دانلود عکس** | Bing / Pinterest / Pixabay / Wikimedia با «دانلود بیشتر» |
 | 🐙 **GitHub** | جستجوی مخازن + دانلود ZIP + دانلود Release |
 | ✈️ **کانال تلگرام** | خواندن پیام‌های کانال عمومی (scrape) یا MTProto |
 | 🐦 **توییتر / X** | تایم‌لاین کاربر + دانلود عکس خودکار + دانلود ویدیو |
 | 📸 **اینستاگرام** | پست‌های پروفایل + دانلود عکس خودکار + دانلود ریل (۳ استراتژی: instaloader → yt-dlp → Cobalt API) |
 | 🎵 **تیک‌تاک** | لیست ویدیوها با تامبنیل + دانلود مستقیم |
-| 📱 **APK دانلود** | جستجو در Google Play + دانلود APK از APKPure / APKMirror / F-Droid / Aptoide |
+| 📱 **APK دانلود** | جستجو در Google Play + دانلود APK از APKPure / APKMirror / Aptoide / F-Droid |
 | 📰 **اخبار RSS** | دریافت فید + کشف خودکار فید از سایت |
-| 📚 **Z-Library** | جستجو و دانلود کتاب الکترونیکی |
+| 📚 **Z-Library** | جستجو و دانلود کتاب الکترونیکی (PDF، EPUB، MOBI، FB2) |
 | 🌐 **ترجمه** | ترجمه به فارسی، انگلیسی، عربی، آلمانی، فرانسوی، روسی |
 | 🖼 **OCR** | استخراج متن از عکس + خروجی PDF |
 | 🌐 **IP / دامنه** | موقعیت، اپراتور، منطقه زمانی |
 | 🔒 **حریم خصوصی** | توضیح کامل نحوه عدم ذخیره داده |
+| 🛡 **اسکن ویروس** | اسکن فایل و URL با VirusTotal (نیاز به API key) |
+| 🦋 **بلواسکای** | دانلود پست، متن و رسانه از Bluesky |
+| 📄 **مقاله علمی** | جستجو via Semantic Scholar + دانلود PDF از Sci-Hub/LibGen/Unpaywall |
 
 ### 📺 دانلود یوتیوب — جزئیات
 
@@ -42,7 +43,9 @@
 - استراتژی ۳: Cobalt API — فقط اگر هر دو استراتژی yt-dlp شکست بخورند
 
 ### 🔗 تشخیص خودکار لینک
+
 فقط لینک بفرستید — ربات خودکار تشخیص می‌دهد:
+
 - `youtube.com` / `youtu.be` → انتخاب کیفیت + دانلود
 - `tiktok.com` / `vm.tiktok.com` → دانلود ویدیو
 - `twitter.com` / `x.com` → دانلود رسانه
@@ -51,11 +54,10 @@
 - سایر لینک‌ها → اسکرین‌شات + گزینه‌های بیشتر
 
 ### 📤 ارسال فایل هوشمند
-- فایل‌های بزرگ به **قطعه‌های ۱۹MB** تقسیم می‌شوند
+
+- فایل‌های بزرگ به **قطعه‌های ۱۹MB** (Bale) / **۴۹MB** (Telegram) تقسیم می‌شوند
 - پسوندهای غیر پشتیبانی‌شده در **ZIP** بسته‌بندی می‌شوند
 - پیام ترکیب قطعه‌ها ارسال می‌شود: `cat file.part*of3.ext > file.ext`
-
----
 
 ## 🛠 نصب و راه‌اندازی
 
@@ -81,6 +83,9 @@ python -m playwright install-deps chromium
 ```bash
 # توکن ربات بله (الزامی)
 export BALE_TOKEN="توکن_ربات_شما"
+
+# اختیاری: ربات تلگرام همزمان (برای پشتیبانی دوplatform)
+export TELEGRAM_TOKEN="توکن_ربات_تلگرام_شما"
 ```
 
 ### ۴. متغیرهای اختیاری
@@ -111,7 +116,7 @@ export TG_API_HASH=abcdef1234567890abcdef1234567890
 # Twitter — کوکی برای دانلود توییت‌های محدودشده
 export TWITTER_COOKIES_FILE=/path/twitter_cookies.txt
 
-# Instagram — برای پروفایل‌های خصوصی
+# Instagram — برای پروفایل‌های خصوصی‌ها
 export INSTAGRAM_USER=your_username
 export INSTAGRAM_PASS=your_password
 # کوکی فایل برای yt-dlp (جایگزین user/pass)
@@ -125,6 +130,12 @@ export SPOTIFY_CLIENT_SECRET=your_client_secret
 # Z-Library: ایمیل و رمز حساب از z-library.sk/login
 export ZLIB_EMAIL=your@email.com
 export ZLIB_PASSWORD=your_password
+
+# VirusTotal — اسکن فایل و URL (حداقل ۴ درخواست در دقیقه، ۵۰۰ در روز)
+export VIRUSTOTAL_API_KEY=your_64char_vt_key_here
+
+# Pixabay — کلید API برای بهبود جستجوی عکس (اختیاری)
+export PIXABAY_KEY=your_pixabay_key
 ```
 
 ### ۵. اجرا
@@ -132,20 +143,6 @@ export ZLIB_PASSWORD=your_password
 ```bash
 python bale_bot.py
 ```
-
----
-
-## 📋 دستورات ربات
-
-| دستور | عملکرد |
-|---|---|
-| `/start` | شروع و نمایش منوی اصلی |
-| `/help` | نمایش راهنمای کامل |
-| `/stats` | نمایش آمار کاربری |
-| `/cancel` | لغو عملیات جاری |
-| `/ocr` | ریپلای روی عکس → استخراج متن |
-
----
 
 ## 🚀 اجرا به‌عنوان سرویس (systemd)
 
@@ -172,10 +169,23 @@ WantedBy=multi-user.target
 فایل `.env`:
 ```bash
 BALE_TOKEN=your_token_here
+TELEGRAM_TOKEN=optional_telegram_token
 YOUTUBE_COOKIES_FILE=/path/yt_cookies.txt
 GITHUB_TOKEN=optional_token
 # WARP_PROXY=socks5://127.0.0.1:40000
 # COBALT_URL=http://localhost:9000
+# TG_API_ID=12345678
+# TG_API_HASH=abcdef1234567890abcdef1234567890
+# TWITTER_COOKIES_FILE=/path/twitter_cookies.txt
+# INSTAGRAM_USER=your_username
+# INSTAGRAM_PASS=your_password
+# INSTAGRAM_COOKIES_FILE=/path/instagram_cookies.txt
+# SPOTIFY_CLIENT_ID=your_client_id
+# SPOTIFY_CLIENT_SECRET=your_client_secret
+# ZLIB_EMAIL=your@email.com
+# ZLIB_PASSWORD=your_password
+# VIRUSTOTAL_API_KEY=your_64char_vt_key_here
+# PIXABAY_KEY=your_pixabay_key
 ```
 
 ```bash
@@ -185,22 +195,7 @@ sudo systemctl status bale-bot
 sudo journalctl -u bale-bot -f   # مشاهده لاگ
 ```
 
----
-
-## 🔧 ساختار فایل
-
-```
-bale_bot.py        ← فایل اصلی ربات (۵۵۰۰+ خط)
-requirements.txt   ← کتابخانه‌های مورد نیاز
-env.example        ← نمونه تنظیمات محیطی
-README.md          ← این فایل
-bale_bot.log       ← فایل لاگ (ایجاد می‌شود)
-tg_session.session ← نشست Telethon (ایجاد می‌شود)
-```
-
----
-
-## 📊 معماری فنی
+## 📊 arquitectura técnica
 
 - **Long Polling** — بدون نیاز به IP ثابت یا دامنه
 - **result_cache** — نتایج جستجو ذخیره موقت برای دکمه‌های callback
@@ -214,6 +209,27 @@ tg_session.session ← نشست Telethon (ایجاد می‌شود)
 - **APK ۴ استراتژی** — APKPure → APKMirror → Aptoide → F-Droid
 - **همه پیام‌ها فارسی** — تمام متن‌های ارسالی به کاربر به زبان فارسی است
 
----
+## 📋 دستورات ربات
 
-**© ۱۴۰۵ — بله قربان**
+| دستور | عملکرد |
+|------|--------|
+| `/start` | شروع و نمایش منوی اصلی |
+| `/help` | نمایش راهنمای کامل |
+| `/stats` | نمایش آمار کاربری |
+| `/cancel` | لغو عملیات جاری |
+| `/ocr` | ریپلای روی عکس → استخراج متن |
+
+## 📁 ساختار فایل
+
+```
+baleghorbanbot/
+├── bale_bot.py        ← فایل اصلی ربات (۹۵۰۰+ خط)
+├── requirements.txt   ← کتابخانه‌های مورد نیاز + مستندات پکیج‌های سیستمی
+├── env.example        ← نمونه تنظیمات محیطی
+├── README.md          ← این فایل
+├── bale_bot.log       ← فایل لاگ (ایجاد می‌شود)
+└── tg_session.session ← نشست Telethon (ایجاد می‌شود)
+```
+
+> **© ۱۴۰۵ — بله قربان**  
+> ربات با ♥ در ایران توسعه یافته و حریم خصوصی کاربران را به شدت محترم می‌دارد. هیچ داده‌ای از کاربران ذخیره نمی‌شود.
