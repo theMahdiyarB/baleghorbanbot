@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.24)
+بله قربان — Bale Bot  (v2.25)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -30,20 +30,29 @@ _ctx = _tl_threading.local()   # _ctx.base_url, _ctx.platform, _ctx.kb_*
 BALE_TOKEN     = os.getenv("BALE_TOKEN", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 
-# Per-platform constants (used by whichever platform is active in the thread)
-def _make_session() -> requests.Session:
+# Define session maker before platform config
+def _make_session(proxy: str = "") -> requests.Session:
     """Create a requests.Session with connection pooling and retry adapter."""
-    from requests.adapters import HTTPAdapter
     s = requests.Session()
-    adapter = HTTPAdapter(
-        pool_connections=4,
-        pool_maxsize=20,
-        max_retries=0,   # we do our own retry logic in api()
-    )
-    s.mount("https://", adapter)
-    s.mount("http://",  adapter)
+    r = Retry(total=3, backoff_factor=0.4,
+              status_forcelist=[500, 502, 503, 504],
+              allowed_methods=["GET", "POST", "HEAD"])
+    s.mount("https://", HTTPAdapter(max_retries=r))
+    s.mount("http://",  HTTPAdapter(max_retries=r))
+    if proxy:
+        try:
+            # Use socks5h so DNS is resolved through the proxy (needed for geo-blocked domains)
+            _proxy = proxy.replace("socks5://", "socks5h://") if proxy.startswith("socks5://") else proxy
+            s.proxies = {"http": _proxy, "https": _proxy}
+            # Test SOCKS support early to give a clear error
+            import socks  # noqa — just check it's importable
+        except ImportError:
+            log.warning("PySocks not installed — WARP proxy disabled. "
+                        "Run: pip install PySocks --break-system-packages")
+            s.proxies = {}
     return s
 
+# Per-platform constants (used by whichever platform is active in the thread)
 _PLATFORM_CFG = {
     "bale": {
         "base_url":   f"https://tapi.bale.ai/bot{BALE_TOKEN}",
@@ -85,8 +94,8 @@ def _chunk_size() -> int:
     return getattr(_ctx, "chunk_size", 19 * 1024 * 1024)
 
 # Keyboard limit helpers — use thread-local per-platform values
-@property
 def _KB_MAX_ROWS():
+    """Get keyboard max rows from thread-local context."""
     return getattr(_ctx, "kb_rows", 10)
 
 KB_MAX_ROWS = 10   # default fallback (replaced per-thread via _ctx)
@@ -173,27 +182,6 @@ logging.getLogger("requests").setLevel(logging.WARNING)
 # ═══════════════════════════════════════════════════════════════════════════════
 # SHARED HTTP SESSION
 # ═══════════════════════════════════════════════════════════════════════════════
-def _make_session(proxy: str = "") -> requests.Session:
-    s = requests.Session()
-    # Do NOT include 429 in status_forcelist — retrying rate-limit responses
-    # immediately makes rate-limiting worse (burns quota faster).
-    r = Retry(total=3, backoff_factor=0.4,
-              status_forcelist=[500, 502, 503, 504],
-              allowed_methods=["GET", "POST", "HEAD"])
-    s.mount("https://", HTTPAdapter(max_retries=r))
-    s.mount("http://",  HTTPAdapter(max_retries=r))
-    if proxy:
-        try:
-            # Use socks5h so DNS is resolved through the proxy (needed for geo-blocked domains)
-            _proxy = proxy.replace("socks5://", "socks5h://") if proxy.startswith("socks5://") else proxy
-            s.proxies = {"http": _proxy, "https": _proxy}
-            # Test SOCKS support early to give a clear error
-            import socks  # noqa — just check it's importable
-        except ImportError:
-            log.warning("PySocks not installed — WARP proxy disabled. "
-                        "Run: pip install PySocks --break-system-packages")
-            s.proxies = {}
-    return s
 
 WEB = _make_session()
 
@@ -297,7 +285,15 @@ def api(method: str, _retries: int = 4, **kwargs) -> dict:
                 return result
             # Bale returns ok=False with error_code on server errors
             code = result.get("error_code", 0)
-            if code in (429, 500, 502, 503, 504) or r.status_code >= 500:
+            if code == 429:
+                # Rate-limited — back off more aggressively
+                log.warning("api %s: rate-limited (429) — retry %d/%d in %ds",
+                            method, attempt+1, _retries, delay)
+                time.sleep(delay)
+                delay = min(delay * 3, 60)  # More aggressive backoff for rate limits
+                last_err = result
+                continue
+            elif code in (500, 502, 503, 504) or r.status_code >= 500:
                 log.warning("api %s: server error %s — retry %d/%d in %ds",
                             method, result, attempt+1, _retries, delay)
                 time.sleep(delay)
@@ -353,33 +349,39 @@ def _post_file(endpoint: str, field: str, filename: str,
     """Low-level multipart file POST to Bale API with retry."""
     delay = 3
     for attempt in range(_retries):
-        files = {field: (filename, io.BytesIO(data_bytes), _mime(filename))}
+        file_obj = io.BytesIO(data_bytes)
+        files = {field: (filename, file_obj, _mime(filename))}
         try:
             r = _session().post(f"{_base_url()}/{endpoint}", data=extra_data,
                               files=files, timeout=180)
             resp = _safe_json(r)
             ok = resp.get("ok", False)
             if ok:
+                file_obj.close()
                 return True
             code = resp.get("error_code", 0)
             if code in (429, 500, 502, 503, 504) or r.status_code >= 500:
                 log.warning("%s: server error %s — retry %d/%d in %ds",
                             endpoint, resp, attempt+1, _retries, delay)
+                file_obj.close()
                 time.sleep(delay)
                 delay = min(delay * 2, 30)
                 continue
             log.error("%s failed: %s  file=%s  size=%dKB",
                       endpoint, resp, filename, len(data_bytes)//1024)
+            file_obj.close()
             return False
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout,
                 requests.exceptions.ChunkedEncodingError) as e:
             log.warning("%s: connection error %s — retry %d/%d in %ds",
                         endpoint, e, attempt+1, _retries, delay)
+            file_obj.close()
             time.sleep(delay)
             delay = min(delay * 2, 30)
         except Exception as e:
             log.error("%s exception: %s  file=%s", endpoint, e, filename)
+            file_obj.close()
             return False
     log.error("%s: all %d retries failed for %s", endpoint, _retries, filename)
     return False
@@ -457,27 +459,42 @@ def _send_one_chunk(chat_id, data_bytes: bytes, filename: str,
         if thumb_bytes:
             # thumb must be sent as a separate multipart field
             delay = 3
+            thumb_sent = False
             for attempt in range(3):
+                video_obj = io.BytesIO(data_bytes)
+                thumb_obj = io.BytesIO(thumb_bytes)
                 files = {
-                    "video": (filename,    io.BytesIO(data_bytes), _mime(filename)),
-                    "thumbnail": ("thumb.jpg", io.BytesIO(thumb_bytes), "image/jpeg"),
+                    "video": (filename,    video_obj, _mime(filename)),
+                    "thumbnail": ("thumb.jpg", thumb_obj, "image/jpeg"),
                 }
                 try:
                     r = _session().post(f"{_base_url()}/sendVideo",
                                         data=extra, files=files, timeout=180)
                     resp = _safe_json(r)
                     if resp.get("ok"):
+                        thumb_sent = True
+                        video_obj.close()
+                        thumb_obj.close()
                         return True
                     code = resp.get("error_code", 0)
                     if code in (429, 500, 502, 503, 504) or r.status_code >= 500:
-                        time.sleep(delay); delay = min(delay*2, 30); continue
+                        video_obj.close()
+                        thumb_obj.close()
+                        time.sleep(delay)
+                        delay = min(delay*2, 30)
+                        continue
                     log.error("sendVideo+thumb failed: %s  file=%s", resp, filename)
+                    video_obj.close()
+                    thumb_obj.close()
                     break
                 except Exception as e:
                     log.warning("sendVideo+thumb: %s retry %d", e, attempt+1)
-                    time.sleep(delay); delay = min(delay*2, 30)
-            else:
-                log.error("sendVideo+thumb: all retries failed for %s", filename)
+                    video_obj.close()
+                    thumb_obj.close()
+                    time.sleep(delay)
+                    delay = min(delay*2, 30)
+            if not thumb_sent:
+                log.error("sendVideo+thumb: all retries failed for %s, falling back to plain sendVideo", filename)
             # Fall through to plain sendVideo if thumb attempt completely failed
             return _post_file("sendVideo", "video", filename, data_bytes, extra)
         return _post_file("sendVideo", "video", filename, data_bytes, extra)
@@ -749,23 +766,38 @@ def send_media_group(chat_id, items: list[dict]) -> bool:
     delay  = 3
     for attempt in range(3):
         try:
-            # Reset BytesIO positions for retry
-            for f in files.values():
-                f[1].seek(0)
             r = _session().post(f"{_base_url()}/sendMediaGroup",
                                 data=data, files=files, timeout=180)
             resp = _safe_json(r)
             if resp.get("ok"):
                 log.info("send_media_group: OK %d items to %d", len(items), chat_id)
+                # Close all BytesIO objects
+                for f in files.values():
+                    f[1].close()
                 return True
             code = resp.get("error_code", 0)
             if code in (429, 500, 502, 503, 504) or r.status_code >= 500:
-                time.sleep(delay); delay = min(delay * 2, 30); continue
+                # Reset BytesIO positions for retry
+                for f in files.values():
+                    try:
+                        f[1].seek(0)
+                    except Exception:
+                        pass
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+                continue
             log.error("sendMediaGroup failed: %s", resp)
             break
         except Exception as e:
             log.warning("sendMediaGroup attempt %d: %s", attempt + 1, e)
-            time.sleep(delay); delay = min(delay * 2, 30)
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+    # Close all BytesIO objects before falling back
+    for f in files.values():
+        try:
+            f[1].close()
+        except Exception:
+            pass
 
     # Fallback: send individually
     log.warning("send_media_group: falling back to individual sends")
@@ -1998,6 +2030,7 @@ def youtube_download(url: str, audio_only=False,
     # selector that lets yt-dlp decide entirely with --format-sort.
     log.warning("youtube_download: all probes failed, trying broad safety-net")
     for client in ("android", "ios", "tv_embedded"):
+        log.info("youtube_download: safety-net trying client=%s", client)
         with tempfile.TemporaryDirectory() as tmp:
             cmd = [
                 YTDLP_BIN,
@@ -2032,8 +2065,9 @@ def youtube_download(url: str, audio_only=False,
                     data = f.read_bytes()
                     log.info("yt-dlp safety-net OK: %s  %.1fMB", f.name, len(data)/1024/1024)
                     return data, f.name
-            log.error("safety-net rc=%d client=%s: %s", proc.returncode, client,
-                      proc.stderr.decode(errors="replace")[:200])
+            else:
+                log.error("safety-net rc=%d client=%s: %s", proc.returncode, client,
+                          proc.stderr.decode(errors="replace")[:200])
 
     # ── Strategy 3: Cobalt API fallback ───────────────────────────────────────
     log.warning("youtube_download: yt-dlp exhausted, trying Cobalt fallback")
@@ -2421,9 +2455,16 @@ def jiosaavn_download(item: dict) -> Optional[tuple[bytes, str]]:
 
 
 def _jiosaavn_decrypt(enc_url: str) -> Optional[str]:
-    """Decrypt JioSaavn encrypted media URL using their known DES key."""
+    """Decrypt JioSaavn encrypted media URL using their known DES key.
+    
+    Note: This uses a hardcoded key for known JioSaavn API compatibility.
+    If the API changes, decryption will fail gracefully.
+    """
+    if not enc_url or not isinstance(enc_url, str):
+        log.debug("jiosaavn_decrypt: invalid input")
+        return None
     try:
-        from base64 import b64decode, b64encode
+        from base64 import b64decode
         # JioSaavn uses DES ECB with a known key
         try:
             from Crypto.Cipher import DES
@@ -2431,14 +2472,28 @@ def _jiosaavn_decrypt(enc_url: str) -> Optional[str]:
             log.warning("jiosaavn_decrypt: pycryptodome not installed, skipping decrypt")
             return None
         key = b"38346591"
-        enc_bytes = b64decode(enc_url)
-        cipher = DES.new(key, DES.MODE_ECB)
-        decrypted = cipher.decrypt(enc_bytes)
+        try:
+            enc_bytes = b64decode(enc_url)
+        except Exception as e:
+            log.debug("jiosaavn_decrypt: invalid base64: %s", e)
+            return None
+        if not enc_bytes or len(enc_bytes) < 8:
+            log.debug("jiosaavn_decrypt: decrypted data too short")
+            return None
+        try:
+            cipher = DES.new(key, DES.MODE_ECB)
+            decrypted = cipher.decrypt(enc_bytes)
+        except Exception as e:
+            log.debug("jiosaavn_decrypt: DES decryption failed: %s", e)
+            return None
         # Remove padding
         url = decrypted.decode("utf-8", errors="ignore").rstrip("\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10")
+        if not url or not url.startswith("http"):
+            log.debug("jiosaavn_decrypt: invalid decrypted URL format")
+            return None
         # Upgrade to 320kbps
         url = url.replace("_96.mp4", "_320.mp4").replace("_160.mp4", "_320.mp4")
-        log.debug("jiosaavn_decrypt: %s", url[:80])
+        log.debug("jiosaavn_decrypt: OK %s", url[:60])
         return url
     except Exception as e:
         log.error("jiosaavn_decrypt: %s", e)
