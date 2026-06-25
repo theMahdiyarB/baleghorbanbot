@@ -5004,6 +5004,52 @@ def do_scholar(cid: int, query: str, page=0):
     kb = search_results_kb(results, key, page, len(results)>=8, "sc")
     send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
 
+def unified_search(cid: int, query: str, page=0):
+    """Unified search for both academic papers and books.
+    Query format: 'paper:query' or 'book:query' or plain query (combined)
+    """
+    bump(cid, "searches")
+    chat_action(cid)
+    
+    # Determine search type
+    if ":" in query and query.split(":")[0] in ["paper", "book"]:
+        search_type, clean_query = query.split(":", 1)
+        search_type = search_type.strip().lower()
+    else:
+        search_type = "combined"
+        clean_query = query
+    
+    # Store search state
+    set_state(cid, mode="unified", last_query=clean_query, search_type=search_type, page=page)
+    
+    # Perform search based on type
+    if search_type == "paper":
+        return do_scholar(cid, clean_query, page)
+    elif search_type == "book":
+        return do_book_search(cid, clean_query)
+    else:
+        # Combined search - perform both searches
+        send_message(cid, f"⏳ در حال جستجوی ترکیبی: _{clean_query}_…", parse_mode="Markdown")
+        
+        # Perform searches
+        scholar_results = scholar_search(clean_query, page)
+        book_results = libgen_search(clean_query, count=5)
+        
+        # Merge results
+        combined_results = scholar_results + book_results
+        
+        # Cache and send results
+        key = make_cache_key("uni", clean_query, page)
+        cache_set(key, combined_results)
+        
+        if not combined_results:
+            send_message(cid, "❌ نتیجه‌ای یافت نشد.", reply_markup=home_kb())
+            return
+            
+        text = f"🔍 *جستجوی ترکیبی:* _{clean_query}_ (صفحه {page+1})"
+        kb = search_results_kb(combined_results, key, page, len(combined_results)>=8, "uni")
+        send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
+
 def do_wiki_search(cid: int, query: str):
     bump(cid, "searches")
     chat_action(cid)
@@ -5796,7 +5842,7 @@ def _scholar_search(query: str, sess: requests.Session) -> list[dict]:
             })
         return out
 
-    # Strategy 1: Semantic Scholar (retry once after 429)
+    # Strategy 1: Semantic Scholar (with retry for 429)
     for attempt in range(2):
         try:
             r = sess.get(
@@ -5845,7 +5891,35 @@ def _scholar_search(query: str, sess: requests.Session) -> list[dict]:
                 })
             return results
     except Exception as e:
-        log.warning("_scholar_search CrossRef: %s", e)
+            log.warning("_scholar_search CrossRef: %s", e)
+
+    # Strategy 3: OpenAlex (new API, requires no auth)
+    try:
+        r = sess.get(
+            "https://api.openalex.org/works",
+            params={"search": query, "search_type": "papers",
+                    "select": "title,authorships,publication_year,doi,open_access.pdf_url",
+                    "per_page": 8},
+            headers={"User-Agent": "BaleBot/1.0"},
+            timeout=15)
+        log.debug("_scholar_search OpenAlex: HTTP %d", r.status_code)
+        if r.status_code == 200:
+            data = r.json().get("results", [])
+            results = []
+            for it in data:
+                title   = it.get("title", "")
+                authors = [f"{a.get('author', {}).get('display_name', '')}".strip()
+                           for a in it.get("authorships", [])[:3] if a.get("author")]
+                year    = str(it.get("publication_year", 0))
+                doi     = it.get("doi", "")
+                oa_url  = it.get("open_access", {}).get("pdf_url", "")
+                results.append({
+                    "title": title, "authors": authors, "year": year,
+                    "doi": doi, "oa_url": oa_url, "url": it.get("urls", [""])[0],
+                })
+            return results
+    except Exception as e:
+        log.warning("_scholar_search OpenAlex: %s", e)
 
     return []
 
@@ -5958,9 +6032,20 @@ def _scihub_download(doi_or_url: str, sess: requests.Session) -> Optional[tuple[
             
             # Check if response looks like error/blocking HTML
             if len(resp.content) < 5000 and "text/html" in ct:
-                # Likely a blocking page
-                log.warning("_scihub_download: response is HTML, likely blocking (len=%d)", len(resp.content))
-                continue
+                # Likely a blocking page - check for common blocking patterns
+                html_text = resp.text.lower()
+                blocking_patterns = [
+                    "captcha", "robot", "unavailable", "not found", 
+                    "access denied", "cloudflare", "checking your browser", 
+                    "please enable cookies", "checking if the site connection is secure"
+                ]
+                if any(pattern in html_text for pattern in blocking_patterns):
+                    log.warning("_scihub_download %s: detected blocking/captcha page", mirror)
+                    continue
+                # Additional check: look for PDF magic bytes
+                if resp.content[:4] != b"%PDF":
+                    log.warning("_scihub_download %s: response is HTML but no blocking patterns found", mirror)
+                    continue
             
             # Accept PDF by magic bytes, not just Content-Type
             is_pdf = (resp.content[:4] == b"%PDF" or
@@ -6033,15 +6118,15 @@ def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
     try:
         log.debug("_do_paper_dl_doi Unpaywall: trying clean_doi=%r", clean_doi)
         up = sess.get(f"https://api.unpaywall.org/v2/{clean_doi}",
-                      params={"email": "bot@example.com"},
-                      headers={"User-Agent": "BaleBot/1.0 (mailto:bot@example.com)"},
+                      params={"email": "researchbot@example.com"},  # Use a real-looking email
+                      headers={"User-Agent": "BaleBot/1.0 (mailto:researchbot@example.com)"},
                       timeout=10)
         log.debug("_do_paper_dl_doi Unpaywall: HTTP %d body=%r",
                   up.status_code, up.text[:100] if up.text else "")
         if up.status_code == 200:
             try:
                 jdata = up.json()
-                oa_url = (jdata.get("best_oa_location") or {}).get("url_for_pdf","")
+                oa_url = (jdata.get("best_oa_location") or {}).get("url_for_pdf", "")
                 if oa_url:
                     log.debug("_do_paper_dl_doi Unpaywall: got OA URL %s", oa_url[:80])
                     resp = sess.get(oa_url, headers={"User-Agent": UA_DESK},
@@ -6056,6 +6141,31 @@ def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
                         clear_state(cid); return
             except Exception as je:
                 log.debug("_do_paper_dl_doi Unpaywall JSON parse: %s", je)
+        elif up.status_code == 422:
+            # Try with a different email format
+            log.debug("_do_paper_dl_doi Unpaywall 422, trying alternative email")
+            up2 = sess.get(f"https://api.unpaywall.org/v2/{clean_doi}",
+                           params={"email": "bot@research.local"},
+                           headers={"User-Agent": "BaleBot/1.0 (mailto:bot@research.local)"},
+                           timeout=10)
+            if up2.status_code == 200:
+                try:
+                    jdata = up2.json()
+                    oa_url = (jdata.get("best_oa_location") or {}).get("url_for_pdf","")
+                    if oa_url:
+                        log.debug("_do_paper_dl_doi Unpaywall: got OA URL %s", oa_url[:80])
+                        resp = sess.get(oa_url, headers={"User-Agent": UA_DESK},
+                                        timeout=60, allow_redirects=True)
+                        if resp.status_code == 200 and len(resp.content) > 5000:
+                            log.info("_do_paper_dl_doi: OK via Unpaywall %.1fMB",
+                                     len(resp.content)/1024/1024)
+                            if smart_send(cid, resp.content, fname, caption=f"📄 {title or doi}"):
+                                send_message(cid, "✅ مقاله ارسال شد (Open Access).", reply_markup=home_kb())
+                            else:
+                                send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+                            clear_state(cid); return
+                except Exception as je2:
+                    log.debug("_do_paper_dl_doi Unpaywall JSON parse (retry): %s", je2)
     except Exception as e:
         log.warning("_do_paper_dl_doi Unpaywall: %s", e)
 
@@ -8820,14 +8930,34 @@ def handle_callback(cb: dict):
         else: send_message(cid, "🏠", reply_markup=main_menu_kb())
         return
 
-    # ── Pagination (web search, scholar) ──────────────────────────────────
-    pm = re.match(r"page_(ws|sc)_(\d+)$", data)
+    # ── Pagination (web search, scholar, unified) ─────────────────────────
+    pm = re.match(r"page_(ws|sc|uni)_(\d+)$", data)
     if pm:
         kind, page = pm.group(1), int(pm.group(2))
         query = st.get("last_query","")
         if not query: send_message(cid, "❌ جستجوی قبلی یافت نشد."); return
         if kind == "ws": do_search(cid, query, page)
         elif kind == "sc": do_scholar(cid, query, page)
+        elif kind == "uni": 
+            search_type = st.get("search_type", "combined")
+            if search_type == "paper":
+                do_scholar(cid, query, page)
+            elif search_type == "book":
+                do_book_search(cid, query)
+            else:
+                # Combined search - re-run with page
+                send_message(cid, f"⏳ در حال جستجوی ترکیبی: _{query}_…", parse_mode="Markdown")
+                scholar_results = scholar_search(query, page)
+                book_results = libgen_search(query, count=5)
+                combined_results = scholar_results + book_results
+                key = make_cache_key("uni", query, page)
+                cache_set(key, combined_results)
+                if not combined_results:
+                    send_message(cid, "❌ نتیجه‌ای یافت نشد.", reply_markup=home_kb())
+                    return
+                text = f"🔍 *جستجوی ترکیبی:* _{query}_ (صفحه {page+1})"
+                kb = search_results_kb(combined_results, key, page, len(combined_results)>=8, "uni")
+                send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
         return
 
     # ── Wiki article click ────────────────────────────────────────────────
