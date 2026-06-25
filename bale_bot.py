@@ -884,7 +884,7 @@ def make_cache_key(prefix: str, query: str, page: int) -> str:
 def main_menu_kb():
     return {"inline_keyboard": [
         [{"text": "🔎 جستجو در وب",      "callback_data": "mode_search"},
-         {"text": "🌐 مشاهده سایت",      "callback_data": "mode_open"}],
+         {"text": "🌐 مشاهده سایت",      "callback_data": "mode_open"},
          {"text": "📖 ویکی‌پدیا",         "callback_data": "mode_wiki"}],
         [{"text": "📺 یوتیوب",            "callback_data": "mode_youtube"},
          {"text": "🎵 دانلود موزیک",     "callback_data": "mode_music"}],
