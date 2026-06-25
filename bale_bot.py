@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.23)
+بله قربان — Bale Bot  (v2.24)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -5868,6 +5868,9 @@ def _scihub_download(doi_or_url: str, sess: requests.Session) -> Optional[tuple[
                           mirror, len(rp.content))
                 continue
 
+            # Strip URL fragment (#view=FitH etc.) — sci-hub.ru iframes have this
+            if "#" in pdf_url:
+                pdf_url = pdf_url.split("#")[0]
             # Normalise URL
             if pdf_url.startswith("//"):
                 pdf_url = "https:" + pdf_url
@@ -5876,17 +5879,24 @@ def _scihub_download(doi_or_url: str, sess: requests.Session) -> Optional[tuple[
             elif not pdf_url.startswith("http"):
                 pdf_url = mirror + "/" + pdf_url
 
-            log.debug("_scihub_download: fetching PDF %s", pdf_url[:80])
+            log.debug("_scihub_download: fetching PDF %s", pdf_url[:100])
+            # Carry cookies from the DOI page response into the PDF request
+            page_cookies = "; ".join(f"{k}={v}" for k, v in rp.cookies.items())
             resp = sess.get(pdf_url, headers={
                 "User-Agent": UA_DESK,
                 "Referer": page_url,
                 "Accept": "application/pdf,application/octet-stream,*/*",
+                "Accept-Encoding": "identity",
                 "Origin": mirror,
+                "Cookie": page_cookies,
             }, timeout=90, allow_redirects=True)
             ct = resp.headers.get("Content-Type", "")
             log.debug("_scihub_download: PDF response HTTP %d  CT=%s  len=%d",
                       resp.status_code, ct, len(resp.content))
-            if resp.status_code == 200 and len(resp.content) > 5000:
+            # Accept PDF by magic bytes, not just Content-Type
+            is_pdf = (resp.content[:4] == b"%PDF" or
+                      "pdf" in ct.lower() or "octet" in ct.lower())
+            if resp.status_code == 200 and len(resp.content) > 5000 and is_pdf:
                 safe = re.sub(r"[^\w\-]", "_", doi)[:60]
                 fname = f"{safe}.pdf"
                 cd = resp.headers.get("Content-Disposition", "")
@@ -5950,24 +5960,24 @@ def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
     # ── Strategy 1: libgen scimag (search by DOI → md5 → download) ──────────
     try:
         for mirror in LIBGEN_MIRRORS:
-            # Search scimag collection by DOI
-            scimag_url = (f"{mirror}/index.php?req={requests.utils.quote(doi)}"
-                          f"&res=5&page=1&sort=def&sortmode=DESC"
-                          f"&topics%5B%5D=a")
-            r = sess.get(scimag_url,
+            # json.php API — query scimag by DOI directly (no HTML scraping)
+            r = sess.get(f"{mirror}/json.php",
+                         params={"object": "f", "topic": "a", "doi": doi},
                          headers={"User-Agent": UA_DESK}, timeout=15)
-            log.debug("_do_paper_dl_doi scimag %s: HTTP %d len=%d",
-                      mirror, r.status_code, len(r.content))
-            if r.status_code != 200 or len(r.content) < 500:
+            log.debug("_do_paper_dl_doi scimag json %s: HTTP %d len=%d body=%r",
+                      mirror, r.status_code, len(r.content), r.text[:80])
+            if r.status_code != 200 or len(r.content) < 5:
                 continue
-            soup = BeautifulSoup(r.text, "html.parser")
-            all_hrefs = [a["href"] for a in soup.find_all("a", href=True)]
-            log.debug("_do_paper_dl_doi scimag links sample: %s", all_hrefs[:15])
             md5 = ""
-            for href in all_hrefs:
-                mm = re.search(r"[?&/]md5=([a-fA-F0-9]{32})", href)
-                if mm:
-                    md5 = mm.group(1).lower(); break
+            try:
+                jdata = r.json()
+                items = list(jdata.values()) if isinstance(jdata, dict) else (
+                        jdata if isinstance(jdata, list) else [])
+                for item in items:
+                    if isinstance(item, dict) and item.get("md5"):
+                        md5 = str(item["md5"]).lower().strip(); break
+            except Exception as je:
+                log.debug("_do_paper_dl_doi scimag json parse: %s body=%r", je, r.text[:80])
             if not md5:
                 log.debug("_do_paper_dl_doi: no md5 in scimag results at %s", mirror)
                 continue
@@ -6005,6 +6015,7 @@ def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
     # ── Strategy 2: Unpaywall (free OA PDF, no auth) ─────────────────────────
     try:
         clean_doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi).strip().rstrip(".,)")
+        log.debug("_do_paper_dl_doi Unpaywall clean_doi=%r", clean_doi)
         up = sess.get(f"https://api.unpaywall.org/v2/{clean_doi}",
                       params={"email": "bot@example.com"},
                       headers={"User-Agent": "BaleBot/1.0 (mailto:bot@example.com)"},
