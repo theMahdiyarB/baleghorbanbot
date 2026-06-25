@@ -164,6 +164,7 @@ LIBGEN_DL_MIRRORS = [
 # Keep these for backward compat (no longer used for login)
 ZLIB_EMAIL    = os.getenv("ZLIB_EMAIL", "")
 ZLIB_PASSWORD = os.getenv("ZLIB_PASSWORD", "")
+UNPAYWALL_EMAIL = os.getenv("UNPAYWALL_EMAIL", "bot@example.com")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -884,7 +885,6 @@ def main_menu_kb():
     return {"inline_keyboard": [
         [{"text": "🔎 جستجو در وب",      "callback_data": "mode_search"},
          {"text": "🌐 مشاهده سایت",      "callback_data": "mode_open"}],
-        [{"text": "📚 مقاله علمی",        "callback_data": "mode_scholar"},
          {"text": "📖 ویکی‌پدیا",         "callback_data": "mode_wiki"}],
         [{"text": "📺 یوتیوب",            "callback_data": "mode_youtube"},
          {"text": "🎵 دانلود موزیک",     "callback_data": "mode_music"}],
@@ -5972,6 +5972,17 @@ def _scihub_download(doi_or_url: str, sess: requests.Session) -> Optional[tuple[
                 if src and len(src) > 5:
                     pdf_url = src; break
 
+            # Pattern 1b: If BeautifulSoup missed the full iframe src (truncation),
+            # try regex on raw HTML — sci-hub.ru embeds PDF in iframe
+            if not pdf_url or (pdf_url and not pdf_url.lower().endswith(".pdf") and "/storage/" in pdf_url):
+                # Look for iframe src with .pdf in raw HTML
+                iframe_match = re.search(
+                    r'<iframe[^>]+src=["\']([^"\']*?\.pdf[^"\']*)["\']',
+                    rp.text, re.IGNORECASE)
+                if iframe_match:
+                    pdf_url = iframe_match.group(1)
+                    log.debug("_scihub_download: regex extracted iframe src: %s", pdf_url[:200])
+
             # Pattern 2: #article, #buttons, download divs
             if not pdf_url:
                 for sel in ("#article a", "#buttons a", "#pdf-buttons a",
@@ -6014,7 +6025,7 @@ def _scihub_download(doi_or_url: str, sess: requests.Session) -> Optional[tuple[
             elif not pdf_url.startswith("http"):
                 pdf_url = mirror + "/" + pdf_url
 
-            log.debug("_scihub_download: fetching PDF %s", pdf_url[:100])
+            log.debug("_scihub_download: fetching PDF %s", pdf_url[:200])
             # Carry cookies from the DOI page response into the PDF request
             page_cookies = "; ".join(f"{k}={v}" for k, v in rp.cookies.items())
             resp = sess.get(pdf_url, headers={
@@ -6118,8 +6129,8 @@ def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
     try:
         log.debug("_do_paper_dl_doi Unpaywall: trying clean_doi=%r", clean_doi)
         up = sess.get(f"https://api.unpaywall.org/v2/{clean_doi}",
-                      params={"email": "researchbot@example.com"},  # Use a real-looking email
-                      headers={"User-Agent": "BaleBot/1.0 (mailto:researchbot@example.com)"},
+                      params={"email": UNPAYWALL_EMAIL},
+                      headers={"User-Agent": f"BaleBot/1.0 (mailto:{UNPAYWALL_EMAIL})"},
                       timeout=10)
         log.debug("_do_paper_dl_doi Unpaywall: HTTP %d body=%r",
                   up.status_code, up.text[:100] if up.text else "")
@@ -6143,10 +6154,11 @@ def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
                 log.debug("_do_paper_dl_doi Unpaywall JSON parse: %s", je)
         elif up.status_code == 422:
             # Try with a different email format
-            log.debug("_do_paper_dl_doi Unpaywall 422, trying alternative email")
+            alt_email = UNPAYWALL_EMAIL.replace("@", "+bot@") if "@" in UNPAYWALL_EMAIL else "bot@research.local"
+            log.debug("_do_paper_dl_doi Unpaywall 422, trying alternative email %r", alt_email)
             up2 = sess.get(f"https://api.unpaywall.org/v2/{clean_doi}",
-                           params={"email": "bot@research.local"},
-                           headers={"User-Agent": "BaleBot/1.0 (mailto:bot@research.local)"},
+                           params={"email": alt_email},
+                           headers={"User-Agent": f"BaleBot/1.0 (mailto:{alt_email})"},
                            timeout=10)
             if up2.status_code == 200:
                 try:
