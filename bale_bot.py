@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.25)
+بله قربان — Bale Bot  (v2.26)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -5880,6 +5880,12 @@ def _scihub_download(doi_or_url: str, sess: requests.Session) -> Optional[tuple[
             soup = BeautifulSoup(rp.text, "html.parser")
             pdf_url = ""
 
+            # Check if page contains error/captcha indicators
+            error_text = rp.text.lower()
+            if any(x in error_text for x in ["captcha", "robot", "unavailable", "not found", "access denied"]):
+                log.warning("_scihub_download %s: page contains error/captcha text", mirror)
+                continue
+
             # Log all links and embeds to diagnose structure
             all_tags = [(t.name, t.get("src",""), t.get("href",""))
                         for t in soup.find_all(["embed","iframe","a","button"])
@@ -5889,7 +5895,7 @@ def _scihub_download(doi_or_url: str, sess: requests.Session) -> Optional[tuple[
             # Pattern 1: embed or iframe with src
             for tag in soup.select("embed[src], iframe[src]"):
                 src = tag.get("src", "")
-                if src:
+                if src and len(src) > 5:
                     pdf_url = src; break
 
             # Pattern 2: #article, #buttons, download divs
@@ -5897,7 +5903,7 @@ def _scihub_download(doi_or_url: str, sess: requests.Session) -> Optional[tuple[
                 for sel in ("#article a", "#buttons a", "#pdf-buttons a",
                             "div[id*='download'] a", "a[href*='.pdf']"):
                     el = soup.select_one(sel)
-                    if el and el.get("href"):
+                    if el and el.get("href") and len(el.get("href","")) > 5:
                         pdf_url = el["href"]; break
 
             # Pattern 3: onclick location.href
@@ -5946,8 +5952,16 @@ def _scihub_download(doi_or_url: str, sess: requests.Session) -> Optional[tuple[
                 "Cookie": page_cookies,
             }, timeout=90, allow_redirects=True)
             ct = resp.headers.get("Content-Type", "")
-            log.debug("_scihub_download: PDF response HTTP %d  CT=%s  len=%d",
-                      resp.status_code, ct, len(resp.content))
+            log.debug("_scihub_download: PDF response HTTP %d  CT=%s  len=%d body_start=%r",
+                      resp.status_code, ct, len(resp.content),
+                      resp.content[:50] if resp.content else b"")
+            
+            # Check if response looks like error/blocking HTML
+            if len(resp.content) < 5000 and "text/html" in ct:
+                # Likely a blocking page
+                log.warning("_scihub_download: response is HTML, likely blocking (len=%d)", len(resp.content))
+                continue
+            
             # Accept PDF by magic bytes, not just Content-Type
             is_pdf = (resp.content[:4] == b"%PDF" or
                       "pdf" in ct.lower() or "octet" in ct.lower())
@@ -6003,7 +6017,7 @@ def do_paper_search(cid: int, query: str):
 
 
 def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
-    """Download paper by DOI. Priority: libgen scimag → Unpaywall OA → Sci-Hub."""
+    """Download paper by DOI. Priority: Unpaywall OA → Sci-Hub → LibGen."""
     if sess is None:
         sess = _libgen_session()
     send_message(cid, f"⏳ در حال دانلود مقاله…\n`{doi[:60]}`", parse_mode="Markdown")
@@ -6012,87 +6026,40 @@ def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
     safe_title = re.sub(r"[^\w\-]", "_", title or doi)[:60]
     fname = f"{safe_title}.pdf"
 
-    # ── Strategy 1: libgen scimag (search by DOI → md5 → download) ──────────
-    try:
-        for mirror in LIBGEN_MIRRORS:
-            # json.php API — query scimag by DOI directly (no HTML scraping)
-            r = sess.get(f"{mirror}/json.php",
-                         params={"object": "f", "topic": "a", "doi": doi},
-                         headers={"User-Agent": UA_DESK}, timeout=15)
-            log.debug("_do_paper_dl_doi scimag json %s: HTTP %d len=%d body=%r",
-                      mirror, r.status_code, len(r.content), r.text[:80])
-            if r.status_code != 200 or len(r.content) < 5:
-                continue
-            md5 = ""
-            try:
-                jdata = r.json()
-                items = list(jdata.values()) if isinstance(jdata, dict) else (
-                        jdata if isinstance(jdata, list) else [])
-                for item in items:
-                    if isinstance(item, dict) and item.get("md5"):
-                        md5 = str(item["md5"]).lower().strip(); break
-            except Exception as je:
-                log.debug("_do_paper_dl_doi scimag json parse: %s body=%r", je, r.text[:80])
-            if not md5:
-                log.debug("_do_paper_dl_doi: no md5 in scimag results at %s", mirror)
-                continue
-            # Download via ads.php
-            ads = sess.get(f"{mirror}/ads.php?md5={md5}",
-                           headers={"User-Agent": UA_DESK}, timeout=15)
-            log.debug("_do_paper_dl_doi ads: HTTP %d len=%d", ads.status_code, len(ads.content))
-            if ads.status_code == 200 and len(ads.content) > 500:
-                ads_soup = BeautifulSoup(ads.text, "html.parser")
-                dl_a = (ads_soup.select_one("a[href*='get.php']") or
-                        ads_soup.select_one("a[href*='download']") or
-                        ads_soup.select_one("#download a"))
-                if dl_a:
-                    href = dl_a.get("href","")
-                    dl_url = href if href.startswith("http") else f"{mirror}{href}"
-                    resp = sess.get(dl_url, headers={"User-Agent": UA_DESK,
-                                                     "Referer": f"{mirror}/"},
-                                    timeout=90, allow_redirects=True)
-                    if resp.status_code == 200 and len(resp.content) > 5000:
-                        log.info("_do_paper_dl_doi: OK via libgen scimag %.1fMB",
-                                 len(resp.content)/1024/1024)
-                        data, f = resp.content, fname
-                        cd = resp.headers.get("Content-Disposition","")
-                        if "filename=" in cd:
-                            mf = re.search(r"filename=([^;\r\n]+)", cd)
-                            if mf: f = mf.group(1).strip().strip('"\'')
-                        if smart_send(cid, data, f, caption=f"📄 {title or doi}"):
-                            send_message(cid, "✅ مقاله ارسال شد.", reply_markup=home_kb())
-                        else:
-                            send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
-                        clear_state(cid); return
-    except Exception as e:
-        log.warning("_do_paper_dl_doi scimag: %s", e)
+    # Clean DOI for all strategies
+    clean_doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi).strip().rstrip(".,)")
 
-    # ── Strategy 2: Unpaywall (free OA PDF, no auth) ─────────────────────────
+    # ── Strategy 1: Unpaywall (free OA PDF, no auth) ─────────────────────────
     try:
-        clean_doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi).strip().rstrip(".,)")
-        log.debug("_do_paper_dl_doi Unpaywall clean_doi=%r", clean_doi)
+        log.debug("_do_paper_dl_doi Unpaywall: trying clean_doi=%r", clean_doi)
         up = sess.get(f"https://api.unpaywall.org/v2/{clean_doi}",
                       params={"email": "bot@example.com"},
                       headers={"User-Agent": "BaleBot/1.0 (mailto:bot@example.com)"},
                       timeout=10)
-        log.debug("_do_paper_dl_doi Unpaywall: HTTP %d", up.status_code)
+        log.debug("_do_paper_dl_doi Unpaywall: HTTP %d body=%r",
+                  up.status_code, up.text[:100] if up.text else "")
         if up.status_code == 200:
-            oa_url = (up.json().get("best_oa_location") or {}).get("url_for_pdf","")
-            if oa_url:
-                resp = sess.get(oa_url, headers={"User-Agent": UA_DESK},
-                                timeout=60, allow_redirects=True)
-                if resp.status_code == 200 and len(resp.content) > 5000:
-                    log.info("_do_paper_dl_doi: OK via Unpaywall %.1fMB",
-                             len(resp.content)/1024/1024)
-                    if smart_send(cid, resp.content, fname, caption=f"📄 {title or doi}"):
-                        send_message(cid, "✅ مقاله ارسال شد (Open Access).", reply_markup=home_kb())
-                    else:
-                        send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
-                    clear_state(cid); return
+            try:
+                jdata = up.json()
+                oa_url = (jdata.get("best_oa_location") or {}).get("url_for_pdf","")
+                if oa_url:
+                    log.debug("_do_paper_dl_doi Unpaywall: got OA URL %s", oa_url[:80])
+                    resp = sess.get(oa_url, headers={"User-Agent": UA_DESK},
+                                    timeout=60, allow_redirects=True)
+                    if resp.status_code == 200 and len(resp.content) > 5000:
+                        log.info("_do_paper_dl_doi: OK via Unpaywall %.1fMB",
+                                 len(resp.content)/1024/1024)
+                        if smart_send(cid, resp.content, fname, caption=f"📄 {title or doi}"):
+                            send_message(cid, "✅ مقاله ارسال شد (Open Access).", reply_markup=home_kb())
+                        else:
+                            send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+                        clear_state(cid); return
+            except Exception as je:
+                log.debug("_do_paper_dl_doi Unpaywall JSON parse: %s", je)
     except Exception as e:
         log.warning("_do_paper_dl_doi Unpaywall: %s", e)
 
-    # ── Strategy 3: Sci-Hub ──────────────────────────────────────────────────
+    # ── Strategy 2: Sci-Hub ──────────────────────────────────────────────────
     result = _scihub_download(doi, sess)
     if result:
         data, f = result
@@ -6101,6 +6068,69 @@ def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
         else:
             send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
         clear_state(cid); return
+
+    # ── Strategy 3: LibGen scimag (search by DOI → md5 → download) ──────────
+    try:
+        for mirror in LIBGEN_MIRRORS:
+            # Try json.php API with various parameter combinations
+            for params in [
+                {"object": "f", "topic": "a", "doi": clean_doi},
+                {"req": clean_doi},
+                {"req": doi},
+            ]:
+                try:
+                    r = sess.get(f"{mirror}/json.php",
+                                 params=params,
+                                 headers={"User-Agent": UA_DESK}, timeout=15)
+                    log.debug("_do_paper_dl_doi libgen json %s params=%s: HTTP %d len=%d body=%r",
+                              mirror, params, r.status_code, len(r.content), r.text[:100])
+                    if r.status_code != 200 or len(r.content) < 5:
+                        continue
+                    md5 = ""
+                    try:
+                        jdata = r.json()
+                        items = list(jdata.values()) if isinstance(jdata, dict) else (
+                                jdata if isinstance(jdata, list) else [])
+                        for item in items:
+                            if isinstance(item, dict) and item.get("md5"):
+                                md5 = str(item["md5"]).lower().strip(); break
+                    except Exception as je:
+                        log.debug("_do_paper_dl_doi libgen json parse: %s", je)
+                    if not md5:
+                        continue
+                    # Download via ads.php
+                    ads = sess.get(f"{mirror}/ads.php?md5={md5}",
+                                   headers={"User-Agent": UA_DESK}, timeout=15)
+                    log.debug("_do_paper_dl_doi libgen ads: HTTP %d len=%d",
+                              ads.status_code, len(ads.content))
+                    if ads.status_code == 200 and len(ads.content) > 500:
+                        ads_soup = BeautifulSoup(ads.text, "html.parser")
+                        dl_a = (ads_soup.select_one("a[href*='get.php']") or
+                                ads_soup.select_one("a[href*='download']") or
+                                ads_soup.select_one("#download a"))
+                        if dl_a:
+                            href = dl_a.get("href","")
+                            dl_url = href if href.startswith("http") else f"{mirror}{href}"
+                            resp = sess.get(dl_url, headers={"User-Agent": UA_DESK,
+                                                             "Referer": f"{mirror}/"},
+                                            timeout=90, allow_redirects=True)
+                            if resp.status_code == 200 and len(resp.content) > 5000:
+                                log.info("_do_paper_dl_doi: OK via libgen scimag %.1fMB",
+                                         len(resp.content)/1024/1024)
+                                data, f = resp.content, fname
+                                cd = resp.headers.get("Content-Disposition","")
+                                if "filename=" in cd:
+                                    mf = re.search(r"filename=([^;\r\n]+)", cd)
+                                    if mf: f = mf.group(1).strip().strip('"\'')
+                                if smart_send(cid, data, f, caption=f"📄 {title or doi}"):
+                                    send_message(cid, "✅ مقاله ارسال شد.", reply_markup=home_kb())
+                                else:
+                                    send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+                                clear_state(cid); return
+                except Exception as pe:
+                    log.debug("_do_paper_dl_doi libgen param attempt failed: %s", pe)
+    except Exception as e:
+        log.warning("_do_paper_dl_doi libgen: %s", e)
 
     send_message(cid,
                  "❌ دانلود ناموفق بود.\n"
@@ -9066,6 +9096,49 @@ def handle_callback(cb: dict):
         _do_audio_download(cid, url, source=source, title=title,
                            artist=artist, track_item=track)
         return
+
+    # ── Generic search results: res_{cache_key}_{idx} (Scholar, Wiki, etc.) ───
+    m = re.match(r"res_(\w+)_(\d+)$", data)
+    if m:
+        key, idx = m.group(1), int(m.group(2))
+        results = cache_get(key)
+        if not results or idx >= len(results):
+            send_message(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید."); return
+        result = results[idx]
+        
+        # Determine source from cache key (first 2 chars)
+        source = key[:2] if key else ""
+        
+        # Scholar result: show title + snippet + link button
+        if source == "sc":
+            title    = result.get("title", "")
+            snippet  = result.get("snippet", "")
+            meta     = result.get("meta", "")
+            link     = result.get("link", "")
+            
+            lines = []
+            if title:
+                lines.append(f"📚 *{title}*")
+            if meta:
+                lines.append(f"_{meta}_")
+            if snippet:
+                lines.append(f"\n{snippet[:300]}")
+            
+            text = "\n".join(lines) if lines else "📚 نتیجه جستجو"
+            
+            kb = home_kb()
+            if link:
+                kb = {"inline_keyboard": [
+                    [{"text": "🔗 مشاهده در Google Scholar", "callback_data": f"open_url_{store_url(link)}"}],
+                    [{"text": "🏠 منوی اصلی", "callback_data": "home"}]
+                ]}
+            
+            send_message(cid, text[:1000], parse_mode="Markdown", reply_markup=kb)
+            return
+        
+        # Wiki result: handled by separate wiki_art_ pattern, shouldn't reach here
+        # But for safety, fall through to unhandled
+        pass
 
     # ── Images query entry ────────────────────────────────────────────────
     log.warning("Unhandled callback: %r", data)
