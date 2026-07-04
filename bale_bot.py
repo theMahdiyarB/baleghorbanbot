@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v2.26)
+بله قربان — Bale Bot  (v3.0)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -118,6 +118,18 @@ def _platform() -> str:
     return getattr(_ctx, "platform", "bale")
 
 
+def _pkey(cid: int) -> str:
+    """Scope a chat_id by the current thread's platform.
+
+    Bale and Telegram hand out chat IDs from overlapping numeric ranges, so
+    the same integer `cid` can be a completely different person on each
+    platform. Every per-chat dict must key on (platform, cid) — this is
+    called from inside get_state/set_state/bump/etc. so all call sites keep
+    passing a plain int cid and get correct isolation for free.
+    """
+    return f"{_platform()}:{cid}"
+
+
 def _session() -> requests.Session:
     return getattr(_ctx, "session", _PLATFORM_CFG["bale"]["session"])
 
@@ -197,7 +209,7 @@ VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
 
 # Unpaywall — free API for open-access papers (requires email registration)
 # Register at: https://unpaywall.org/products/api
-UNPAYWALL_EMAIL = os.getenv("UNPAYWALL_EMAIL", "dev@balebot.local")
+UNPAYWALL_EMAIL = os.getenv("UNPAYWALL_EMAIL", "dev@balebot.dev")
 
 # Library Genesis — no login required, public API
 # Only reliable mirrors that work from Hetzner/Iran hosting
@@ -212,8 +224,11 @@ LIBGEN_DL_MIRRORS = [
     "https://annas-archive.se",  # Anna's Archive direct download
     "https://annas-archive.org",  # Anna's Archive primary
 ]
-# Anna's Archive - comprehensive open access directory
-ANNA_ARCHIVE_MIRROR = "https://anna-archive.se"
+# Anna's Archive - comprehensive open access directory (mirrors libgen + more)
+ANNAS_ARCHIVE_MIRRORS = [
+    "https://annas-archive.org",
+    "https://annas-archive.se",
+]
 # Sci-Hub for scientific papers - only reliable mirrors
 SCIHUB_MIRRORS = [
     "https://sci-hub.se",
@@ -259,6 +274,27 @@ _state_lock = _threading.Lock()
 _cache_lock = _threading.Lock()
 _stats_lock = _threading.Lock()
 _url_lock = _threading.Lock()
+
+# Caps concurrent CPU-heavy subprocess work (yt-dlp downloads, ffmpeg
+# transcoding/splitting). The thread pool below allows 40 concurrent request
+# handlers — fine for searches/API calls — but 40 simultaneous yt-dlp+ffmpeg
+# processes would thrash a small VPS's CPU and make every download crawl.
+# Everyone else just waits briefly in an orderly queue instead.
+HEAVY_DOWNLOAD_SEMAPHORE = _threading.Semaphore(int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "6")))
+
+
+def _heavy_download(fn):
+    """Decorator: bound a download entry point by HEAVY_DOWNLOAD_SEMAPHORE so
+    tens of simultaneous users can't all spawn yt-dlp/ffmpeg processes at
+    once — extra requests simply wait their turn in an orderly queue."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with HEAVY_DOWNLOAD_SEMAPHORE:
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 user_state: dict[int, dict] = {}
 user_stats: dict[int, dict] = {}
@@ -571,6 +607,44 @@ def _post_file(
             return False
     log.error("%s: all %d retries failed for %s", endpoint, _retries, filename)
     return False
+
+
+def _has_audio_stream(data_bytes: bytes, filename: str = "clip.mp4") -> bool:
+    """Return True if the given video file contains at least one audio stream.
+
+    Used to catch cases (mostly longer TikTok clips) where yt-dlp's format
+    selection picks a video-only stream that "succeeds" but produces a
+    silent file.
+    """
+    import shutil as _sh
+
+    ffprobe = _sh.which("ffprobe") or "/usr/bin/ffprobe"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / filename
+            src.write_bytes(data_bytes)
+            probe = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a",
+                    "-show_entries",
+                    "stream=codec_type",
+                    "-of",
+                    "csv=p=0",
+                    str(src),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return bool(probe.stdout.strip())
+    except Exception as e:
+        log.debug("_has_audio_stream: %s", e)
+        # If we can't tell, don't block the send — assume it's fine.
+        return True
 
 
 def _video_meta(data_bytes: bytes, filename: str) -> dict:
@@ -1145,13 +1219,29 @@ def get_file_url(file_id: str) -> Optional[str]:
     return None
 
 
-def download_bytes(url: str, max_bytes=MAX_FILE_SIZE) -> Optional[bytes]:
+def download_bytes(
+    url: str, max_bytes=MAX_FILE_SIZE, headers: Optional[dict] = None
+) -> Optional[bytes]:
     if not url or url.strip() in ("", "NA", "na", "none", "None", "null"):
         log.debug("download_bytes: skipping invalid URL %r", url)
         return None
     log.debug("download_bytes: %s", url)
+    # Many image/CDN hosts (Bing, Pinterest, hotlink-protected sites) reject
+    # requests without a browser-like User-Agent/Referer and return a small
+    # HTML error page instead of the real file — which used to be silently
+    # accepted as "downloaded" bytes. Always send sane default headers.
+    req_headers = {"User-Agent": UA_DESK, "Referer": url}
+    if headers:
+        req_headers.update(headers)
     try:
-        r = WEB.get(url, timeout=30, stream=True)
+        r = WEB.get(url, timeout=30, stream=True, headers=req_headers)
+        if r.status_code >= 400:
+            log.warning("download_bytes: HTTP %d for %s", r.status_code, url)
+            return None
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if "text/html" in ctype:
+            log.warning("download_bytes: got HTML content-type for %s — skipping", url)
+            return None
         chunks, total = [], 0
         for chunk in r.iter_content(8192):
             chunks.append(chunk)
@@ -1159,7 +1249,11 @@ def download_bytes(url: str, max_bytes=MAX_FILE_SIZE) -> Optional[bytes]:
             if total > max_bytes:
                 log.warning("download_bytes: exceeded %d bytes", max_bytes)
                 return None
-        return b"".join(chunks)
+        data = b"".join(chunks)
+        if not data:
+            log.warning("download_bytes: empty body for %s", url)
+            return None
+        return data
     except Exception as e:
         log.error("download_bytes: %s — %s", url, e)
         return None
@@ -3956,16 +4050,41 @@ def social_download_ytdlp(
         result = _run(["-x", "--audio-format", "mp3", "--audio-quality", "5"], url)
     else:
         result = None
-        # For TikTok, ensure we get video WITH audio by using bestvideo+bestaudio or forcing mp4 with audio
+        # For TikTok, ensure we get video WITH audio. TikTok's extractor can
+        # expose a video-only "bestvideo" stream for longer clips; merging
+        # that with "bestaudio" sometimes yields a technically-successful but
+        # silent file. Try single combined-stream formats first (these are
+        # TikTok's own muxed CDN files and always carry audio), then fall
+        # back to explicit video+audio merge, verifying each attempt with
+        # ffprobe before accepting it.
         is_tiktok = "tiktok.com" in url.lower()
-        for fmt in [
-            ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"],
-            (["-f", "best[ext=mp4]/best"] + (["--embed-thumbnail"] if not is_tiktok else [])),
-            ["--merge-output-format", "mp4"],
-        ]:
-            result = _run(fmt if isinstance(fmt, list) else fmt, url)
-            if result:
+        attempts = (
+            [
+                ["-f", "best[ext=mp4]/best"],
+                ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"],
+                ["--merge-output-format", "mp4"],
+            ]
+            if is_tiktok
+            else [
+                ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"],
+                ["-f", "best[ext=mp4]/best", "--embed-thumbnail"],
+                ["--merge-output-format", "mp4"],
+            ]
+        )
+        for fmt in attempts:
+            candidate = _run(fmt, url)
+            if not candidate:
+                continue
+            cand_data, cand_name = candidate
+            if _has_audio_stream(cand_data, cand_name):
+                result = candidate
                 break
+            log.warning(
+                "social yt-dlp: %s produced a silent file, trying next format", fmt
+            )
+            result = result or candidate  # keep as last-resort fallback
+        # If every attempt was silent, `result` holds the last one so we
+        # still deliver *something* rather than nothing.
 
     if result:
         return result
@@ -5113,7 +5232,14 @@ def github_zip(repo_url: str) -> Optional[bytes]:
 
 # ─── Images ───────────────────────────────────────────────────────────────────
 def images_bing(query: str, max_results=8) -> list[dict]:
-    """Search Bing Images with improved regex patterns and better URL extraction."""
+    """Search Bing Images by parsing the real result markup.
+
+    Bing renders each result as ``<a class="iusc" m='{"murl":"...","turl":"..."}'>``
+    (JSON in the ``m`` attribute, HTML-entity escaped). Scanning the whole page
+    for any "murl"/"contentUrl" substring (the old approach) also matches
+    unrelated static assets embedded on every page, which is why it used to
+    return the same single stray image regardless of the query.
+    """
     log.info("images_bing: %r", query)
     try:
         r = WEB.get(
@@ -5125,47 +5251,54 @@ def images_bing(query: str, max_results=8) -> list[dict]:
         log.debug("bing_images: status=%d len=%d", r.status_code, len(r.text))
         results = []
         seen: set[str] = set()
-        
-        # Try multiple extraction methods for better reliability
-        # Method 1: Extract from murl (media URL - most reliable)
-        for pattern in [
-            r'"murl":"(https?://[^"]+\.(?:jpg|jpeg|png|webp))"',
-            r'"contentUrl":"(https?://[^"]+\.(?:jpg|jpeg|png|webp))"',
-            r'"thumbUrl":"(https?://[^"]+\.(?:jpg|jpeg|png|webp))"',
-            r'mediaUrl":"(https?://[^"]+)"',
-            r'"imgurl":"(https?://[^"]+\.(?:jpg|jpeg|png|webp))"',
-        ]:
-            for u in re.findall(pattern, r.text):
-                u = u.replace("&amp;", "&").replace("\\/", "/").replace("\\", "")
-                if u not in seen and not any(
-                    x in u for x in ["bing.com", "microsoft.com", "127.0.0.1", "localhost"]
-                ):
-                    seen.add(u)
-                    results.append({"url": u, "title": query})
-                if len(results) >= max_results:
-                    break
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        for a in soup.find_all("a", class_="iusc"):
+            m_attr = a.get("m")
+            if not m_attr:
+                continue
+            try:
+                meta = json.loads(m_attr)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            u = meta.get("murl") or meta.get("turl")
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            results.append(
+                {
+                    "url": u,
+                    "title": meta.get("t") or query,
+                    "_referer": "https://www.bing.com/",
+                }
+            )
             if len(results) >= max_results:
                 break
-        
-        # Method 2: If still no results, try extracting blob URLs and data attributes
-        if len(results) == 0:
-            # Look for data-src or src attributes in img tags
-            for pat in [
-                r'data-src="([^"]+)"',
-                r'src="([^"]+\.(?:jpg|jpeg|png|webp))"',
-                r'url\(([^)]+)\)',
+
+        # Fallback: some Bing responses only include result data inside
+        # <div class="iuscp"> wrappers or escaped JSON blobs — try the
+        # historical regex extraction as a last resort.
+        if not results:
+            for pattern in [
+                r'"murl":"(https?://[^"]+?)"',
+                r'"turl":"(https?://[^"]+?)"',
             ]:
-                for u in re.findall(pat, r.text):
-                    if u.startswith("http") and not u.startswith("data:"):
-                        u = u.split("?")[0].split("&")[0]  # Clean URL
-                        if u not in seen and ".jpg" in u.lower() or ".png" in u.lower() or ".webp" in u.lower():
-                            seen.add(u)
-                            results.append({"url": u, "title": query})
+                for u in re.findall(pattern, r.text):
+                    u = u.replace("\\/", "/").replace("&amp;", "&")
+                    if u in seen or any(
+                        x in u
+                        for x in ("bing.com/rp/", "microsoft.com", "127.0.0.1", "localhost")
+                    ):
+                        continue
+                    seen.add(u)
+                    results.append(
+                        {"url": u, "title": query, "_referer": "https://www.bing.com/"}
+                    )
                     if len(results) >= max_results:
                         break
-                if len(results) >= max_results:
+                if results:
                     break
-        
+
         log.info("images_bing: %d results", len(results))
         return results
     except Exception as e:
@@ -5232,7 +5365,9 @@ def images_pinterest(query: str, max_results=8) -> list[dict]:
                 u = u.replace("\\u002F", "/")
                 if u not in seen:
                     seen.add(u)
-                    results.append({"url": u, "title": query})
+                    results.append(
+                        {"url": u, "title": query, "_referer": "https://www.pinterest.com/"}
+                    )
                 if len(results) >= max_results:
                     break
         if results:
@@ -5316,6 +5451,7 @@ def images_pexels(query: str, max_results=8) -> list[dict]:
                     results.append({
                         "url": url,
                         "title": photo.get("description", {}).get("raw", query)[:60] or query,
+                        "_referer": "https://unsplash.com",
                     })
             if results:
                 log.info("unsplash_api: %d results", len(results))
@@ -5780,6 +5916,106 @@ def _libgen_session() -> requests.Session:
     return _get_web(use_warp=bool(WARP_PROXY))
 
 
+def annas_archive_search(
+    query: str, count: int = 10, extensions: list = None, sess=None
+) -> list[dict]:
+    """Search Anna's Archive (aggregates libgen, Z-Library, Sci-Hub, and more).
+
+    Anna's Archive book pages use the same MD5 hashes as libgen for most
+    entries, so results returned here plug directly into libgen_download()
+    (which already has an Anna's Archive fallback in its download chain).
+    """
+    log.info("annas_archive_search: %r", query)
+    if sess is None:
+        sess = _libgen_session()
+
+    for mirror in ANNAS_ARCHIVE_MIRRORS:
+        try:
+            r = sess.get(
+                f"{mirror}/search",
+                params={"q": query},
+                headers={"User-Agent": UA_DESK},
+                timeout=20,
+            )
+            log.debug(
+                "annas_archive_search %s: HTTP %d len=%d",
+                mirror,
+                r.status_code,
+                len(r.content),
+            )
+            if r.status_code != 200 or len(r.content) < 500:
+                continue
+
+            soup = BeautifulSoup(r.text, "html.parser")
+            results = []
+            seen_md5 = set()
+            for a in soup.select("a[href*='/md5/']"):
+                href = a.get("href", "")
+                mm = re.search(r"/md5/([a-fA-F0-9]{32})", href)
+                if not mm:
+                    continue
+                md5 = mm.group(1).lower()
+                if md5 in seen_md5:
+                    continue
+
+                text = a.get_text(" ", strip=True)
+                if not text:
+                    continue
+
+                # Title is generally the longest contiguous text chunk;
+                # format/size/language info usually appears in a trailing
+                # bracketed/comma-separated segment, e.g.
+                # "... English [en], .pdf, 🚀 12.3MB"
+                ext = ""
+                ext_m = re.search(
+                    r"\.(pdf|epub|mobi|djvu|azw3?|fb2|txt|cbz|cbr)\b", text, re.I
+                )
+                if ext_m:
+                    ext = ext_m.group(1).lower()
+                if extensions and ext and ext not in [e.lower() for e in extensions]:
+                    continue
+
+                size_m = re.search(r"([\d.]+\s?(?:MB|KB|GB))", text, re.I)
+                size_str = size_m.group(1) if size_m else ""
+
+                # Best-effort title: strip off the trailing metadata segment
+                # if we found one, otherwise use the first ~120 chars.
+                title = text
+                if ext_m:
+                    title = text[: ext_m.start()].rstrip(" ,.")
+                title = title[:150].strip() or query
+
+                seen_md5.add(md5)
+                results.append(
+                    {
+                        "id": md5,
+                        "name": title,
+                        "authors": [],
+                        "year": "",
+                        "publisher": "",
+                        "language": "",
+                        "extension": ext,
+                        "size": size_str,
+                        "cover": "",
+                        "md5": md5,
+                        "url": f"{mirror}/md5/{md5}",
+                        "_source": "annas_archive",
+                    }
+                )
+                if len(results) >= count:
+                    break
+
+            if results:
+                log.info(
+                    "annas_archive_search: %d results via %s", len(results), mirror
+                )
+                return results
+        except Exception as e:
+            log.warning("annas_archive_search %s: %s", mirror, e)
+
+    return []
+
+
 def libgen_search(query: str, count: int = 10, extensions: list = None) -> list[dict]:
     """
     Search for books using multiple strategies:
@@ -5977,7 +6213,14 @@ def libgen_search(query: str, count: int = 10, extensions: list = None) -> list[
                 e_id = str(item.get("e_id", ""))
                 year = str(item.get("year") or "")
                 pub = (item.get("publisher") or "").strip()
-                add = item.get("add") or {}
+                add = item.get("add")
+                if isinstance(add, str):
+                    try:
+                        add = json.loads(add) if add.strip() else {}
+                    except Exception:
+                        add = {}
+                if not isinstance(add, dict):
+                    add = {}
 
                 language = ""
                 lang_e = add.get("101")
@@ -6063,7 +6306,16 @@ def libgen_search(query: str, count: int = 10, extensions: list = None) -> list[
         except Exception as e:
             log.warning("libgen_search %s: %s", mirror, e)
 
-    # ── Strategy 2: Open Library (always reachable, no blocks) ──────────────────
+    # ── Strategy 2: Anna's Archive (aggregates libgen + Z-Library + more) ────────
+    try:
+        aa_results = annas_archive_search(query, count=count, extensions=extensions, sess=sess)
+        if aa_results:
+            log.info("libgen_search: %d results via Anna's Archive", len(aa_results))
+            return aa_results
+    except Exception as e:
+        log.warning("libgen_search annas_archive: %s", e)
+
+    # ── Strategy 3: Open Library (always reachable, no blocks) ──────────────────
     try:
         params = {
             "q": query,
@@ -6585,8 +6837,9 @@ def rss_search_feeds(site_url: str) -> list[str]:
 
 
 def init_user(cid: int):
-    if cid not in user_stats:
-        user_stats[cid] = {
+    key = _pkey(cid)
+    if key not in user_stats:
+        user_stats[key] = {
             "requests": 0,
             "joined": datetime.now().strftime("%Y-%m-%d"),
             "searches": 0,
@@ -6598,26 +6851,27 @@ def init_user(cid: int):
 
 def bump(cid: int, key="requests"):
     init_user(cid)
+    pkey = _pkey(cid)
     with _stats_lock:
-        user_stats[cid]["requests"] = user_stats[cid].get("requests", 0) + 1
-        user_stats[cid][key] = user_stats[cid].get(key, 0) + 1
+        user_stats[pkey]["requests"] = user_stats[pkey].get("requests", 0) + 1
+        user_stats[pkey][key] = user_stats[pkey].get(key, 0) + 1
 
 
 def get_state(cid: int) -> dict:
     with _state_lock:
         return dict(
-            user_state.get(cid, {})
+            user_state.get(_pkey(cid), {})
         )  # return a copy — safe to read outside lock
 
 
 def set_state(cid: int, **kw):
     with _state_lock:
-        user_state[cid] = kw
+        user_state[_pkey(cid)] = kw
 
 
 def clear_state(cid: int):
     with _state_lock:
-        user_state[cid] = {"mode": None}
+        user_state[_pkey(cid)] = {"mode": None}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6909,9 +7163,10 @@ def _youtube_quality_picker(cid: int, url: str, audio_only: bool = False):
     description = info.get("description", "") or ""
     duration = info.get("duration_string", "")
 
-    # Truncate description for Telegram message limit (4096 chars)
-    if len(description) > 1500:
-        description = description[:1500] + "..."
+    # Truncate description to Telegram/Bale message limit (4096 chars), leaving
+    # room for the title/duration lines prepended below.
+    if len(description) > 3800:
+        description = description[:3800] + "..."
 
     if audio_only or not formats:
         # Audio mode or no video formats found — skip quality picker
@@ -6927,16 +7182,28 @@ def _youtube_quality_picker(cid: int, url: str, audio_only: bool = False):
     if description:
         caption_parts.append(f"\n{description}")
     caption = "\n".join(caption_parts)
-    
+
+    BALE_CAPTION_LIMIT = 1024
+    inline_cap = caption if len(caption) <= BALE_CAPTION_LIMIT else ""
+
     if thumbnail:
         try:
             thumb_data = download_bytes(thumbnail)
             if thumb_data:
-                smart_send(cid, thumb_data, "thumbnail.jpg", caption=caption, media_type="photo")
+                smart_send(
+                    cid, thumb_data, "thumbnail.jpg", caption=inline_cap, media_type="photo"
+                )
+            elif not inline_cap:
+                send_message(cid, caption, parse_mode="Markdown")
         except Exception as e:
             log.debug("Failed to send thumbnail: %s", e)
     else:
-        send_message(cid, caption, parse_mode="Markdown")
+        send_message(cid, caption if inline_cap else f"📺 *{title}*", parse_mode="Markdown")
+
+    # Caption (with full description) too long for the photo caption limit —
+    # send it as its own message so nothing gets cut off.
+    if not inline_cap:
+        send_message(cid, caption[:4096], parse_mode="Markdown")
 
     # Build quality keyboard with filesize info
     rows = []
@@ -7073,6 +7340,7 @@ def _decode_fmt(encoded: str) -> str:
     return encoded.replace("~", "+").replace("_", " ")
 
 
+@_heavy_download
 def _youtube_execute_download(
     cid: int,
     url_key: str,
@@ -7207,6 +7475,7 @@ def do_music(cid: int, query: str):
     )
 
 
+@_heavy_download
 def _do_audio_download(
     cid: int,
     url: str,
@@ -7290,6 +7559,7 @@ def _do_audio_download(
     clear_state(cid)
 
 
+@_heavy_download
 def do_spotify_dl(cid: int, url: str):
     """Download Spotify track/album/playlist via spotdl, with full platform fallback."""
     bump(cid, "downloads")
@@ -7380,13 +7650,24 @@ def do_images(cid: int, query: str, source: str, page=0):
     sent = 0
     for r in page_results[:6]:
         try:
-            img_bytes = r.get("_bytes") or download_bytes(r["url"], MAX_IMAGE_SIZE)
-            if img_bytes and len(img_bytes) > 1000:
-                if send_photo(cid, img_bytes, caption=r.get("title", "")[:80]):
-                    sent += 1
+            hdrs = {"Referer": r["_referer"]} if r.get("_referer") else None
+            img_bytes = r.get("_bytes") or download_bytes(
+                r["url"], MAX_IMAGE_SIZE, headers=hdrs
+            )
+            if not img_bytes or len(img_bytes) <= 1000:
+                log.warning(
+                    "do_images: skip %s — download failed or too small (%s bytes)",
+                    r.get("url"),
+                    len(img_bytes) if img_bytes else 0,
+                )
+                continue
+            if send_photo(cid, img_bytes, caption=r.get("title", "")[:80]):
+                sent += 1
+            else:
+                log.warning("do_images: send_photo failed for %s", r.get("url"))
             time.sleep(0.3)
         except Exception as ex:
-            log.error("do_images send: %s", ex)
+            log.error("do_images send: %s", ex, exc_info=True)
     kb = images_more_kb(key, page, source)
     send_message(cid, f"✅ {sent} عکس ارسال شد.", reply_markup=kb)
 
@@ -7790,9 +8071,9 @@ def do_book_download(cid: int, md5_ext: str):
 # ── Sci-Hub paper search + download ─────────────────────────────────────────
 
 SCIHUB_MIRRORS = [
-    "https://sci-hub.ru",  # JS challenge — partially works
-    "https://sci-hub.st",  # 403 but worth a try
-    # sci-hub.se: DNS fails on this server (Name or service not known)
+    "https://sci-hub.se",  # historically the most stable domain — try first
+    "https://sci-hub.ru",  # sometimes JS-gated, still worth a try
+    "https://sci-hub.st",  # occasionally 403s, kept as last resort
 ]
 
 
@@ -8096,19 +8377,35 @@ def _scihub_download(
             log.debug("_scihub_download: fetching PDF %s", pdf_url[:200])
             # Carry cookies from the DOI page response into the PDF request
             page_cookies = "; ".join(f"{k}={v}" for k, v in rp.cookies.items())
-            resp = sess.get(
-                pdf_url,
-                headers={
-                    "User-Agent": UA_DESK,
-                    "Referer": page_url,
+
+            def _fetch_pdf(extra_headers: dict):
+                return sess.get(
+                    pdf_url,
+                    headers={
+                        "User-Agent": UA_DESK,
+                        "Referer": page_url,
+                        "Cookie": page_cookies,
+                        **extra_headers,
+                    },
+                    timeout=90,
+                    allow_redirects=True,
+                )
+
+            resp = _fetch_pdf(
+                {
                     "Accept": "application/pdf,application/octet-stream,*/*",
                     "Accept-Encoding": "identity",
                     "Origin": mirror,
-                    "Cookie": page_cookies,
-                },
-                timeout=90,
-                allow_redirects=True,
+                }
             )
+            if resp.status_code == 200 and len(resp.content) == 0:
+                # Some CDNs return an empty 200 body when the request looks
+                # too "scripted" (forced identity encoding / custom Origin).
+                # Retry once with a plain browser-like header set.
+                log.debug(
+                    "_scihub_download: empty body on first attempt, retrying with plain headers"
+                )
+                resp = _fetch_pdf({"Accept": "*/*"})
             ct = resp.headers.get("Content-Type", "")
             log.debug(
                 "_scihub_download: PDF response HTTP %d  CT=%s  len=%d body_start=%r",
@@ -8117,6 +8414,10 @@ def _scihub_download(
                 len(resp.content),
                 resp.content[:50] if resp.content else b"",
             )
+
+            if not resp.content:
+                log.warning("_scihub_download %s: empty PDF response, skipping", mirror)
+                continue
 
             # Check if response looks like error/blocking HTML
             if len(resp.content) < 5000 and "text/html" in ct:
@@ -8273,22 +8574,28 @@ def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
             except Exception as je:
                 log.debug("_do_paper_dl_doi Unpaywall JSON parse: %s", je)
         elif up.status_code == 422:
-            # Try with a different email format
-            alt_email = (
+            # Unpaywall's email validator rejects some domains/formats outright.
+            # Try a short list of syntactically-valid fallback addresses.
+            fallback_emails = [
                 UNPAYWALL_EMAIL.replace("@", "+bot@")
                 if "@" in UNPAYWALL_EMAIL
-                else "bot@research.local"
-            )
-            log.debug(
-                "_do_paper_dl_doi Unpaywall 422, trying alternative email %r", alt_email
-            )
-            up2 = sess.get(
-                f"https://api.unpaywall.org/v2/{clean_doi}",
-                params={"email": alt_email},
-                headers={"User-Agent": f"BaleBot/1.0 (mailto:{alt_email})"},
-                timeout=10,
-            )
-            if up2.status_code == 200:
+                else "bot@balebot.dev",
+                "bot@balebot.dev",
+                "research@gmail.com",
+            ]
+            for alt_email in fallback_emails:
+                log.debug(
+                    "_do_paper_dl_doi Unpaywall 422, trying alternative email %r",
+                    alt_email,
+                )
+                up2 = sess.get(
+                    f"https://api.unpaywall.org/v2/{clean_doi}",
+                    params={"email": alt_email},
+                    headers={"User-Agent": f"BaleBot/1.0 (mailto:{alt_email})"},
+                    timeout=10,
+                )
+                if up2.status_code != 200:
+                    continue
                 try:
                     jdata = up2.json()
                     oa_url = (jdata.get("best_oa_location") or {}).get(
@@ -8323,6 +8630,7 @@ def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
                                 )
                             clear_state(cid)
                             return
+                    break  # got a valid 200 JSON — no OA url, stop trying emails
                 except Exception as je2:
                     log.debug("_do_paper_dl_doi Unpaywall JSON parse (retry): %s", je2)
     except Exception as e:
@@ -9276,6 +9584,7 @@ def _render_tweet_card(tw: dict, tweet_url: str) -> Optional[bytes]:
         return None
 
 
+@_heavy_download
 def do_twitter_dl(cid: int, url: str, _tw_data_override: dict = None):
     """Download ALL media from a tweet, send tweet card + media group + caption."""
     bump(cid, "downloads")
@@ -9415,6 +9724,7 @@ def _fetch_instagram_caption(url: str) -> str:
     return ""
 
 
+@_heavy_download
 def do_instagram_dl(cid: int, url: str):
     """دانلود تمام رسانه‌های یک پست اینستاگرام (تکی / کاروسل / ریل) با کپشن کامل."""
     bump(cid, "downloads")
@@ -9545,6 +9855,7 @@ def _fetch_tiktok_caption(url: str) -> str:
     return ""
 
 
+@_heavy_download
 def do_tiktok_dl(cid: int, url: str):
     """دانلود ویدیوی TikTok با کپشن کامل."""
     bump(cid, "downloads")
@@ -10899,7 +11210,7 @@ def handle_callback(cb: dict):
         return
 
     if data == "stats":
-        s = user_stats.get(cid, {})
+        s = user_stats.get(_pkey(cid), {})
         txt = (
             f"📊 *آمار کاربری*\n\n"
             f"🗓 عضویت: {s.get('joined', '—')}\n"
@@ -12024,7 +12335,16 @@ def handle_callback(cb: dict):
         if not url:
             send_message(target_cid, "❌ لینک منقضی شده.")
             return
-        threading.Thread(target=do_music, args=(target_cid, url), daemon=True).start()
+        # Capture platform BEFORE spawning thread — _ctx is thread-local,
+        # the new thread would otherwise default to Bale and send to the
+        # wrong API if this button was clicked from Telegram.
+        captured_platform = _platform()
+
+        def _music_thread(cid=target_cid, u=url, plat=captured_platform):
+            _set_platform_ctx(plat)
+            do_music(cid, u)
+
+        threading.Thread(target=_music_thread, daemon=True).start()
         return
 
     # ── Social result item click: soc_{platform}_{cache_key}_{idx} ───────
