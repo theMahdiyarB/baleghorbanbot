@@ -105,6 +105,8 @@ def _set_platform_ctx(platform: str):
     _ctx.kb_cols = cfg["kb_cols"]
     _ctx.chunk_size = cfg["chunk_size"]
     _ctx.session = cfg["session"]  # shared persistent Session (thread-safe reads)
+    # Also set max video duration for splitting (Telegram allows larger files)
+    _ctx.video_split_mb = 45.0 if platform == "telegram" else 18.0
 
 
 # Helpers to read thread-local context — fall back to Bale defaults
@@ -121,7 +123,11 @@ def _session() -> requests.Session:
 
 
 def _chunk_size() -> int:
-    return getattr(_ctx, "chunk_size", 19 * 1024 * 1024)
+    """Get chunk size based on platform - Telegram allows 50MB, Bale 20MB"""
+    platform = getattr(_ctx, "platform", "bale")
+    if platform == "telegram":
+        return getattr(_ctx, "chunk_size", TELEGRAM_MAX_FILE_SIZE)
+    return getattr(_ctx, "chunk_size", BALE_MAX_FILE_SIZE)
 
 
 # Keyboard limit helpers — use thread-local per-platform values
@@ -137,7 +143,10 @@ KB_MAX_BUTTONS = KB_MAX_ROWS * KB_MAX_COLS
 # Legacy TOKEN for any remaining single-platform references
 TOKEN = BALE_TOKEN or TELEGRAM_TOKEN
 
-MAX_FILE_SIZE = 20 * 1024 * 1024
+# Platform Limits
+TELEGRAM_MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB for standard Telegram bots (up to 2GB for Premium)
+BALE_MAX_FILE_SIZE = 20 * 1024 * 1024      # 20MB for Bale
+MAX_FILE_SIZE = BALE_MAX_FILE_SIZE  # Default to Bale for safety, updated dynamically
 
 # yt-dlp binary — resolved from PATH at runtime
 YTDLP_BIN = "yt-dlp"
@@ -188,16 +197,27 @@ VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
 LIBGEN_MIRRORS = [
     "https://libgen.li",  # primary; .is/.st time out from most servers
     "https://libgen.lc",  # fallback
+    "https://libgen.rs",  # additional mirror
+    "https://libgen.st",  # additional mirror
+    "https://libgen.is",  # additional mirror
 ]
 LIBGEN_DL_MIRRORS = [
     "https://library.lol",
     "https://libgen.rocks",
     "https://books.ms",
+    "https://libgen.is",
+    "https://annas-archive.se",  # Anna's Archive direct download
+    "https://annas-archive.org",  # Anna's Archive primary
 ]
-# Keep these for backward compat (no longer used for login)
-ZLIB_EMAIL = os.getenv("ZLIB_EMAIL", "")
-ZLIB_PASSWORD = os.getenv("ZLIB_PASSWORD", "")
-UNPAYWALL_EMAIL = os.getenv("UNPAYWALL_EMAIL", "bot@example.com")
+# Anna's Archive - comprehensive open access directory
+ANNA_ARCHIVE_MIRROR = "https://anna-archive.se"
+# Sci-Hub for scientific papers
+SCIHUB_MIRRORS = [
+    "https://sci-hub.se",
+    "https://sci-hub.st",
+    "https://sci-hub.ru",
+    "https://sci-hub.moscow",
+]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -871,10 +891,12 @@ def smart_send(
     # Step 3: Large video → ffmpeg time-split (each part = self-contained playable MP4)
     if is_video:
         send_message(chat_id, "⏳ در حال تقسیم ویدیو…")
-        # Telegram supports 50MB — only split on Bale
-        if _platform() == "telegram":
+        # Telegram supports 50MB — only split on Bale or if file exceeds platform limit
+        if _platform() == "telegram" and total_size <= _chunk_size():
             return _send_one_chunk(chat_id, data, filename, caption, media_type)
-        parts = _split_video_ffmpeg(data, filename, max_mb=18.0)
+        # Use platform-specific split size
+        max_mb = getattr(_ctx, "video_split_mb", 18.0)
+        parts = _split_video_ffmpeg(data, filename, max_mb=max_mb)
 
         if len(parts) > 1:
             n = len(parts)
@@ -2602,8 +2624,8 @@ def youtube_download(
                 "--merge-output-format",
                 "mp4",
                 "--split-chapters",
-                "--max-filesize",
-                "19M",
+                # Remove --max-filesize to allow full video downloads
+                # File size limits are handled by smart_send() chunking
                 "-o",
                 os.path.join(tmp, "%(title)s.%(ext)s"),
             ]
@@ -2665,8 +2687,6 @@ def youtube_download(
                     "--audio-quality",
                     "0",
                     "--split-chapters",
-                    "--max-filesize",
-                    "19M",
                     "-o",
                     os.path.join(tmp, "%(title)s.%(ext)s"),
                 ]
@@ -2740,8 +2760,6 @@ def youtube_download(
                     "--audio-quality",
                     "0",
                     "--split-chapters",
-                    "--max-filesize",
-                    "19M",
                     "-o",
                     os.path.join(tmp, "%(title)s.%(ext)s"),
                 ]
@@ -2802,8 +2820,6 @@ def youtube_download(
                 "--merge-output-format",
                 "mp4",
                 "--split-chapters",
-                "--max-filesize",
-                "19M",
                 "-o",
                 os.path.join(tmp, "%(title)s.%(ext)s"),
             ]
@@ -2871,6 +2887,8 @@ def _cobalt_download_all(
     Download ALL items via Cobalt API (handles carousels, playlists, etc).
     Returns list of {data, fname, is_video} dicts.
     Set COBALT_URL env var to your self-hosted instance.
+    
+    For TikTok and other platforms, ensures audio is included in video downloads.
     """
     if not COBALT_URL:
         log.debug("_cobalt_download_all: COBALT_URL not set, skipping")
@@ -2889,6 +2907,9 @@ def _cobalt_download_all(
             payload["audioBitrate"] = "192"
         else:
             payload["downloadMode"] = "auto"
+            # Ensure audio is included for video downloads (fixes TikTok no-sound issue)
+            payload["isAudioOnly"] = False
+            payload["dubLang"] = False
 
         resp = WEB.post(
             f"{COBALT_URL}/",
@@ -2911,6 +2932,9 @@ def _cobalt_download_all(
         if status == "error":
             code = j.get("error", {}).get("code", "unknown")
             log.warning("_cobalt_download_all: API error code=%s", code)
+            # Handle age-restricted content errors
+            if code == "error.api.content.post.age":
+                log.info("_cobalt_download_all: age-restricted content, will try yt-dlp with cookies")
             return []
 
         def _sniff_type(
@@ -3557,8 +3581,6 @@ def music_download_ytdlp(url: str, source: str = "auto") -> Optional[tuple[bytes
                 "20",
                 "--retries",
                 "2",
-                "--max-filesize",
-                "19M",
                 "-o",
                 os.path.join(tmp, "%(title).60s.%(ext)s"),
             ]
@@ -3909,12 +3931,14 @@ def social_download_ytdlp(
         result = _run(["-x", "--audio-format", "mp3", "--audio-quality", "5"], url)
     else:
         result = None
+        # For TikTok, ensure we get video WITH audio by using bestvideo+bestaudio or forcing mp4 with audio
+        is_tiktok = "tiktok.com" in url.lower()
         for fmt in [
             ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"],
-            ["-f", "best", "--merge-output-format", "mp4"],
+            (["-f", "best[ext=mp4]/best"] + (["--embed-thumbnail"] if not is_tiktok else [])),
             ["--merge-output-format", "mp4"],
         ]:
-            result = _run(fmt, url)
+            result = _run(fmt if isinstance(fmt, list) else fmt, url)
             if result:
                 break
 
@@ -4845,13 +4869,88 @@ def instagram_get_profile(username: str) -> list[dict]:
 def tiktok_download(url: str) -> Optional[tuple[bytes, str]]:
     """Download TikTok video.
     Strategy 1: Cobalt API (self-hosted, most reliable for TikTok)
-    Strategy 2: yt-dlp fallback
+    Strategy 2: yt-dlp with cookies for age-restricted content
+    Strategy 3: Alternative TikTok APIs (tikwm.com, snaptik.app)
     """
     log.info("tiktok_download: %s", url)
+    
+    # Try Cobalt first
     cobalt = _cobalt_download(url)
     if cobalt:
         return cobalt
-    return social_download_ytdlp(url)
+    
+    # Try yt-dlp with TikTok-specific options and cookies
+    result = social_download_ytdlp(url, audio_only=False, cookies_file=TWITTER_COOKIES_FILE or YOUTUBE_COOKIES_FILE)
+    if result:
+        return result
+    
+    # Fallback: try alternative TikTok APIs
+    try:
+        # Try tikwm.com API
+        vid_id = ""
+        m = re.search(r"/video/(\d+)", url)
+        if m:
+            vid_id = m.group(1)
+        else:
+            # Try to get video ID from short URL
+            try:
+                resp = WEB.head(url, timeout=10, allow_redirects=True)
+                final_url = resp.url
+                m = re.search(r"/video/(\d+)", final_url)
+                if m:
+                    vid_id = m.group(1)
+            except Exception:
+                pass
+        
+        if vid_id:
+            log.info("tiktok_download: trying tikwm.com API for vid=%s", vid_id)
+            api_url = f"https://www.tikwm.com/api/?url=https://www.tiktok.com/video/{vid_id}"
+            r = WEB.get(api_url, headers={"User-Agent": UA_DESK}, timeout=15)
+            if r.status_code == 200:
+                j = r.json()
+                if j.get("code") == 0 and j.get("data", {}).get("play"):
+                    video_url = j["data"]["play"]
+                    log.info("tiktok_download: got URL from tikwm: %s", video_url[:80])
+                    video_data = WEB.get(video_url, timeout=60).content
+                    if len(video_data) > 10000:
+                        title = j["data"].get("title", "tiktok_video")[:60]
+                        fname = f"{title}.mp4"
+                        log.info("tiktok_download OK via tikwm: %.1fMB", len(video_data)/1024/1024)
+                        return video_data, fname
+            log.debug("tiktok_download: tikwm failed, response: %s", r.text[:200])
+    except Exception as e:
+        log.warning("tiktok_download: tikwm fallback error: %s", e)
+    
+    # Last resort: try snaptik.app
+    try:
+        log.info("tiktok_download: trying snaptik.app")
+        r = WEB.post(
+            "https://snaptik.app/action-2024.php",
+            data={"url": url},
+            headers={
+                "User-Agent": UA_DESK,
+                "Referer": "https://snaptik.app/",
+                "X-Requested-With": "XMLHttpRequest"
+            },
+            timeout=15
+        )
+        if r.status_code == 200 and "download.php" in r.text:
+            # Extract download link
+            dl_match = re.search(r'href=["\']([^"\']*download\.php[^"\']*)["\']', r.text)
+            if dl_match:
+                dl_url = dl_match.group(1)
+                if not dl_url.startswith("http"):
+                    dl_url = "https://snaptik.app/" + dl_url
+                log.info("tiktok_download: got snaptik URL: %s", dl_url[:80])
+                video_data = WEB.get(dl_url, timeout=60).content
+                if len(video_data) > 10000:
+                    log.info("tiktok_download OK via snaptik: %.1fMB", len(video_data)/1024/1024)
+                    return video_data, "tiktok_video.mp4"
+    except Exception as e:
+        log.warning("tiktok_download: snaptik fallback error: %s", e)
+    
+    log.error("tiktok_download: all methods failed")
+    return None
 
 
 def tiktok_user_videos(username: str, limit: int = 10) -> list[dict]:
@@ -5681,13 +5780,18 @@ def libgen_search(query: str, count: int = 10, extensions: list = None) -> list[
                 try:
                     for bk in results:
                         if not bk["name"]:
+                            # Try to get metadata from json.php - handle both dict and list responses
                             fr = sess.get(
                                 f"{mirror}/json.php?object=f&md5={bk['md5']}&fields=*",
                                 headers={"User-Agent": UA_DESK},
                                 timeout=8,
                             )
                             if fr.status_code == 200:
-                                fraw = fr.json()
+                                try:
+                                    fraw = fr.json()
+                                except Exception as je:
+                                    log.debug("libgen json parse error: %s", je)
+                                    continue
                                 flist = (
                                     list(fraw.values())
                                     if isinstance(fraw, dict)
@@ -6479,16 +6583,27 @@ PRIVACY_TEXT = """🔒 *حریم خصوصی بله قربان*
 url_cache: dict[str, str] = {}  # short_key → full_url
 
 
-def store_url(url: str) -> str:
+def store_url(url: str, chat_id: int = None) -> str:
+    """Store URL in cache with optional chat_id for callback retrieval."""
     key = hashlib.md5(url.encode()).hexdigest()[:10]
     with _url_lock:
+        # Store URL
         url_cache[key] = url
+        # Optionally store chat_id for callback context
+        if chat_id is not None:
+            url_cache[f"{key}_chat"] = chat_id
     return key
 
 
 def get_url(key: str) -> Optional[str]:
     with _url_lock:
         return url_cache.get(key)
+
+
+def get_url_chat(key: str) -> Optional[int]:
+    """Get stored chat_id for a URL key."""
+    with _url_lock:
+        return url_cache.get(f"{key}_chat")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -6846,9 +6961,12 @@ def _youtube_execute_download(
 ):
     """Final step: perform the actual download and send to user."""
     url = get_url(url_key) or ""
+    # Try to get chat_id from cache, fallback to callback cid
+    cached_cid = get_url_chat(url_key)
+    target_cid = cached_cid if cached_cid else cid
     if not url:
         send_message(
-            cid, "❌ لینک منقضی شده. دوباره امتحان کنید.", reply_markup=home_kb()
+            target_cid, "❌ لینک منقضی شده. دوباره امتحان کنید.", reply_markup=home_kb()
         )
         return
 
@@ -6859,11 +6977,11 @@ def _youtube_execute_download(
     sub_label = f" + زیرنویس ({sub_code})" if sub_code else ""
     label = "🎵 صدا" if audio_only else "📺 ویدیو"
     send_message(
-        cid,
+        target_cid,
         f"⏳ در حال دانلود {label}{sub_label}…\n_(ممکن است چند دقیقه طول بکشد)_",
         parse_mode="Markdown",
     )
-    chat_action(cid, "upload_video" if not audio_only else "upload_voice")
+    chat_action(target_cid, "upload_video" if not audio_only else "upload_voice")
 
     result = youtube_download(
         url,
@@ -6872,7 +6990,7 @@ def _youtube_execute_download(
         sub_code=sub_code if sub_code != "NONE" else "",
         yt_client=client,
     )
-    _finish_video(cid, result)
+    _finish_video(target_cid, result)
 
 
 def _finish_video(cid: int, result):
@@ -7450,13 +7568,15 @@ def do_book_show_book(cid: int, book: dict):
     rows = []
     ia_url = book.get("ia_url", "")
     if md5:
-        rows.append([{"text": "📥 دانلود", "callback_data": f"book_dl_{md5}_{ext}"}])
+        # Store the book info with chat_id for callback
+        book_key = store_url(f"libgen:{md5}:{ext}", chat_id=cid)
+        rows.append([{"text": "📥 دانلود", "callback_data": f"book_dl_{book_key}"}])
     elif ia_url:
         rows.append(
             [
                 {
                     "text": "📖 دانلود از Internet Archive",
-                    "callback_data": f"book_ia_{store_url(ia_url)}",
+                    "callback_data": f"book_ia_{store_url(ia_url, chat_id=cid)}",
                 }
             ]
         )
@@ -7467,7 +7587,7 @@ def do_book_show_book(cid: int, book: dict):
                 [
                     {
                         "text": "🌐 مشاهده در Open Library",
-                        "callback_data": f"book_ol_{store_url(url)}",
+                        "callback_data": f"book_ol_{store_url(url, chat_id=cid)}",
                     }
                 ]
             )
@@ -10229,7 +10349,7 @@ def do_soundcloud_info(cid: int, url: str):
             send_message(cid, "\n".join(lines), parse_mode="Markdown")
 
         # Offer download button
-        url_key = store_url(url)
+        url_key = store_url(url, chat_id=cid)
         kb = {
             "inline_keyboard": [
                 [
@@ -10533,9 +10653,14 @@ def handle_message(msg: dict):
         "ocr": lambda: send_message(
             cid, "🖼 لطفاً عکس ارسال کنید.", reply_markup=cancel_kb()
         ),
-        "images_pick": lambda: do_images(
-            cid, st.get("last_query", text), st.get("img_source", "bing")
+        "images_query": lambda: handle_message_images_query(cid, text, st),
+        "images_source": lambda: send_message(
+            cid, "🖼 منبع را از دکمه‌های زیر انتخاب کنید:", reply_markup=image_source_kb()
         ),
+        "img_bing": lambda: do_images(cid, st.get("last_query", ""), "bing"),
+        "img_pinterest": lambda: do_images(cid, st.get("last_query", ""), "pinterest"),
+        "img_pexels": lambda: do_images(cid, st.get("last_query", ""), "pexels"),
+        "img_wiki": lambda: do_images(cid, st.get("last_query", ""), "wiki"),
         "tg_read": lambda: do_tg_read(cid, text, False),
         "tg_mtproto": lambda: do_tg_read(cid, text, True),
         "tg_dl": lambda: do_tg_dl_media(cid, text),
@@ -10591,9 +10716,39 @@ def handle_message(msg: dict):
 # ═══════════════════════════════════════════════════════════════════════════════
 def handle_callback(cb: dict):
     msg = cb.get("message") or {}
-    cid = (msg.get("chat") or {}).get("id") or 0
+    cid = (msg.get("chat") or {}).get("id")
+    
+    # Fallback: extract chat_id from callback query's 'from' field if message.chat is missing
+    # This handles cases where the callback comes from an inline query or edited message
     if not cid:
-        log.warning("handle_callback: no chat id in callback, skipping")
+        from_user = cb.get("from") or {}
+        cid = from_user.get("id")
+    
+    # Additional fallback: try to get chat_id from callback data prefix if stored
+    # Some platforms may not include full message object in callbacks
+    if not cid:
+        log.warning("handle_callback: no chat id in callback, cb keys: %s", list(cb.keys()))
+        # Try to find chat_id in nested structures
+        for key in ["message", "inline_message_id", "chat_instance"]:
+            if key in cb:
+                val = cb[key]
+                if isinstance(val, dict) and "chat" in val:
+                    cid = (val.get("chat") or {}).get("id")
+                    if cid:
+                        break
+        
+    # Critical fallback for SoundCloud and other downloads: check if we have cached URL with chat_id
+    if not cid:
+        # Try to extract from callback data pattern - some callbacks store chat info
+        m = re.match(r"(sc_dl|yt_dl|bk_dl)_\w+", data if (data := cb.get("data", "")) else "")
+        if m:
+            log.error("handle_callback: CRITICAL - cannot determine chat_id for %s, skipping. Full cb: %r", m.group(0), cb)
+        else:
+            log.error("handle_callback: CRITICAL - cannot determine chat_id, skipping callback. Full cb: %r", cb)
+        return
+    
+    if not cid:
+        log.error("handle_callback: CRITICAL - cannot determine chat_id, skipping callback. Full cb: %r", cb)
         return
     data = cb.get("data", "")
     answer_cb(cb["id"])
@@ -11068,12 +11223,16 @@ def handle_callback(cb: dict):
     # book_ia_{url_key} — download from Internet Archive
     m = re.match(r"book_ia_(\w+)$", data)
     if m:
-        ia_url = get_url(m.group(1)) or ""
+        url_key = m.group(1)
+        ia_url = get_url(url_key) or ""
+        # Try to get chat_id from cache, fallback to callback cid
+        cached_cid = get_url_chat(url_key)
+        target_cid = cached_cid if cached_cid else cid
         if not ia_url:
-            send_message(cid, "❌ لینک منقضی شده.", reply_markup=home_kb())
+            send_message(target_cid, "❌ لینک منقضی شده.", reply_markup=home_kb())
             return
-        send_message(cid, "⏳ در حال دانلود از Internet Archive…")
-        chat_action(cid, "upload_document")
+        send_message(target_cid, "⏳ در حال دانلود از Internet Archive…")
+        chat_action(target_cid, "upload_document")
         sess = _libgen_session()
         try:
             resp = sess.get(
@@ -11084,28 +11243,29 @@ def handle_callback(cb: dict):
             )
             if resp.status_code == 200 and len(resp.content) > 5000:
                 fname = ia_url.split("/")[-1].split("?")[0] or "book.pdf"
-                if smart_send(cid, resp.content, fname, caption=f"📚 {fname}"):
-                    send_message(cid, "✅ کتاب ارسال شد.", reply_markup=home_kb())
+                if smart_send(target_cid, resp.content, fname, caption=f"📚 {fname}"):
+                    send_message(target_cid, "✅ کتاب ارسال شد.", reply_markup=home_kb())
                 else:
-                    send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+                    send_message(target_cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
             else:
-                send_message(cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb())
+                send_message(target_cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb())
         except Exception as e:
             log.warning("book_ia: %s", e)
-            send_message(cid, "❌ خطا در دانلود.", reply_markup=home_kb())
-        clear_state(cid)
+            send_message(target_cid, "❌ خطا در دانلود.", reply_markup=home_kb())
+        clear_state(target_cid)
         return
 
     # book_ol_{url_key} — show Open Library link
     m = re.match(r"book_ol_(\w+)$", data)
     if m:
-        ol_url = get_url(m.group(1)) or ""
+        url_key = m.group(1)
+        ol_url = get_url(url_key) or ""
+        cached_cid = get_url_chat(url_key)
+        target_cid = cached_cid if cached_cid else cid
         if ol_url:
-            send_message(
-                cid, f"🌐 لینک Open Library:\n{ol_url}", reply_markup=home_kb()
-            )
+            send_message(target_cid, f"🌐 لینک Open Library:\n{ol_url}", reply_markup=home_kb())
         else:
-            send_message(cid, "❌ لینک منقضی شده.", reply_markup=home_kb())
+            send_message(target_cid, "❌ لینک منقضی شده.", reply_markup=home_kb())
         return
 
     # paper_item_{cache_key}_{idx} — user clicked a paper in results
@@ -11133,7 +11293,7 @@ def handle_callback(cb: dict):
 
         rows = []
         if doi:
-            doi_key = store_url(doi)
+            doi_key = store_url(doi, chat_id=cid)
             rows.append(
                 [
                     {
@@ -11143,7 +11303,7 @@ def handle_callback(cb: dict):
                 ]
             )
         if oa_url:
-            oa_key = store_url(oa_url)
+            oa_key = store_url(oa_url, chat_id=cid)
             rows.append(
                 [
                     {
@@ -11169,22 +11329,28 @@ def handle_callback(cb: dict):
     # paper_dl_{doi_key} — download from Sci-Hub
     m = re.match(r"paper_dl_(\w+)$", data)
     if m:
-        doi = get_url(m.group(1)) or ""
+        url_key = m.group(1)
+        doi = get_url(url_key) or ""
+        cached_cid = get_url_chat(url_key)
+        target_cid = cached_cid if cached_cid else cid
         if not doi:
-            send_message(cid, "❌ DOI یافت نشد.")
+            send_message(target_cid, "❌ DOI یافت نشد.")
             return
-        _do_paper_dl_doi(cid, doi)
+        _do_paper_dl_doi(target_cid, doi)
         return
 
     # paper_oa_{url_key} — download open access PDF directly
     m = re.match(r"paper_oa_(\w+)$", data)
     if m:
-        oa_url = get_url(m.group(1)) or ""
+        url_key = m.group(1)
+        oa_url = get_url(url_key) or ""
+        cached_cid = get_url_chat(url_key)
+        target_cid = cached_cid if cached_cid else cid
         if not oa_url:
-            send_message(cid, "❌ لینک یافت نشد.")
+            send_message(target_cid, "❌ لینک یافت نشد.")
             return
-        send_message(cid, "⏳ در حال دانلود Open Access PDF…")
-        chat_action(cid, "upload_document")
+        send_message(target_cid, "⏳ در حال دانلود Open Access PDF…")
+        chat_action(target_cid, "upload_document")
         sess = _libgen_session()
         try:
             resp = sess.get(
@@ -11199,8 +11365,8 @@ def handle_callback(cb: dict):
                 )
                 if not fname.endswith(".pdf"):
                     fname += ".pdf"
-                if smart_send(cid, resp.content, fname, caption=f"📄 {fname}"):
-                    send_message(cid, "✅ مقاله ارسال شد.", reply_markup=home_kb())
+                if smart_send(target_cid, resp.content, fname, caption=f"📄 {fname}"):
+                    send_message(target_cid, "✅ مقاله ارسال شد.", reply_markup=home_kb())
                 else:
                     send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
             else:
@@ -11336,10 +11502,22 @@ def handle_callback(cb: dict):
         do_book_show_book(cid, results[idx])
         return
 
-    # book_dl_{md5}_{ext}  — دانلود کتاب (md5 و ext مستقیم در callback)
-    m = re.match(r"book_dl_([a-f0-9]{32})_(\w+)$", data)
+    # book_dl_{url_key}  — دانلود کتاب (url_key points to libgen:{md5}:{ext})
+    m = re.match(r"book_dl_(\w+)$", data)
     if m:
-        do_book_download(cid, f"{m.group(1)}_{m.group(2)}")
+        url_key = m.group(1)
+        stored = get_url(url_key)
+        if not stored:
+            send_message(cid, "❌ لینک منقضی شده.")
+            return
+        # Parse libgen:{md5}:{ext} format
+        if stored.startswith("libgen:"):
+            parts = stored.split(":")
+            if len(parts) >= 3:
+                md5, ext = parts[1], parts[2]
+                do_book_download(cid, f"{md5}_{ext}")
+                return
+        send_message(cid, "❌ اطلاعات کتاب نامعتبر است.")
         return
 
     # ── RSS callbacks ─────────────────────────────────────────────────────
@@ -11717,10 +11895,13 @@ def handle_callback(cb: dict):
     if m_sc:
         url_key = m_sc.group(1)
         url = get_url(url_key)
+        # Try to get chat_id from cache first, fallback to callback's cid
+        cached_cid = get_url_chat(url_key)
+        target_cid = cached_cid if cached_cid else cid
         if not url:
-            send_message(cid, "❌ لینک منقضی شده.")
+            send_message(target_cid, "❌ لینک منقضی شده.")
             return
-        threading.Thread(target=do_music, args=(cid, url), daemon=True).start()
+        threading.Thread(target=do_music, args=(target_cid, url), daemon=True).start()
         return
 
     # ── Social result item click: soc_{platform}_{cache_key}_{idx} ───────
