@@ -106,7 +106,7 @@ def _set_platform_ctx(platform: str):
     _ctx.chunk_size = cfg["chunk_size"]
     _ctx.session = cfg["session"]  # shared persistent Session (thread-safe reads)
     # Also set max video duration for splitting (Telegram allows larger files)
-    _ctx.video_split_mb = 45.0 if platform == "telegram" else 18.0
+    _ctx.video_split_mb = 48.0 if platform == "telegram" else 18.0
 
 
 # Helpers to read thread-local context — fall back to Bale defaults
@@ -144,9 +144,11 @@ KB_MAX_BUTTONS = KB_MAX_ROWS * KB_MAX_COLS
 TOKEN = BALE_TOKEN or TELEGRAM_TOKEN
 
 # Platform Limits
-TELEGRAM_MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB for standard Telegram bots (up to 2GB for Premium)
-BALE_MAX_FILE_SIZE = 20 * 1024 * 1024      # 20MB for Bale
-MAX_FILE_SIZE = BALE_MAX_FILE_SIZE  # Default to Bale for safety, updated dynamically
+# Telegram supports up to 50MB for standard bots, 2GB for Premium bots
+# We use 48MB to leave some buffer
+TELEGRAM_MAX_FILE_SIZE = 48 * 1024 * 1024  # 48MB for Telegram (can go up to 2GB with Premium)
+BALE_MAX_FILE_SIZE = 20 * 1024 * 1024      # 20MB for Bale (hard limit)
+MAX_FILE_SIZE = BALE_MAX_FILE_SIZE  # Default to Bale for safety, updated dynamically per-thread
 
 # yt-dlp binary — resolved from PATH at runtime
 YTDLP_BIN = "yt-dlp"
@@ -193,30 +195,29 @@ COBALT_URL = os.getenv("COBALT_URL", "http://localhost:9000")
 # Get your key at https://www.virustotal.com/gui/join-us
 VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
 
+# Unpaywall — free API for open-access papers (requires email registration)
+# Register at: https://unpaywall.org/products/api
+UNPAYWALL_EMAIL = os.getenv("UNPAYWALL_EMAIL", "dev@balebot.local")
+
 # Library Genesis — no login required, public API
+# Only reliable mirrors that work from Hetzner/Iran hosting
 LIBGEN_MIRRORS = [
-    "https://libgen.li",  # primary; .is/.st time out from most servers
+    "https://libgen.li",  # primary - most reliable
     "https://libgen.lc",  # fallback
-    "https://libgen.rs",  # additional mirror
-    "https://libgen.st",  # additional mirror
-    "https://libgen.is",  # additional mirror
 ]
 LIBGEN_DL_MIRRORS = [
-    "https://library.lol",
+    "https://library.lol",  # primary download mirror
     "https://libgen.rocks",
     "https://books.ms",
-    "https://libgen.is",
     "https://annas-archive.se",  # Anna's Archive direct download
     "https://annas-archive.org",  # Anna's Archive primary
 ]
 # Anna's Archive - comprehensive open access directory
 ANNA_ARCHIVE_MIRROR = "https://anna-archive.se"
-# Sci-Hub for scientific papers
+# Sci-Hub for scientific papers - only reliable mirrors
 SCIHUB_MIRRORS = [
     "https://sci-hub.se",
     "https://sci-hub.st",
-    "https://sci-hub.ru",
-    "https://sci-hub.moscow",
 ]
 
 
@@ -267,9 +268,6 @@ result_cache: dict[str, list] = {}  # key → list[dict]
 # ═══════════════════════════════════════════════════════════════════════════════
 # BALE API HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
-
-# Chunk size matches index.js: 19 MB per part
-CHUNK_SIZE = 19 * 1024 * 1024
 
 # Extensions Bale accepts natively — no ZIP wrapping needed (mirrors index.js)
 EXEMPT_EXT = {
@@ -518,6 +516,17 @@ def _post_file(
                 file_obj.close()
                 return True
             code = resp.get("error_code", 0)
+            # Error 404 "no such group or user" means chat_id is invalid — don't retry
+            if code == 404:
+                log.error(
+                    "%s failed: %s  file=%s  size=%dKB — chat/user not found (404)",
+                    endpoint,
+                    resp,
+                    filename,
+                    len(data_bytes) // 1024,
+                )
+                file_obj.close()
+                return False
             if code in (429, 500, 502, 503, 504) or r.status_code >= 500:
                 log.warning(
                     "%s: server error %s — retry %d/%d in %ds",
@@ -934,7 +943,8 @@ def smart_send(
         # ffmpeg failed → fall through to byte-split as last resort
 
     # Step 4: Non-video or ffmpeg fallback → raw byte-split
-    total_chunks = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+    chunk_size = _chunk_size()
+    total_chunks = (total_size + chunk_size - 1) // chunk_size
     base2 = filename.rsplit(".", 1)[0] if "." in filename else filename
     ext2 = ("." + filename.rsplit(".", 1)[1]) if "." in filename else ""
     log.info("smart_send: byte-splitting %s into %d chunks", filename, total_chunks)
@@ -945,8 +955,8 @@ def smart_send(
     )
     all_ok = True
     for i in range(total_chunks):
-        start = i * CHUNK_SIZE
-        end = min(start + CHUNK_SIZE, total_size)
+        start = i * chunk_size
+        end = min(start + chunk_size, total_size)
         chunk = data[start:end]
         chunk_name = f"{base2}.part{i + 1}of{total_chunks}{ext2}"
         send_message(
@@ -2486,14 +2496,22 @@ def youtube_get_formats(url: str) -> dict:
                 "fmt_spec": fmt_spec,
                 "client": used_client,
                 "_tbr": tbr,
+                "tbr_estimate": tbr,  # Store for filesize calculation
             }
 
     quality_list = sorted(
         seen_heights.values(), key=lambda x: x["height"], reverse=True
     )
-    # Remove internal _tbr key
+    # Remove internal _tbr key and add filesize info
     for q in quality_list:
         q.pop("_tbr", None)
+        # Estimate filesize based on duration and bitrate (tbr in kbps)
+        tbr = q.get("tbr_estimate") or 0
+        duration_sec = info.get("duration") or 0
+        if tbr and duration_sec:
+            # filesize in MB = (tbr_kbps * duration_sec) / 8 / 1024
+            estimated_mb = int((tbr * duration_sec) / 8 / 1024)
+            q["filesize_mb"] = estimated_mb
 
     # ── Subtitles ─────────────────────────────────────────────────────────────
     subs_raw = {}
@@ -2535,6 +2553,7 @@ def youtube_get_formats(url: str) -> dict:
         "formats": quality_list,
         "subtitles": subtitle_list[:20],  # cap at 20 languages
         "title": info.get("title", ""),
+        "description": info.get("description", ""),
         "thumbnail": info.get("thumbnail", ""),
         "duration": info.get("duration_string", ""),
         "client": used_client,
@@ -2895,11 +2914,12 @@ def _cobalt_download_all(
         return []
     log.info("_cobalt_download_all: %s audio=%s via %s", url, audio_only, COBALT_URL)
     try:
+        # Cobalt API v2 format - see https://github.com/imputnet/cobalt
+        # Fixed payload format to avoid "error.api.invalid_body" errors
         payload: dict = {
-            "url": url,
+            "url": url.strip(),  # Ensure no trailing whitespace
             "videoQuality": quality,
             "filenameStyle": "basic",
-            "alwaysProxy": False,
         }
         if audio_only:
             payload["downloadMode"] = "audio"
@@ -2907,12 +2927,17 @@ def _cobalt_download_all(
             payload["audioBitrate"] = "192"
         else:
             payload["downloadMode"] = "auto"
-            # Ensure audio is included for video downloads (fixes TikTok no-sound issue)
-            payload["isAudioOnly"] = False
-            payload["dubLang"] = False
+            # For TikTok and other platforms: ensure full video with audio is downloaded
+            # Don't set isAudioOnly or dubLang to avoid audio stripping
+            payload["youtubeVideoCodec"] = "h264"  # prefer compatible codec
+        
+        # Add TikTok-specific settings to ensure audio is included
+        if "tiktok.com" in url:
+            payload["tiktokFullAudio"] = True
+            payload["tiktokH265"] = False  # Prefer H264 for better compatibility
 
         resp = WEB.post(
-            f"{COBALT_URL}/",
+            f"{COBALT_URL}/json",
             json=payload,
             headers={"Accept": "application/json", "Content-Type": "application/json"},
             timeout=30,
@@ -5088,6 +5113,7 @@ def github_zip(repo_url: str) -> Optional[bytes]:
 
 # ─── Images ───────────────────────────────────────────────────────────────────
 def images_bing(query: str, max_results=8) -> list[dict]:
+    """Search Bing Images with improved regex patterns and better URL extraction."""
     log.info("images_bing: %r", query)
     try:
         r = WEB.get(
@@ -5099,15 +5125,20 @@ def images_bing(query: str, max_results=8) -> list[dict]:
         log.debug("bing_images: status=%d len=%d", r.status_code, len(r.text))
         results = []
         seen: set[str] = set()
+        
+        # Try multiple extraction methods for better reliability
+        # Method 1: Extract from murl (media URL - most reliable)
         for pattern in [
             r'"murl":"(https?://[^"]+\.(?:jpg|jpeg|png|webp))"',
-            r"murl&quot;:&quot;(https?://[^&]+\.(?:jpg|jpeg|png))"
-            r"&quot;",
+            r'"contentUrl":"(https?://[^"]+\.(?:jpg|jpeg|png|webp))"',
+            r'"thumbUrl":"(https?://[^"]+\.(?:jpg|jpeg|png|webp))"',
+            r'mediaUrl":"(https?://[^"]+)"',
+            r'"imgurl":"(https?://[^"]+\.(?:jpg|jpeg|png|webp))"',
         ]:
             for u in re.findall(pattern, r.text):
-                u = u.replace("&amp;", "&")
+                u = u.replace("&amp;", "&").replace("\\/", "/").replace("\\", "")
                 if u not in seen and not any(
-                    x in u for x in ["bing.com", "microsoft.com"]
+                    x in u for x in ["bing.com", "microsoft.com", "127.0.0.1", "localhost"]
                 ):
                     seen.add(u)
                     results.append({"url": u, "title": query})
@@ -5115,6 +5146,26 @@ def images_bing(query: str, max_results=8) -> list[dict]:
                     break
             if len(results) >= max_results:
                 break
+        
+        # Method 2: If still no results, try extracting blob URLs and data attributes
+        if len(results) == 0:
+            # Look for data-src or src attributes in img tags
+            for pat in [
+                r'data-src="([^"]+)"',
+                r'src="([^"]+\.(?:jpg|jpeg|png|webp))"',
+                r'url\(([^)]+)\)',
+            ]:
+                for u in re.findall(pat, r.text):
+                    if u.startswith("http") and not u.startswith("data:"):
+                        u = u.split("?")[0].split("&")[0]  # Clean URL
+                        if u not in seen and ".jpg" in u.lower() or ".png" in u.lower() or ".webp" in u.lower():
+                            seen.add(u)
+                            results.append({"url": u, "title": query})
+                    if len(results) >= max_results:
+                        break
+                if len(results) >= max_results:
+                    break
+        
         log.info("images_bing: %d results", len(results))
         return results
     except Exception as e:
@@ -5200,7 +5251,11 @@ def images_pexels(query: str, max_results=8) -> list[dict]:
     """Pixabay API (requires free API key) + Unsplash fallback."""
     log.info("images_pexels: %r", query)
     # Key from env or hardcoded backup — get your own free key at pixabay.com/api/docs/
-    PIXABAY_KEY = os.getenv("PIXABAY_KEY", "47075717-fbc72d1e73d12c83cfdb8b44e")
+    # Note: The hardcoded key may be rate-limited. Set PIXABAY_KEY env var for production.
+    PIXABAY_KEY = os.getenv("PIXABAY_KEY", "")
+    if not PIXABAY_KEY:
+        log.warning("pixabay: no API key set - set PIXABAY_KEY env var at pixabay.com/api/docs/")
+    
     if PIXABAY_KEY:
         try:
             r = _get_web(use_warp=True).get(
@@ -5230,36 +5285,51 @@ def images_pexels(query: str, max_results=8) -> list[dict]:
                 if results:
                     log.info("pixabay: %d results", len(results))
                     return results
-            log.warning("pixabay: status=%d resp=%s", r.status_code, r.text[:100])
+            elif r.status_code == 400:
+                log.warning("pixabay: invalid API key (400) - check PIXABAY_KEY env var")
+            elif r.status_code == 403:
+                log.warning("pixabay: API key forbidden (403) - key may be blocked")
+            else:
+                log.warning("pixabay: status=%d resp=%s", r.status_code, r.text[:100])
         except Exception as e:
             log.error("images_pexels pixabay: %s", e)
 
-    # Unsplash Source CDN (returns random matching image — no key needed)
+    # Unsplash API fallback (no key required for basic usage)
     try:
         results = []
-        slug = urllib.parse.quote(query)
-        for i in range(min(max_results, 6)):
-            # Use different seeds so we get different images
-            r2 = WEB.get(
-                f"https://source.unsplash.com/800x600/?{slug},{i}",
-                allow_redirects=True,
-                timeout=15,
-                headers={"User-Agent": "BaleBot/1.0"},
-            )
-            if r2.status_code == 200 and len(r2.content) > 5000:
-                results.append(
-                    {"url": r2.url, "title": f"{query} #{i + 1}", "_bytes": r2.content}
-                )
-        if results:
-            log.info("unsplash: %d results", len(results))
-            return results
+        # Use Unsplash API directly
+        r_unsplash = WEB.get(
+            f"https://unsplash.com/napi/search/photos?query={urllib.parse.quote(query)}&per_page={max_results}",
+            headers={
+                "User-Agent": UA_DESK,
+                "Accept": "application/json",
+                "Referer": "https://unsplash.com",
+            },
+            timeout=15,
+        )
+        if r_unsplash.status_code == 200:
+            data = r_unsplash.json()
+            photos = data.get("results", [])
+            for photo in photos[:max_results]:
+                url = photo.get("urls", {}).get("regular", "")
+                if url:
+                    results.append({
+                        "url": url,
+                        "title": photo.get("description", {}).get("raw", query)[:60] or query,
+                    })
+            if results:
+                log.info("unsplash_api: %d results", len(results))
+                return results
     except Exception as e:
-        log.error("images_pexels unsplash: %s", e)
-    return []
+        log.debug("unsplash api fallback: %s", e)
+    
+    # Final fallback to Bing
+    log.info("pexels: falling back to Bing")
+    return images_bing(query, max_results)
 
 
 def images_wikimedia(query: str, max_results=8) -> list[dict]:
-    """Search Wikimedia Commons for images."""
+    """Search Wikimedia Commons for images with better filtering and relevance."""
     log.info("images_wikimedia: %r", query)
     try:
         r = _get_web(use_warp=True).get(
@@ -5267,8 +5337,8 @@ def images_wikimedia(query: str, max_results=8) -> list[dict]:
             params={
                 "action": "query",
                 "generator": "search",
-                "gsrsearch": query,  # no filetype filter — too restrictive
-                "gsrnamespace": "6",
+                "gsrsearch": query,
+                "gsrnamespace": "6",  # File namespace
                 "gsrlimit": str(max_results * 3),
                 "prop": "imageinfo",
                 "iiprop": "url|size|mime",
@@ -5280,15 +5350,36 @@ def images_wikimedia(query: str, max_results=8) -> list[dict]:
         log.debug("wikimedia_search: status=%d", r.status_code)
         results = []
         pages = r.json().get("query", {}).get("pages", {})
+        query_terms = query.lower().split()
+        
+        # Score-based ranking for better relevance
+        scored_results = []
         for pg in sorted(pages.values(), key=lambda p: p.get("index", 999)):
             ii = (pg.get("imageinfo") or [{}])[0]
             url = ii.get("url", "")
             mime = ii.get("mime", "")
+            title = pg.get("title", "")
+            
             # Accept jpeg, png, webp — skip SVG, GIF, TIFF, OGG
             if url and mime in ("image/jpeg", "image/png", "image/webp", "image/jpg"):
-                results.append({"url": url, "title": pg.get("title", query)})
-            if len(results) >= max_results:
-                break
+                title_lower = title.lower()
+                file_name = title_lower.replace("file:", "").replace("_", " ")
+                
+                # Score by how many query terms match
+                score = sum(1 for term in query_terms if term in file_name)
+                
+                # Bonus if title starts with query
+                if file_name.startswith(query_terms[0] if query_terms else ""):
+                    score += 5
+                
+                # Only include if at least one term matches OR we have few results
+                if score > 0 or len(results) < max_results // 2:
+                    scored_results.append((score, {"url": url, "title": title}))
+        
+        # Sort by score (descending) and take top results
+        scored_results.sort(key=lambda x: -x[0])
+        results = [item for _, item in scored_results[:max_results]]
+        
         log.info("images_wikimedia: %d results", len(results))
         return results
     except Exception as e:
@@ -6790,7 +6881,10 @@ def do_youtube_dl(cid: int, url: str):
 
 
 def _youtube_quality_picker(cid: int, url: str, audio_only: bool = False):
-    """Probe available formats and show quality selection keyboard to user."""
+    """Probe available formats and show quality selection keyboard to user.
+    
+    First sends thumbnail + description, then quality selector with filesize info.
+    """
     send_message(cid, "⏳ در حال بررسی کیفیت‌های موجود…")
     chat_action(cid)
     info = youtube_get_formats(url)
@@ -6811,6 +6905,13 @@ def _youtube_quality_picker(cid: int, url: str, audio_only: bool = False):
     formats = info.get("formats", [])
     subtitles = info.get("subtitles", [])
     title = info.get("title", "")[:50]
+    thumbnail = info.get("thumbnail", "")
+    description = info.get("description", "") or ""
+    duration = info.get("duration_string", "")
+
+    # Truncate description for Telegram message limit (4096 chars)
+    if len(description) > 1500:
+        description = description[:1500] + "..."
 
     if audio_only or not formats:
         # Audio mode or no video formats found — skip quality picker
@@ -6819,15 +6920,37 @@ def _youtube_quality_picker(cid: int, url: str, audio_only: bool = False):
         )
         return
 
-    # Build quality keyboard — callback: yt_qual_{url_key}_{info_key}_{idx}
-    # url_key and info_key are pure hex (no underscores), idx is digits — safe to split
+    # First: Send thumbnail with description
+    caption_parts = [f"📺 *{title}*"]
+    if duration:
+        caption_parts.append(f"⏱ مدت: {duration}")
+    if description:
+        caption_parts.append(f"\n{description}")
+    caption = "\n".join(caption_parts)
+    
+    if thumbnail:
+        try:
+            thumb_data = download_bytes(thumbnail)
+            if thumb_data:
+                smart_send(cid, thumb_data, "thumbnail.jpg", caption=caption, media_type="photo")
+        except Exception as e:
+            log.debug("Failed to send thumbnail: %s", e)
+    else:
+        send_message(cid, caption, parse_mode="Markdown")
+
+    # Build quality keyboard with filesize info
     rows = []
     for i, fmt in enumerate(formats[:8]):  # cap at 8 rows
         label = fmt["label"]
+        filesize_mb = fmt.get("filesize_mb")
+        if filesize_mb:
+            label_with_size = f"{label} • {filesize_mb}MB"
+        else:
+            label_with_size = label
         rows.append(
             [
                 {
-                    "text": f"📹 {label}",
+                    "text": f"📹 {label_with_size}",
                     "callback_data": f"yt_qual_{url_key}_{info_key}_{i}",
                 }
             ]
@@ -6843,7 +6966,7 @@ def _youtube_quality_picker(cid: int, url: str, audio_only: bool = False):
     )
     rows.append([{"text": "❌ لغو", "callback_data": "home"}])
 
-    text = f"📺 *{title}*\n\nکیفیت دانلود را انتخاب کنید:"
+    text = "کیفیت دانلود را انتخاب کنید:"
     send_message(
         cid, text, parse_mode="Markdown", reply_markup={"inline_keyboard": rows}
     )
