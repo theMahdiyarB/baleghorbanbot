@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v3.3)
+بله قربان — Bale Bot  (v3.4)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -12139,6 +12139,8 @@ def _poll_platform(platform: str, token: str):
 def run():
     threads = []
 
+    _warp_selfcheck()
+
     if BALE_TOKEN:
         log.info("Bale platform enabled — token …%s", BALE_TOKEN[-6:])
         t = _tl_threading.Thread(
@@ -12190,8 +12192,6 @@ def run():
     except KeyboardInterrupt:
         log.info("Bot stopped.")
         _update_executor.shutdown(wait=False)
-
-    _warp_selfcheck()
 
 
 if __name__ == "__main__":
