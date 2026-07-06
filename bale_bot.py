@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v3.4)
+بله قربان — Bale Bot  (v3.5)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -208,50 +208,18 @@ SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 WARP_PROXY = os.getenv("WARP_PROXY", "")  # e.g. "socks5://127.0.0.1:40000"
 
 def _warp_selfcheck():
-    """Log whether traffic is actually routed through WARP.
-
-    We do NOT trust Cloudflare's warp= flag: reaching Cloudflare's own site
-    through the WARP proxy often reports warp=off even when routing works.
-    Instead we compare the public egress IP direct vs via the proxy (if it
-    changes, traffic goes through WARP) and probe a normally DNS-blocked host.
-    """
     if not WARP_PROXY:
-        log.warning("WARP self-check: WARP_PROXY NOT set \u2014 Sci-Hub/Anna's/blocked DNS will FAIL.")
+        log.warning("WARP self-check: WARP_PROXY NOT set — Sci-Hub/Anna's/blocked DNS will FAIL.")
         return
     px = WARP_PROXY.replace("socks5://", "socks5h://")
-    proxies = {"http": px, "https": px}
-
-    def _egress(use_proxy):
-        try:
-            r = requests.get("https://api.ipify.org/",
-                             proxies=proxies if use_proxy else None, timeout=10)
-            if r.status_code == 200:
-                return r.text.strip()
-        except Exception as e:
-            log.debug("WARP self-check egress proxy=%s: %s", use_proxy, e)
-        return ""
-
-    direct_ip = _egress(False)
-    proxy_ip = _egress(True)
-
-    dns_bypass = False
     try:
-        rr = requests.get("https://sci-hub.wf/", proxies=proxies, timeout=15,
-                          allow_redirects=True)
-        dns_bypass = rr.status_code < 500
+        r = requests.get("https://www.cloudflare.com/cdn-cgi/trace/",
+                         proxies={"http": px, "https": px}, timeout=10)
+        on = ("warp=on" in r.text) or ("warp=plus" in r.text)
+        log.info("WARP self-check: proxy=%s  ->  warp=%s", WARP_PROXY,
+                 "ON ✅" if on else "OFF ❌ (proxy up but traffic not on WARP)")
     except Exception as e:
-        log.debug("WARP self-check dns probe: %s", e)
-
-    routed = bool(proxy_ip and proxy_ip != direct_ip)
-    ok = routed or dns_bypass
-    log.info(
-        "WARP self-check: direct_ip=%s proxy_ip=%s routed=%s blocked_site=%s => %s",
-        direct_ip or "?", proxy_ip or "?",
-        "YES" if routed else "NO",
-        "reachable" if dns_bypass else "unreachable",
-        "WORKING \u2705" if ok else "NOT WORKING \u274c",
-    )
-
+        log.error("WARP self-check: proxy %s UNREACHABLE — %s", WARP_PROXY, e)
 
 # Cobalt API — self-hosted instance for reliable social/YouTube downloads.
 # Self-host: https://github.com/imputnet/cobalt
@@ -587,6 +555,7 @@ def _notify_bale_error(chat_id: int):
 def send_message(
     chat_id, text, reply_markup=None, reply_to_message_id=None, parse_mode=None
 ) -> dict:
+    _status_clear(chat_id)  # a real content message ends any transient status bubble
     kw = dict(chat_id=chat_id, text=str(text)[:4096])
     if reply_markup:
         kw["reply_markup"] = (
@@ -599,6 +568,256 @@ def send_message(
     if parse_mode:
         kw["parse_mode"] = parse_mode
     return api("sendMessage", **kw)
+
+
+# -- Single self-editing status bubble per chat (clean progress UX) --
+# One message per user action: loading -> ... -> done, edited in place so a
+# whole process is a single message. Generic wording only (never leaks which
+# tool/source/proxy is used).
+_STATUS = {}
+_STATUS_LOCK = threading.Lock()
+_STATUS_SPIN = "\u25d0\u25d3\u25d1\u25d2"
+
+
+def _mk_rm(rm):
+    return json.dumps(rm) if (rm and not isinstance(rm, str)) else rm
+
+
+def _raw_send(cid, text, reply_markup=None, reply_to_message_id=None, parse_mode=None):
+    kw = dict(chat_id=cid, text=str(text)[:4096])
+    rm = _mk_rm(reply_markup)
+    if rm:
+        kw["reply_markup"] = rm
+    if reply_to_message_id:
+        kw["reply_to_message_id"] = reply_to_message_id
+    if parse_mode:
+        kw["parse_mode"] = parse_mode
+    return api("sendMessage", **kw)
+
+
+def edit_message(cid, message_id, text, reply_markup=None, parse_mode=None):
+    """Edit a message in place (editMessageText). Works on Bale & Telegram."""
+    if not message_id:
+        return _raw_send(cid, text, reply_markup=reply_markup, parse_mode=parse_mode)
+    kw = dict(chat_id=cid, message_id=message_id, text=str(text)[:4096])
+    rm = _mk_rm(reply_markup)
+    if rm:
+        kw["reply_markup"] = rm
+    if parse_mode:
+        kw["parse_mode"] = parse_mode
+    return api("editMessageText", **kw)
+
+
+def _status(cid, text, reply_markup=None, reply_to_message_id=None,
+            parse_mode=None, final=False, spinner=True):
+    """Show/advance the chat's single status bubble.
+
+    - non-final: renders a spinner + text + elapsed and reuses one message.
+    - final=True: writes the final text and closes the bubble.
+    Falls back to a fresh message if editing is not possible.
+    """
+    key = _pkey(cid)
+    now = time.time()
+    with _STATUS_LOCK:
+        st = _STATUS.get(key) or {"mid": None, "start": now, "tick": 0}
+        st["tick"] += 1
+        tick, start, mid = st["tick"], st["start"], st.get("mid")
+    if final or not spinner:
+        body = str(text)
+    else:
+        spin = _STATUS_SPIN[tick % len(_STATUS_SPIN)]
+        body = f"{spin} {text}\n\n\u23f1 {int(now - start)}s"
+    r = None
+    if mid:
+        r = edit_message(cid, mid, body, reply_markup=reply_markup, parse_mode=parse_mode)
+    if not r or not (r or {}).get("ok"):
+        r = _raw_send(cid, body, reply_markup=reply_markup, parse_mode=parse_mode)
+        mid = ((r or {}).get("result") or {}).get("message_id")
+    with _STATUS_LOCK:
+        if final:
+            _STATUS.pop(key, None)
+        else:
+            st["mid"] = mid
+            _STATUS[key] = st
+    return r
+
+
+def _status_clear(cid, delete=True):
+    """End the chat's transient status bubble. Called by send_message so that a
+    real content message replaces any leftover spinner instead of stacking."""
+    key = _pkey(cid)
+    with _STATUS_LOCK:
+        st = _STATUS.pop(key, None)
+    if delete and st and st.get("mid"):
+        try:
+            api("deleteMessage", chat_id=cid, message_id=st["mid"])
+        except Exception:
+            pass
+
+
+def edit_message(chat_id, message_id, text, reply_markup=None, parse_mode=None) -> dict:
+    """Edit a message in place (editMessageText). Works on Bale & Telegram.
+    Falls back to a new message if there is no message_id."""
+    if not message_id:
+        return send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
+    kw = dict(chat_id=chat_id, message_id=message_id, text=str(text)[:4096])
+    if reply_markup:
+        kw["reply_markup"] = (json.dumps(reply_markup)
+                              if not isinstance(reply_markup, str) else reply_markup)
+    if parse_mode:
+        kw["parse_mode"] = parse_mode
+    return api("editMessageText", **kw)
+
+
+class Progress:
+    """Live, self-editing status message with steps + elapsed/ETA.
+
+    Sends one message, then edits it in place. Edits are throttled (~1.3s) to
+    avoid rate limits. Safe on both Bale and Telegram (both support
+    editMessageText). If editing ever fails it silently keeps going.
+    """
+    _SPIN = "\u25d0\u25d3\u25d1\u25d2"
+
+    def __init__(self, cid, title="\u23f3 \u062f\u0631 \u062d\u0627\u0644 \u067e\u0631\u062f\u0627\u0632\u0634\u2026", total_steps=0):
+        self.cid = cid
+        self.title = title
+        self.total = total_steps
+        self.done = 0
+        self.start = time.time()
+        self.last_edit = 0.0
+        self.tick = 0
+        self.lines = []
+        try:
+            r = send_message(cid, title)
+            self.msg_id = (r or {}).get("result", {}).get("message_id")
+        except Exception:
+            self.msg_id = None
+
+    def _eta(self):
+        if self.total and self.done:
+            per = (time.time() - self.start) / self.done
+            remain = int(per * max(0, self.total - self.done))
+            return "  \u2022  ~" + str(remain) + "s \u0628\u0627\u0642\u06cc\u200c\u0645\u0627\u0646\u062f\u0647"
+        return ""
+
+    def step(self, text, force=False):
+        if self.lines and self.lines[-1].startswith("\u23f3"):
+            self.lines[-1] = "\u25ab\ufe0f" + self.lines[-1][1:]
+        if text:
+            self.done += 1
+            self.lines.append("\u23f3 " + text)
+        self._render(force=force)
+
+    def _render(self, force=False):
+        now = time.time()
+        if not force and now - self.last_edit < 1.3:
+            return
+        self.last_edit = now
+        self.tick += 1
+        spin = self._SPIN[self.tick % len(self._SPIN)]
+        prog = (" (" + str(self.done) + "/" + str(self.total) + ")") if self.total else ""
+        head = spin + " " + self.title + prog
+        body = head + "\n\n" + "\n".join(self.lines[-10:]) + "\n\n\u23f1 " + str(int(now - self.start)) + "s" + self._eta()
+        try:
+            edit_message(self.cid, self.msg_id, body)
+        except Exception as e:
+            log.debug("Progress render: %s", e)
+
+    def finish(self, text, ok=True):
+        if self.lines and self.lines[-1].startswith("\u23f3"):
+            self.lines[-1] = ("\u2705" if ok else "\u25ab\ufe0f") + self.lines[-1][1:]
+        self.lines.append(("\u2705 " if ok else "\u274c ") + text)
+        self._render(force=True)
+
+
+def _gbooks_cover(title, author=""):
+    """Reliable book cover via Google Books (no key needed)."""
+    try:
+        q = (title or "").strip()
+        if author:
+            q += " " + author
+        if not q:
+            return ""
+        r = WEB.get("https://www.googleapis.com/books/v1/volumes",
+                    params={"q": q, "maxResults": 1, "country": "US"}, timeout=12)
+        if r.status_code == 200:
+            items = r.json().get("items") or []
+            if items:
+                links = items[0].get("volumeInfo", {}).get("imageLinks", {})
+                u = links.get("thumbnail") or links.get("smallThumbnail") or ""
+                return u.replace("http://", "https://").replace("&edge=curl", "")
+    except Exception as e:
+        log.debug("_gbooks_cover: %s", e)
+    return ""
+
+
+def _libgen_cover_url(md5, sess=None):
+    """Extract the cover image URL from a libgen.li book (ads.php) page."""
+    if not md5:
+        return ""
+    sess = sess or _libgen_session()
+    for mirror in LIBGEN_MIRRORS:
+        try:
+            r = sess.get(mirror + "/ads.php?md5=" + md5,
+                         headers={"User-Agent": UA_DESK}, timeout=(6, 15))
+            if r.status_code != 200:
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+            for img in soup.find_all("img"):
+                src = img.get("src") or img.get("data-src") or ""
+                if "/covers/" in src.lower() or "cover" in src.lower():
+                    if src.startswith("http"):
+                        return src
+                    if src.startswith("//"):
+                        return "https:" + src
+                    return mirror + "/" + src.lstrip("/")
+        except Exception as e:
+            log.debug("_libgen_cover_url %s: %s", mirror, e)
+    return ""
+
+
+def _annas_scidb(doi, sess=None):
+    """Fetch a paper via Anna's Archive SciDB (a Sci-Hub mirror).
+    Needs WARP to reach annas-archive.* . Returns (pdf_bytes, source) or None.
+    """
+    doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", (doi or "")).strip().rstrip(".,)")
+    if not doi:
+        return None
+    sess = sess or _libgen_session()
+    hdrs = {"User-Agent": UA_DESK}
+    for mirror in ANNAS_ARCHIVE_MIRRORS:
+        try:
+            page = mirror + "/scidb/" + doi
+            r = sess.get(page, headers=hdrs, timeout=(6, 25), allow_redirects=True)
+            if r.status_code != 200:
+                continue
+            if r.content[:4] == b"%PDF":
+                return r.content, "Anna's SciDB"
+            pdf_url = ""
+            for u in re.findall(r'(?:src|href)="([^"]+)"', r.text):
+                lu = u.lower()
+                if ".pdf" in lu or "scimag" in lu or ("/scidb/" in lu and "download" in lu):
+                    pdf_url = u
+                    break
+            if not pdf_url:
+                m = re.search(r'"(https?://[^"]+\.pdf[^"]*)"', r.text)
+                if m:
+                    pdf_url = m.group(1)
+            if not pdf_url:
+                continue
+            if pdf_url.startswith("//"):
+                pdf_url = "https:" + pdf_url
+            elif pdf_url.startswith("/"):
+                pdf_url = mirror + pdf_url
+            pr = sess.get(pdf_url, headers={**hdrs, "Referer": page},
+                          timeout=(6, 90), allow_redirects=True)
+            if pr.status_code == 200 and len(pr.content) > 5000 and (
+                pr.content[:4] == b"%PDF"
+                or "pdf" in pr.headers.get("Content-Type", "").lower()):
+                return pr.content, "Anna's SciDB"
+        except Exception as e:
+            log.debug("_annas_scidb %s: %s", mirror, e)
+    return None
 
 
 def _post_file(
@@ -6175,12 +6394,22 @@ def libgen_search(query: str, count: int = 10, extensions: list = None) -> list[
                 ym = re.search(r"\b(1[5-9]\d{2}|20[0-3]\d)\b", row_text)
                 year = ym.group(1) if ym else ""
                 author = cells[1] if len(cells) > 1 else ""
+                cover = ""
+                _img = tr.find("img")
+                if _img:
+                    _src = _img.get("data-src") or _img.get("src") or ""
+                    if _src.startswith("//"):
+                        cover = "https:" + _src
+                    elif _src.startswith("http"):
+                        cover = _src
+                    elif _src and "/covers/" in _src.lower():
+                        cover = mirror + "/" + _src.lstrip("/")
                 seen.add(md5)
                 results.append({
                     "id": md5, "name": title[:200],
                     "authors": [author] if author else [],
                     "year": year, "publisher": "", "language": "",
-                    "extension": ext, "size": size, "cover": "",
+                    "extension": ext, "size": size, "cover": cover,
                     "md5": md5, "url": f"{mirror}/ads.php?md5={md5}",
                     "_source": "libgen",
                 })
@@ -6533,7 +6762,7 @@ def do_search(cid: int, query: str, page=0):
     cache_set(key, results)
     set_state(cid, mode="search", last_query=query, page=page, cache_key=key)
     if not results:
-        send_message(cid, "❌ نتیجه‌ای یافت نشد.", reply_markup=home_kb())
+        _status(cid, "❌ نتیجه‌ای یافت نشد.", reply_markup=home_kb(), final=True)
         return
     text = f"🔎 *نتایج جستجو:* _{query}_  (صفحه {page + 1})\nروی هر نتیجه کلیک کنید:"
     kb = search_results_kb(results, key, page, len(results) == 10, "ws")
@@ -6548,7 +6777,7 @@ def do_scholar(cid: int, query: str, page=0):
     cache_set(key, results)
     set_state(cid, mode="scholar", last_query=query, page=page, cache_key=key)
     if not results:
-        send_message(cid, "❌ مقاله‌ای یافت نشد.", reply_markup=home_kb())
+        _status(cid, "❌ مقاله‌ای یافت نشد.", reply_markup=home_kb(), final=True)
         return
     text = f"📚 *Google Scholar:* _{query}_  (صفحه {page + 1})"
     kb = search_results_kb(results, key, page, len(results) >= 8, "sc")
@@ -6582,7 +6811,7 @@ def unified_search(cid: int, query: str, page=0):
         return do_book_search(cid, clean_query)
     else:
         # Combined search - perform both searches
-        send_message(
+        _status(
             cid, f"⏳ در حال جستجوی ترکیبی: _{clean_query}_…", parse_mode="Markdown"
         )
 
@@ -6598,7 +6827,7 @@ def unified_search(cid: int, query: str, page=0):
         cache_set(key, combined_results)
 
         if not combined_results:
-            send_message(cid, "❌ نتیجه‌ای یافت نشد.", reply_markup=home_kb())
+            _status(cid, "❌ نتیجه‌ای یافت نشد.", reply_markup=home_kb(), final=True)
             return
 
         text = f"🔍 *جستجوی ترکیبی:* _{clean_query}_ (صفحه {page + 1})"
@@ -6617,7 +6846,7 @@ def do_wiki_search(cid: int, query: str):
         results = wikipedia_search(query, "en")
         lang = "en"
     if not results:
-        send_message(cid, "❌ مقاله‌ای در ویکی‌پدیا یافت نشد.", reply_markup=home_kb())
+        _status(cid, "❌ مقاله‌ای در ویکی‌پدیا یافت نشد.", reply_markup=home_kb(), final=True)
         return
     key = make_cache_key("wk", query, 0)
     cache_set(key, results)
@@ -6630,19 +6859,19 @@ def do_wiki_search(cid: int, query: str):
 def do_wiki_article(cid: int, title: str, lang: str):
     bump(cid, "searches")
     chat_action(cid)
-    send_message(cid, f"⏳ در حال دریافت مقاله _{title}_…", parse_mode="Markdown")
+    _status(cid, f"⏳ در حال دریافت مقاله _{title}_…", parse_mode="Markdown")
     text = wikipedia_article(title, lang)
     if not text and lang == "fa":
         text = wikipedia_article(title, "en")
     if not text:
-        send_message(cid, "❌ مقاله یافت نشد.", reply_markup=home_kb())
+        _status(cid, "❌ مقاله یافت نشد.", reply_markup=home_kb(), final=True)
         return
     send_message(cid, f"📖 *{title}*\n\n{text[:3500]}", parse_mode="Markdown")
     if len(text) > 3500:
         send_document(
             cid, text.encode("utf-8"), f"{title[:40]}.txt", caption="📄 متن کامل مقاله"
         )
-    send_message(cid, "✅", reply_markup=home_kb())
+    _status(cid, "✅", reply_markup=home_kb(), final=True)
     clear_state(cid)
 
 
@@ -6664,7 +6893,7 @@ def do_open_url(cid: int, url: str):
     if not url.startswith("http"):
         url = "https://" + url
     url_key = store_url(url)
-    send_message(cid, f"⏳ در حال گرفتن اسکرین‌شات از:\n{url}")
+    _status(cid, f"⏳ در حال گرفتن اسکرین‌شات از:\n{url}")
     chat_action(cid, "upload_photo")
     ss = screenshot_page(url)
     if ss:
@@ -6689,7 +6918,7 @@ def do_youtube_search_cmd(cid: int, query: str, page=0):
     cache_set(key, results)
     set_state(cid, mode="yt_search", last_query=query, page=page, cache_key=key)
     if not results:
-        send_message(cid, "❌ ویدیویی یافت نشد.", reply_markup=home_kb())
+        _status(cid, "❌ ویدیویی یافت نشد.", reply_markup=home_kb(), final=True)
         return
     text = f"📺 *یوتیوب:* _{query}_\nروی ویدیو کلیک کنید:"
     kb = yt_results_kb(results, key, page, len(results) == 8)
@@ -6700,7 +6929,7 @@ def do_youtube_dl(cid: int, url: str):
     """Entry point for direct YouTube URL download — shows quality picker."""
     bump(cid, "downloads")
     if not ("youtu.be" in url or "youtube.com" in url):
-        send_message(cid, "❌ لینک یوتیوب معتبر وارد کنید.", reply_markup=home_kb())
+        _status(cid, "❌ لینک یوتیوب معتبر وارد کنید.", reply_markup=home_kb(), final=True)
         return
     _youtube_quality_picker(cid, url)
 
@@ -6710,12 +6939,12 @@ def _youtube_quality_picker(cid: int, url: str, audio_only: bool = False):
     
     First sends thumbnail + description, then quality selector with filesize info.
     """
-    send_message(cid, "⏳ در حال بررسی کیفیت‌های موجود…")
+    _status(cid, "⏳ در حال بررسی کیفیت‌های موجود…")
     chat_action(cid)
     info = youtube_get_formats(url)
     if not info:
         # Probe failed — fall back to direct download
-        send_message(cid, "⚠️ بررسی کیفیت ممکن نبود. در حال دانلود با بهترین کیفیت…")
+        _status(cid, "⚠️ بررسی کیفیت ممکن نبود. در حال دانلود با بهترین کیفیت…")
         chat_action(cid, "upload_video")
         result = youtube_download(url, audio_only=audio_only)
         _finish_video(cid, result)
@@ -6927,9 +7156,8 @@ def _youtube_execute_download(
     cached_cid = get_url_chat(url_key)
     target_cid = cached_cid if cached_cid else cid
     if not url:
-        send_message(
-            target_cid, "❌ لینک منقضی شده. دوباره امتحان کنید.", reply_markup=home_kb()
-        )
+        _status(
+            target_cid, "❌ لینک منقضی شده. دوباره امتحان کنید.", reply_markup=home_kb(), final=True)
         return
 
     info_list = cache_get(info_key)
@@ -6938,7 +7166,7 @@ def _youtube_execute_download(
 
     sub_label = f" + زیرنویس ({sub_code})" if sub_code else ""
     label = "🎵 صدا" if audio_only else "📺 ویدیو"
-    send_message(
+    _status(
         target_cid,
         f"⏳ در حال دانلود {label}{sub_label}…\n_(ممکن است چند دقیقه طول بکشد)_",
         parse_mode="Markdown",
@@ -6957,23 +7185,22 @@ def _youtube_execute_download(
 
 def _finish_video(cid: int, result):
     if not result:
-        send_message(
+        _status(
             cid,
             "❌ دانلود ناموفق بود.\n"
             "• ویدیو ممکن است در دسترس نباشد\n"
             "• ویدیوی دیگری امتحان کنید",
             parse_mode="Markdown",
-            reply_markup=home_kb(),
-        )
+            reply_markup=home_kb(), final=True)
         return
     data, fname = result
     fname = Path(fname).name
     size_mb = len(data) / 1024 / 1024
     log.info("_finish_video: %s  %.1fMB", fname, size_mb)
     if smart_send(cid, data, fname, caption="", media_type="video"):
-        send_message(cid, f"✅ ارسال شد ({size_mb:.1f}MB).", reply_markup=home_kb())
+        _status(cid, f"✅ ارسال شد.", reply_markup=home_kb(), final=True)
     else:
-        send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+        _status(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb(), final=True)
     clear_state(cid)
 
 
@@ -7000,16 +7227,15 @@ def do_music(cid: int, query: str):
             return
 
     # جستجو — نمایش نتایج به صورت دکمه
-    send_message(
+    _status(
         cid, f"🔍 در حال جستجو در همه پلتفرم‌ها: _{query}_…", parse_mode="Markdown"
     )
     chat_action(cid)
     results = music_search_multi(query)
 
     if not results:
-        send_message(
-            cid, "❌ نتیجه‌ای یافت نشد. عبارت دیگری امتحان کنید.", reply_markup=home_kb()
-        )
+        _status(
+            cid, "❌ نتیجه‌ای یافت نشد. عبارت دیگری امتحان کنید.", reply_markup=home_kb(), final=True)
         return
 
     key = make_cache_key("mu", query, 0)
@@ -7038,12 +7264,11 @@ def do_music(cid: int, query: str):
         rows.append([{"text": label, "callback_data": f"mu_dl_{key}_{i}"}])
 
     rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
-    send_message(
+    _status(
         cid,
         f"🎵 *نتایج موزیک برای:* _{query}_\nروی آهنگ بزنید تا دانلود شود:",
         parse_mode="Markdown",
-        reply_markup={"inline_keyboard": rows},
-    )
+        reply_markup={"inline_keyboard": rows}, final=True)
 
 
 @_heavy_download
@@ -7057,7 +7282,7 @@ def _do_audio_download(
 ):
     """دانلود صدا از URL یا جستجو با زنجیره fallback کامل."""
     bump(cid, "downloads")
-    send_message(cid, "⏳ در حال دانلود آهنگ…")
+    _status(cid, "⏳ در حال دانلود آهنگ…")
     chat_action(cid, "record_voice")
 
     def _status(text: str):
@@ -7111,22 +7336,21 @@ def _do_audio_download(
             )
 
     if not result:
-        send_message(
+        _status(
             cid,
             "❌ دانلود آهنگ ناموفق بود.\n"
             "• عبارت دیگری جستجو کنید\n"
             "• ممکن است محتوا در همه منابع محدودیت داشته باشد",
-            reply_markup=home_kb(),
-        )
+            reply_markup=home_kb(), final=True)
         return
 
     data, fname = result
     fname = Path(fname).name
     caption = f"🎵 {title or fname[:60]}"
     if smart_send(cid, data, fname, caption=caption, media_type="audio"):
-        send_message(cid, "✅ ارسال شد!", reply_markup=home_kb())
+        _status(cid, "✅ ارسال شد!", reply_markup=home_kb(), final=True)
     else:
-        send_message(cid, "❌ ارسال فایل ناموفق بود.", reply_markup=home_kb())
+        _status(cid, "❌ ارسال فایل ناموفق بود.", reply_markup=home_kb(), final=True)
     clear_state(cid)
 
 
@@ -7147,7 +7371,7 @@ def do_spotify_dl(cid: int, url: str):
         else "محتوا"
     )
 
-    send_message(cid, f"⏳ در حال دانلود {kind} از Spotify…")
+    _status(cid, f"⏳ در حال دانلود {kind} از Spotify…")
     chat_action(cid, "record_voice")
 
     def _status(text: str):
@@ -7162,22 +7386,21 @@ def do_spotify_dl(cid: int, url: str):
         result = spotify_download(url)
 
     if not result:
-        send_message(
+        _status(
             cid,
             "❌ دانلود از Spotify ناموفق بود.\n\n"
             "مطمئن شوید `spotdl` نصب است:\n"
             "`pip install spotdl`",
             parse_mode="Markdown",
-            reply_markup=home_kb(),
-        )
+            reply_markup=home_kb(), final=True)
         return
 
     data, fname = result
     caption = f"🎵 {fname[:60]}"
     if smart_send(cid, data, fname, caption=caption):
-        send_message(cid, "✅ ارسال شد!", reply_markup=home_kb())
+        _status(cid, "✅ ارسال شد!", reply_markup=home_kb(), final=True)
     else:
-        send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+        _status(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb(), final=True)
     clear_state(cid)
 
 
@@ -7193,7 +7416,7 @@ def do_images(cid: int, query: str, source: str, page=0):
         "pexels": "📷 Pixabay",
         "wiki": "🎨 Wikimedia",
     }
-    send_message(
+    _status(
         cid,
         f"⏳ جستجوی عکس [{source_names.get(source, source)}]: _{query}_…",
         parse_mode="Markdown",
@@ -7223,7 +7446,7 @@ def do_images(cid: int, query: str, source: str, page=0):
         cache_key=key,
     )
     if not page_results:
-        send_message(cid, "❌ تصویری یافت نشد.", reply_markup=home_kb())
+        _status(cid, "❌ تصویری یافت نشد.", reply_markup=home_kb(), final=True)
         return
     sent = 0
     for r in page_results[:6]:
@@ -7247,7 +7470,7 @@ def do_images(cid: int, query: str, source: str, page=0):
         except Exception as ex:
             log.error("do_images send: %s", ex, exc_info=True)
     kb = images_more_kb(key, page, source)
-    send_message(cid, f"✅ {sent} عکس ارسال شد.", reply_markup=kb)
+    _status(cid, f"✅ {sent} عکس ارسال شد.", reply_markup=kb, final=True)
 
 
 def do_github_search(cid: int, query: str, page=0):
@@ -7258,7 +7481,7 @@ def do_github_search(cid: int, query: str, page=0):
     cache_set(key, results)
     set_state(cid, mode="gh_search", last_query=query, page=page, cache_key=key)
     if not results:
-        send_message(cid, "❌ مخزنی یافت نشد.", reply_markup=home_kb())
+        _status(cid, "❌ مخزنی یافت نشد.", reply_markup=home_kb(), final=True)
         return
     text = f"🐙 *GitHub:* _{query}_  (صفحه {page + 1})\nروی مخزن کلیک کنید:"
     kb = gh_repo_kb(results, key, page, len(results) == 8)
@@ -7267,17 +7490,17 @@ def do_github_search(cid: int, query: str, page=0):
 
 def do_github_zip(cid: int, url: str):
     bump(cid, "downloads")
-    send_message(cid, "⏳ در حال دانلود ZIP مخزن…")
+    _status(cid, "⏳ در حال دانلود ZIP مخزن…")
     data = github_zip(url)
     if not data:
-        send_message(cid, "❌ دانلود ناموفق.", reply_markup=home_kb())
+        _status(cid, "❌ دانلود ناموفق.", reply_markup=home_kb(), final=True)
         return
     m = re.search(r"github\.com/([^/]+/[^/]+?)(?:\.git|/|$)", url)
     slug = m.group(1).replace("/", "_") if m else "repo"
     if send_document(cid, data, f"{slug}.zip", caption=f"📥 {url[:60]}"):
-        send_message(cid, "✅ ZIP ارسال شد.", reply_markup=home_kb())
+        _status(cid, "✅ ZIP ارسال شد.", reply_markup=home_kb(), final=True)
     else:
-        send_message(cid, "❌ ارسال ناموفق.", reply_markup=home_kb())
+        _status(cid, "❌ ارسال ناموفق.", reply_markup=home_kb(), final=True)
     clear_state(cid)
 
 
@@ -7287,7 +7510,7 @@ def do_github_release(cid: int, repo_full: str, page: int = 0):
     chat_action(cid)
     rel = github_latest_release(repo_full)
     if not rel:
-        send_message(cid, "❌ هیچ Release‌ای یافت نشد.", reply_markup=home_kb())
+        _status(cid, "❌ هیچ Release‌ای یافت نشد.", reply_markup=home_kb(), final=True)
         return
 
     tag = rel.get("tag_name", "")
@@ -7365,17 +7588,17 @@ def do_ocr_photo(cid: int, photos: list, reply_id=None):
     chat_action(cid)
     photo = sorted(photos, key=lambda p: p.get("file_size", 0))[-1]
     if photo.get("file_size", 0) > MAX_OCR_SIZE:
-        send_message(cid, "❌ حجم عکس بیشتر از ۵MB است.")
+        _status(cid, "❌ حجم عکس بیشتر از ۵MB است.", final=True)
         return
     url = get_file_url(photo["file_id"])
     if not url:
-        send_message(cid, "❌ خطا در دریافت فایل.")
+        _status(cid, "❌ خطا در دریافت فایل.", final=True)
         return
     data = download_bytes(url, MAX_OCR_SIZE)
     if not data:
-        send_message(cid, "❌ خطا در دانلود عکس.")
+        _status(cid, "❌ خطا در دانلود عکس.", final=True)
         return
-    send_message(cid, "⏳ در حال پردازش تصویر…")
+    _status(cid, "⏳ در حال پردازش تصویر…")
     extracted = ocr_image(data)
     send_message(
         cid,
@@ -7389,7 +7612,7 @@ def do_ocr_photo(cid: int, photos: list, reply_id=None):
     except Exception as e:
         log.error("ocr_to_pdf: %s", e)
     clear_state(cid)
-    send_message(cid, "✅ OCR انجام شد.", reply_markup=home_kb())
+    _status(cid, "✅ OCR انجام شد.", reply_markup=home_kb(), final=True)
 
 
 def do_translate(cid: int, text: str, lang: str):
@@ -7409,12 +7632,11 @@ def do_currency(cid: int, text: str):
         re.IGNORECASE,
     )
     if not m:
-        send_message(
+        _status(
             cid,
             "❌ فرمت اشتباه. مثال: `100 USD to IRR`",
             parse_mode="Markdown",
-            reply_markup=home_kb(),
-        )
+            reply_markup=home_kb(), final=True)
         return
     amount, frm, to = m.groups()
     amount = float(amount.replace(",", ""))
@@ -7456,7 +7678,7 @@ def do_paste(cid: int, text: str):
     if url:
         send_message(cid, f"📋 آپلود شد:\n{url}", reply_markup=home_kb())
     else:
-        send_message(cid, "❌ خطا در آپلود.", reply_markup=home_kb())
+        _status(cid, "❌ خطا در آپلود.", reply_markup=home_kb(), final=True)
     clear_state(cid)
 
 
@@ -7466,8 +7688,8 @@ def do_qr(cid: int, text: str):
     if qr:
         send_photo(cid, qr, caption=f"📱 QR: {text[:60]}")
     else:
-        send_message(cid, "❌ خطا در ساخت QR.")
-    send_message(cid, "✅", reply_markup=home_kb())
+        _status(cid, "❌ خطا در ساخت QR.", final=True)
+    _status(cid, "✅", reply_markup=home_kb(), final=True)
     clear_state(cid)
 
 
@@ -7479,7 +7701,7 @@ def do_qr(cid: int, text: str):
 def do_book_search(cid: int, query: str, extensions: list = None):
     """Search Library Genesis and show results as buttons."""
     bump(cid, "searches")
-    send_message(
+    _status(
         cid, f"⏳ در حال جستجو در Library Genesis: _{query}_…", parse_mode="Markdown"
     )
     chat_action(cid)
@@ -7487,9 +7709,8 @@ def do_book_search(cid: int, query: str, extensions: list = None):
 
     if not results:
         log.warning("do_book_search: no results for %r", query)
-        send_message(
-            cid, "❌ نتیجه‌ای یافت نشد. کلمات دیگری امتحان کنید.", reply_markup=home_kb()
-        )
+        _status(
+            cid, "❌ نتیجه‌ای یافت نشد. کلمات دیگری امتحان کنید.", reply_markup=home_kb(), final=True)
         return
 
     key = make_cache_key("zl", query, 0)
@@ -7515,7 +7736,13 @@ def do_book_show_book(cid: int, book: dict):
     rating = book.get("rating", "")
     url = book.get("url", "")
 
-    # ارسال کاور کتاب
+    # کاور: row -> libgen page -> Google Books
+    if not cover and book.get("md5"):
+        cover = _libgen_cover_url(book["md5"])
+    if not cover:
+        _a0 = (authors or [""])[0]
+        _a0 = _a0["author"] if isinstance(_a0, dict) else str(_a0)
+        cover = _gbooks_cover(name, _a0)
     if cover:
         try:
             img_bytes = download_bytes(cover, MAX_IMAGE_SIZE)
@@ -7603,11 +7830,10 @@ def do_book_download(cid: int, md5_ext: str):
     # Validate: md5 must be 32 hex chars
     if not re.fullmatch(r"[a-f0-9]{32}", md5):
         log.error("do_book_download: invalid md5_ext=%r", md5_ext)
-        send_message(
+        _status(
             cid,
             "❌ اطلاعات دانلود نامعتبر است. دوباره جستجو کنید.",
-            reply_markup=home_kb(),
-        )
+            reply_markup=home_kb(), final=True)
         return
 
     # Try to get title from cache for a nicer filename
@@ -7623,7 +7849,7 @@ def do_book_download(cid: int, md5_ext: str):
     except Exception:
         pass
 
-    send_message(
+    _status(
         cid,
         "⏳ در حال دانلود کتاب از Library Genesis…\n_(ممکن است چند ثانیه طول بکشد)_",
         parse_mode="Markdown",
@@ -7632,17 +7858,16 @@ def do_book_download(cid: int, md5_ext: str):
     result = libgen_download(md5, title=title, ext=ext)
     if not result:
         log.error("do_book_download: failed md5=%s", md5)
-        send_message(
-            cid, "❌ دانلود ناموفق بود. دوباره امتحان کنید.", reply_markup=home_kb()
-        )
+        _status(
+            cid, "❌ دانلود ناموفق بود. دوباره امتحان کنید.", reply_markup=home_kb(), final=True)
         return
 
     data, fname = result
     log.info("libgen: sending %s  %.1fMB", fname, len(data) / 1024 / 1024)
     if smart_send(cid, data, fname, caption=f"📚 {fname[:80]}"):
-        send_message(cid, "✅ کتاب ارسال شد.", reply_markup=home_kb())
+        _status(cid, "✅ کتاب ارسال شد.", reply_markup=home_kb(), final=True)
     else:
-        send_message(cid, "❌ ارسال فایل ناموفق بود.", reply_markup=home_kb())
+        _status(cid, "❌ ارسال فایل ناموفق بود.", reply_markup=home_kb(), final=True)
     clear_state(cid)
 
 
@@ -8053,7 +8278,7 @@ def _scihub_download(
 def do_paper_search(cid: int, query: str):
     """جستجوی مقاله علمی via Semantic Scholar + دانلود از Sci-Hub."""
     bump(cid, "searches")
-    send_message(cid, f"⏳ در حال جستجوی مقاله: _{query}_…", parse_mode="Markdown")
+    _status(cid, f"⏳ در حال جستجوی مقاله: _{query}_…", parse_mode="Markdown")
     chat_action(cid)
 
     sess = _libgen_session()
@@ -8066,11 +8291,10 @@ def do_paper_search(cid: int, query: str):
 
     results = _scholar_search(query, sess)
     if not results:
-        send_message(
+        _status(
             cid,
             "❌ مقاله‌ای یافت نشد. DOI یا عنوان دقیق‌تری امتحان کنید.",
-            reply_markup=home_kb(),
-        )
+            reply_markup=home_kb(), final=True)
         return
 
     key = make_cache_key("art", query, 0)
@@ -8083,14 +8307,13 @@ def do_paper_search(cid: int, query: str):
         rows.append([{"text": label, "callback_data": f"paper_item_{key}_{i}"}])
     rows.append([{"text": "🏠 خانه", "callback_data": "home"}])
     kb = {"inline_keyboard": rows}
-    send_message(
+    _status(
         cid,
         f"📄 *نتایج Semantic Scholar:* _{query}_\nروی مقاله کلیک کنید:",
         parse_mode="Markdown",
-        reply_markup=kb,
-    )
+        reply_markup=kb, final=True)
 
-def _oa_pdf(doi: str, sess) -> Optional[tuple[bytes, str]]:
+def _oa_pdf(doi: str, sess, on_step=None) -> Optional[tuple[bytes, str]]:
     """Try every free OA source for a DOI. Returns (pdf_bytes, source_name)."""
     clean = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi).strip().rstrip(".,)")
     hdrs = {"User-Agent": UA_DESK}
@@ -8108,6 +8331,8 @@ def _oa_pdf(doi: str, sess) -> Optional[tuple[bytes, str]]:
         return None
 
     # 1) Unpaywall
+    if on_step:
+        on_step("Unpaywall")
     try:
         up = sess.get(f"https://api.unpaywall.org/v2/{clean}",
                       params={"email": UNPAYWALL_EMAIL}, timeout=12)
@@ -8120,6 +8345,8 @@ def _oa_pdf(doi: str, sess) -> Optional[tuple[bytes, str]]:
         log.debug("_oa_pdf unpaywall: %s", e)
 
     # 2) OpenAlex
+    if on_step:
+        on_step("OpenAlex")
     try:
         oa = sess.get(f"https://api.openalex.org/works/https://doi.org/{clean}", timeout=12)
         if oa.status_code == 200:
@@ -8132,6 +8359,8 @@ def _oa_pdf(doi: str, sess) -> Optional[tuple[bytes, str]]:
         log.debug("_oa_pdf openalex: %s", e)
 
     # 3) Semantic Scholar
+    if on_step:
+        on_step("Semantic Scholar")
     try:
         s2 = sess.get(f"https://api.semanticscholar.org/graph/v1/paper/DOI:{clean}",
                       params={"fields": "openAccessPdf"}, timeout=12)
@@ -8143,6 +8372,8 @@ def _oa_pdf(doi: str, sess) -> Optional[tuple[bytes, str]]:
         log.debug("_oa_pdf s2: %s", e)
 
     # 4) Europe PMC (PMC full-text PDF)
+    if on_step:
+        on_step("Europe PMC")
     try:
         ep = sess.get("https://www.ebi.ac.uk/europepmc/webservices/rest/search",
                       params={"query": f"DOI:{clean}", "format": "json", "resultType": "core"}, timeout=12)
@@ -8160,92 +8391,89 @@ def _oa_pdf(doi: str, sess) -> Optional[tuple[bytes, str]]:
 
 
 def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
-    """Download paper by DOI. OA sources -> Sci-Hub (WARP) -> LibGen scimag."""
+    """Download a paper by DOI with a LIVE progress message.
+    Order: Open-Access sources -> Anna's SciDB -> Sci-Hub -> LibGen scimag."""
     if sess is None:
         sess = _libgen_session()
-    send_message(cid, f"⏳ در حال دانلود مقاله…\n`{doi[:60]}`", parse_mode="Markdown")
     chat_action(cid, "upload_document")
-
     safe_title = re.sub(r"[^\w\-]", "_", title or doi)[:60]
-    fname = f"{safe_title}.pdf"
+    fname = safe_title + ".pdf"
     clean_doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi).strip().rstrip(".,)")
 
-    # ── Strategy 1: Open Access (Unpaywall/OpenAlex/Semantic Scholar/Europe PMC)
-    oa = _oa_pdf(doi, sess)
-    if oa:
-        data, src = oa
-        if smart_send(cid, data, fname, caption=f"📄 {title or doi}"):
-            send_message(cid, f"✅ مقاله ارسال شد (Open Access – {src}).", reply_markup=home_kb())
+    warp = "WARP \u2705" if WARP_PROXY else "\u26a0\ufe0f WARP off"
+    prog = Progress(cid, title="\U0001F50E \u062f\u0627\u0646\u0644\u0648\u062f \u0645\u0642\u0627\u0644\u0647  (" + warp + ")", total_steps=8)
+
+    def _deliver(data, f, src):
+        prog.finish("\u06cc\u0627\u0641\u062a \u0634\u062f \u062f\u0631 " + src + " \u2014 \u0627\u0631\u0633\u0627\u0644\u2026", ok=True)
+        if smart_send(cid, data, f, caption="\U0001F4C4 " + (title or doi)):
+            send_message(cid, "\u2705 \u0645\u0642\u0627\u0644\u0647 \u0627\u0631\u0633\u0627\u0644 \u0634\u062f (" + src + ").", reply_markup=home_kb())
         else:
-            send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+            send_message(cid, "\u274c \u0627\u0631\u0633\u0627\u0644 \u0646\u0627\u0645\u0648\u0641\u0642 \u0628\u0648\u062f.", reply_markup=home_kb())
         clear_state(cid)
+
+    # 1) Open Access (multi-source; each reported live)
+    oa = _oa_pdf(doi, sess, on_step=lambda nm: prog.step("\u0628\u0631\u0631\u0633\u06cc " + nm + "\u2026"))
+    if oa:
+        _deliver(oa[0], fname, "Open Access \u2013 " + oa[1])
         return
 
-    # ── Strategy 2: Sci-Hub (route through WARP if configured to dodge DNS blocks)
+    # 2) Anna's Archive SciDB (Sci-Hub mirror; needs WARP)
+    prog.step("\u0628\u0631\u0631\u0633\u06cc Anna's Archive SciDB\u2026")
+    res = _annas_scidb(doi, sess)
+    if res:
+        _deliver(res[0], fname, res[1])
+        return
+
+    # 3) Sci-Hub mirrors (through WARP)
+    prog.step("\u0628\u0631\u0631\u0633\u06cc Sci-Hub\u2026")
     scihub_sess = _get_web(use_warp=True) if WARP_PROXY else sess
     result = _scihub_download(doi, scihub_sess)
     if result:
-        data, f = result
-        if smart_send(cid, data, f, caption=f"📄 {title or doi}"):
-            send_message(cid, "✅ مقاله ارسال شد (Sci-Hub).", reply_markup=home_kb())
-        else:
-            send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
-        clear_state(cid)
+        _deliver(result[0], result[1], "Sci-Hub")
         return
 
-    # ── Strategy 3: LibGen scimag (search by DOI → md5 → download)
+    # 4) LibGen scimag (DOI -> md5 -> download)
+    prog.step("\u0628\u0631\u0631\u0633\u06cc LibGen\u2026")
     try:
         for mirror in LIBGEN_MIRRORS:
             for params in [{"object": "f", "topic": "a", "doi": clean_doi},
-                           {"req": clean_doi}, {"req": doi}]:
+                           {"req": clean_doi}]:
                 try:
-                    r = sess.get(f"{mirror}/json.php", params=params,
-                                 headers={"User-Agent": UA_DESK}, timeout=15)
+                    r = sess.get(mirror + "/json.php", params=params,
+                                 headers={"User-Agent": UA_DESK}, timeout=(6, 15))
                     if r.status_code != 200 or len(r.content) < 5:
                         continue
                     md5 = ""
                     try:
-                        jdata = r.json()
-                        items = (list(jdata.values()) if isinstance(jdata, dict)
-                                 else (jdata if isinstance(jdata, list) else []))
-                        for item in items:
-                            if isinstance(item, dict) and item.get("md5"):
-                                md5 = str(item["md5"]).lower().strip()
+                        jd = r.json()
+                        items = (list(jd.values()) if isinstance(jd, dict)
+                                 else (jd if isinstance(jd, list) else []))
+                        for it in items:
+                            if isinstance(it, dict) and it.get("md5"):
+                                md5 = str(it["md5"]).lower().strip()
                                 break
-                    except Exception as je:
-                        log.debug("paper libgen json parse: %s", je)
+                    except Exception:
+                        pass
                     if not md5:
                         continue
-                    ads = sess.get(f"{mirror}/ads.php?md5={md5}",
-                                   headers={"User-Agent": UA_DESK}, timeout=15)
-                    if ads.status_code == 200 and len(ads.content) > 500:
-                        soup = BeautifulSoup(ads.text, "html.parser")
-                        dl_a = (soup.select_one("a[href*='get.php']")
-                                or soup.select_one("a[href*='download']"))
-                        if dl_a:
-                            href = dl_a.get("href", "")
-                            dl_url = href if href.startswith("http") else f"{mirror}{href}"
-                            resp = sess.get(dl_url, headers={"User-Agent": UA_DESK, "Referer": f"{mirror}/"},
-                                            timeout=90, allow_redirects=True)
-                            if resp.status_code == 200 and len(resp.content) > 5000:
-                                if smart_send(cid, resp.content, fname, caption=f"📄 {title or doi}"):
-                                    send_message(cid, "✅ مقاله ارسال شد (LibGen).", reply_markup=home_kb())
-                                    clear_state(cid)
-                                    return
+                    got = libgen_download(md5, title=(title or doi)[:60], ext="pdf")
+                    if got:
+                        _deliver(got[0], got[1], "LibGen")
+                        return
                 except Exception as pe:
                     log.debug("paper libgen attempt: %s", pe)
     except Exception as e:
         log.warning("paper libgen: %s", e)
 
-    # ── Final: honest coverage message
+    # Nothing worked
+    prog.finish("\u062f\u0631 \u0647\u06cc\u0686 \u0645\u0646\u0628\u0639\u06cc \u06cc\u0627\u0641\u062a \u0646\u0634\u062f.", ok=False)
+    tail = "" if WARP_PROXY else "\u26a0\ufe0f WARP \u0641\u0639\u0627\u0644 \u0646\u06cc\u0633\u062a \u2014 Sci-Hub/Anna's \u0645\u0633\u062f\u0648\u062f \u0627\u0633\u062a.\n"
     send_message(
         cid,
-        "❌ این مقاله در دسترس نبود.\n\n"
-        "ℹ️ راهنما: ربات می‌تواند مقالات زیر را بدهد:\n"
-        "• مقالات Open Access (Unpaywall / OpenAlex / Semantic Scholar / Europe PMC)\n"
-        "• مقالات موجود در Sci-Hub / LibGen\n\n"
-        "مقالات پولی جدید (که در Sci-Hub نیستند) قابل دریافت نیستند.\n"
-        f"🔗 DOI: `{doi}`",
+        "\u274c \u0627\u06cc\u0646 \u0645\u0642\u0627\u0644\u0647 \u062f\u0631 \u062f\u0633\u062a\u0631\u0633 \u0646\u0628\u0648\u062f.\n\n"
+        "\u2139\ufe0f \u0645\u0646\u0627\u0628\u0639: Open Access (Unpaywall/OpenAlex/S2/Europe PMC) + Anna's SciDB + Sci-Hub + LibGen.\n"
+        + tail
+        + "\U0001F517 DOI: `" + doi + "`",
         parse_mode="Markdown", reply_markup=home_kb(),
     )
     clear_state(cid)
@@ -8254,31 +8482,29 @@ def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
 def do_apk_search(cid: int, query: str):
     """Search Google Play and show results as clickable buttons."""
     bump(cid, "searches")
-    send_message(
+    _status(
         cid, f"🔍 در حال جستجو در Google Play: _{query}_…", parse_mode="Markdown"
     )
     chat_action(cid)
     results = gplay_search(query, n_hits=8)
     if not results:
-        send_message(
+        _status(
             cid,
             "❌ اپلیکیشنی یافت نشد.\n"
             "• نام پکیج را امتحان کنید (مثل `org.telegram.messenger`)\n"
             "• اپ ممکن است در منطقه شما در دسترس نباشد",
             parse_mode="Markdown",
-            reply_markup=home_kb(),
-        )
+            reply_markup=home_kb(), final=True)
         return
     key = make_cache_key("apk", query, 0)
     cache_set(key, results)
     set_state(cid, mode="apk", last_query=query, cache_key=key)
     kb = apk_results_kb(results, key)
-    send_message(
+    _status(
         cid,
         f"📱 *نتایج Google Play برای:* _{query}_\nبرای جزئیات روی اپ کلیک کنید:",
         parse_mode="Markdown",
-        reply_markup=kb,
-    )
+        reply_markup=kb, final=True)
 
 
 def do_apk_show(cid: int, app: dict):
@@ -8341,7 +8567,7 @@ def do_apk_download(cid: int, app_id: str):
     size = info.get("size", "") if info else ""
     size_hint = f" (~{size})" if size else ""
 
-    send_message(
+    _status(
         cid,
         f"⏳ در حال دانلود APK: *{name}*{size_hint}\n"
         f"`{app_id}`\n\n"
@@ -8352,7 +8578,7 @@ def do_apk_download(cid: int, app_id: str):
 
     result = apk_download(app_id)
     if not result:
-        send_message(
+        _status(
             cid,
             "❌ دانلود APK ناموفق بود.\n\n"
             "دلایل احتمالی:\n"
@@ -8361,8 +8587,7 @@ def do_apk_download(cid: int, app_id: str):
             "• اپ پولی است (فقط اپ‌های رایگان پشتیبانی می‌شوند)\n\n"
             f"دانلود دستی: https://apkpure.com/{app_id}/{app_id}",
             parse_mode="Markdown",
-            reply_markup=home_kb(),
-        )
+            reply_markup=home_kb(), final=True)
         return
 
     data, fname = result
@@ -8370,15 +8595,14 @@ def do_apk_download(cid: int, app_id: str):
     log.info("APK: sending %s %.1fMB", fname, size_mb)
 
     if smart_send(cid, data, fname, caption=f"📱 {name} — {fname}"):
-        send_message(
+        _status(
             cid,
             f"✅ APK ارسال شد! ({size_mb:.1f}MB)\n\n"
             "⚠️ *نکته:* گزینه «نصب از منابع ناشناس» را در تنظیمات اندروید فعال کنید.",
             parse_mode="Markdown",
-            reply_markup=home_kb(),
-        )
+            reply_markup=home_kb(), final=True)
     else:
-        send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+        _status(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb(), final=True)
     clear_state(cid)
 
 
@@ -8390,7 +8614,7 @@ def do_rss(cid: int, query: str):
     if query.startswith("http"):
         # Direct RSS URL or website URL → auto-discover
         if not any(x in query for x in ["rss", "feed", "atom", "xml"]):
-            send_message(cid, "🔍 در حال جستجوی RSS در سایت…")
+            _status(cid, "🔍 در حال جستجوی RSS در سایت…")
             feeds = rss_search_feeds(query)
             if not feeds:
                 # Try the URL itself as a feed
@@ -8415,15 +8639,14 @@ def do_rss(cid: int, query: str):
             query = feeds[0]
 
         # Fetch the feed
-        send_message(cid, f"⏳ در حال دریافت فید RSS…")
+        _status(cid, f"⏳ در حال دریافت فید RSS…")
         items = rss_fetch(query, 15)
         if not items:
-            send_message(
+            _status(
                 cid,
                 "❌ فید یافت نشد یا معتبر نیست.\n"
                 "آدرس فید RSS را مستقیم وارد کنید (مثال: https://example.com/rss)",
-                reply_markup=home_kb(),
-            )
+                reply_markup=home_kb(), final=True)
             return
         key = make_cache_key("rss", query, 0)
         cache_set(key, items)
@@ -8496,7 +8719,7 @@ def do_tg_read(cid: int, channel: str, use_mtproto: bool = False):
     """Read Telegram channel messages and show as clickable buttons."""
     bump(cid, "searches")
     channel = channel.strip().lstrip("@")
-    send_message(cid, f"⏳ در حال دریافت پیام‌های @{channel}…")
+    _status(cid, f"⏳ در حال دریافت پیام‌های @{channel}…")
     chat_action(cid)
 
     if use_mtproto and TG_API_ID and TG_API_HASH:
@@ -8510,23 +8733,21 @@ def do_tg_read(cid: int, channel: str, use_mtproto: bool = False):
             log.error("MTProto loop: %s", e)
             messages = []
         if not messages:
-            send_message(
+            _status(
                 cid,
                 "❌ MTProto ناموفق بود.\n"
                 "مطمئن شوید TG_API_ID و TG_API_HASH تنظیم شده‌اند.",
-                reply_markup=home_kb(),
-            )
+                reply_markup=home_kb(), final=True)
             return
     else:
         messages = tg_channel_read_web(channel, 20)
         if not messages:
-            send_message(
+            _status(
                 cid,
                 "❌ پیامی یافت نشد.\n"
                 "• کانال باید عمومی باشد\n"
                 "• نام کانال را بررسی کنید (بدون @)",
-                reply_markup=home_kb(),
-            )
+                reply_markup=home_kb(), final=True)
             return
 
     key = make_cache_key("tg", channel, 0)
@@ -8587,25 +8808,24 @@ def do_tg_show_message(cid: int, msg_data: dict):
             reply_markup=home_kb(),
         )
     else:
-        send_message(cid, "✅", reply_markup=home_kb())
+        _status(cid, "✅", reply_markup=home_kb(), final=True)
 
 
 def do_tg_dl_media(cid: int, msg_url: str):
     """Download media from a Telegram message URL."""
     bump(cid, "downloads")
-    send_message(cid, f"⏳ در حال دانلود رسانه از:\n{msg_url}")
+    _status(cid, f"⏳ در حال دانلود رسانه از:\n{msg_url}")
     chat_action(cid, "upload_document")
     result = tg_download_media_web(msg_url)
     if not result:
-        send_message(
+        _status(
             cid,
             "❌ دانلود ناموفق بود — این پیام ممکن است رسانه نداشته باشد.",
-            reply_markup=home_kb(),
-        )
+            reply_markup=home_kb(), final=True)
         return
     data, fname = result
     smart_send(cid, data, fname, caption=f"✈️ {fname[:60]}")
-    send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
+    _status(cid, "✅ ارسال شد.", reply_markup=home_kb(), final=True)
     clear_state(cid)
 
 
@@ -8613,17 +8833,16 @@ def do_twitter_timeline(cid: int, username: str):
     """Fetch and display Twitter/X user timeline via Nitter."""
     bump(cid, "searches")
     username = username.strip().lstrip("@")
-    send_message(cid, f"⏳ در حال دریافت توییت‌های @{username}…")
+    _status(cid, f"⏳ در حال دریافت توییت‌های @{username}…")
     chat_action(cid)
     tweets = twitter_get_channel(username, 20)
     if not tweets:
-        send_message(
+        _status(
             cid,
             "❌ توییتی یافت نشد.\n"
             "• ممکن است Nitter instances در دسترس نباشند\n"
             "• نام کاربری را بررسی کنید",
-            reply_markup=home_kb(),
-        )
+            reply_markup=home_kb(), final=True)
         return
     key = make_cache_key("tw", username, 0)
     cache_set(key, tweets)
@@ -8668,7 +8887,7 @@ def do_twitter_show(cid: int, tweet: dict):
     if has_vid or not img_urls:
         send_message(cid, "📥 دانلود ویدیو؟", reply_markup=kb)
     else:
-        send_message(cid, "✅", reply_markup=home_kb())
+        _status(cid, "✅", reply_markup=home_kb(), final=True)
 
 
 def _fetch_tweet_data(tweet_url: str) -> dict:
@@ -9075,7 +9294,7 @@ def _render_tweet_card(tw: dict, tweet_url: str) -> Optional[bytes]:
 def do_twitter_dl(cid: int, url: str, _tw_data_override: dict = None):
     """Download ALL media from a tweet, send tweet card + media group + caption."""
     bump(cid, "downloads")
-    send_message(cid, "⏳ در حال دانلود از توییت…")
+    _status(cid, "⏳ در حال دانلود از توییت…")
     chat_action(cid, "upload_video")
 
     tw_data = _tw_data_override or _fetch_tweet_data(url)
@@ -9095,11 +9314,10 @@ def do_twitter_dl(cid: int, url: str, _tw_data_override: dict = None):
 
     if not results:
         if not card_bytes:
-            send_message(
+            _status(
                 cid,
                 "❌ این توییت رسانه‌ای ندارد یا دانلود ناموفق بود.",
-                reply_markup=home_kb(),
-            )
+                reply_markup=home_kb(), final=True)
         else:
             if caption:
                 if original_text:
@@ -9113,7 +9331,7 @@ def do_twitter_dl(cid: int, url: str, _tw_data_override: dict = None):
                     )
                 else:
                     send_message(cid, caption[:4096])
-            send_message(cid, "✅ توییت ارسال شد.", reply_markup=home_kb())
+            _status(cid, "✅ توییت ارسال شد.", reply_markup=home_kb(), final=True)
         clear_state(cid)
         return
 
@@ -9142,7 +9360,7 @@ def do_twitter_dl(cid: int, url: str, _tw_data_override: dict = None):
     elif caption and (len(results) > 1 or len(caption) > BALE_CAPTION_LIMIT):
         send_message(cid, caption[:4096])
 
-    send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
+    _status(cid, "✅ ارسال شد.", reply_markup=home_kb(), final=True)
     clear_state(cid)
 
 
@@ -9150,17 +9368,16 @@ def do_instagram_profile(cid: int, username: str):
     """Fetch and display Instagram profile posts."""
     bump(cid, "searches")
     username = username.strip().lstrip("@")
-    send_message(cid, f"⏳ در حال دریافت پست‌های @{username}…")
+    _status(cid, f"⏳ در حال دریافت پست‌های @{username}…")
     chat_action(cid)
     posts = instagram_get_profile(username)
     if not posts:
-        send_message(
+        _status(
             cid,
             "❌ پستی یافت نشد.\n"
             "• پروفایل باید عمومی باشد\n"
             "• برای پروفایل‌های خصوصی INSTAGRAM_USER/PASS تنظیم کنید",
-            reply_markup=home_kb(),
-        )
+            reply_markup=home_kb(), final=True)
         return
     key = make_cache_key("ig", username, 0)
     cache_set(key, posts)
@@ -9215,20 +9432,19 @@ def _fetch_instagram_caption(url: str) -> str:
 def do_instagram_dl(cid: int, url: str):
     """دانلود تمام رسانه‌های یک پست اینستاگرام (تکی / کاروسل / ریل) با کپشن کامل."""
     bump(cid, "downloads")
-    send_message(cid, "⏳ در حال دانلود از اینستاگرام…")
+    _status(cid, "⏳ در حال دانلود از اینستاگرام…")
     chat_action(cid, "upload_video")
 
     items = instagram_download_all(url)
     items = [it for it in items if it.get("data") and len(it["data"]) > 5000]
 
     if not items:
-        send_message(
+        _status(
             cid,
             "❌ دانلود ناموفق بود.\n"
             "• پست باید عمومی باشد\n"
             "• برای پست‌های خصوصی INSTAGRAM_USER/PASS را تنظیم کنید",
-            reply_markup=home_kb(),
-        )
+            reply_markup=home_kb(), final=True)
         return
 
     # Caption priority: instaloader → oEmbed → state
@@ -9288,7 +9504,7 @@ def do_instagram_dl(cid: int, url: str):
         if caption and len(caption) > BALE_CAPTION_LIMIT:
             send_message(cid, caption[:4096])
 
-    send_message(cid, f"✅ {total} مورد ارسال شد.", reply_markup=home_kb())
+    _status(cid, f"✅ {total} مورد ارسال شد.", reply_markup=home_kb(), final=True)
     clear_state(cid)
 
 
@@ -9296,17 +9512,16 @@ def do_tiktok_user(cid: int, username: str):
     """Fetch TikTok user video list."""
     bump(cid, "searches")
     username = username.strip().lstrip("@")
-    send_message(cid, f"⏳ در حال دریافت ویدیوهای @{username}…")
+    _status(cid, f"⏳ در حال دریافت ویدیوهای @{username}…")
     chat_action(cid)
     videos = tiktok_user_videos(username, 10)
     if not videos:
-        send_message(
+        _status(
             cid,
             "❌ ویدیویی یافت نشد.\n"
             "• نام کاربری را بررسی کنید\n"
             "• پروفایل باید عمومی باشد",
-            reply_markup=home_kb(),
-        )
+            reply_markup=home_kb(), final=True)
         return
     key = make_cache_key("tt", username, 0)
     cache_set(key, videos)
@@ -9346,11 +9561,11 @@ def _fetch_tiktok_caption(url: str) -> str:
 def do_tiktok_dl(cid: int, url: str):
     """دانلود ویدیوی TikTok با کپشن کامل."""
     bump(cid, "downloads")
-    send_message(cid, "⏳ در حال دانلود از TikTok…")
+    _status(cid, "⏳ در حال دانلود از TikTok…")
     chat_action(cid, "upload_video")
     result = tiktok_download(url)
     if not result:
-        send_message(cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb())
+        _status(cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb(), final=True)
         return
     data, fname = result
 
@@ -9364,7 +9579,7 @@ def do_tiktok_dl(cid: int, url: str):
     smart_send(cid, data, fname, caption=inline_cap)
     if caption and not inline_cap:
         send_message(cid, caption[:4096])
-    send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
+    _status(cid, "✅ ارسال شد.", reply_markup=home_kb(), final=True)
     clear_state(cid)
 
 
@@ -9560,7 +9775,7 @@ def do_virusscan(cid: int, data: bytes, filename: str):
         return
 
     size_mb = len(data) / 1024 / 1024
-    send_message(
+    _status(
         cid,
         f"🔍 در حال آپلود `{filename}` ({size_mb:.1f}MB) به VirusTotal…\n"
         "ممکن است تا ۶۰ ثانیه طول بکشد.",
@@ -9570,7 +9785,7 @@ def do_virusscan(cid: int, data: bytes, filename: str):
 
     result = virustotal_scan_file(data, filename)
     if result is None:
-        send_message(cid, "❌ خطا در ارتباط با VirusTotal.", reply_markup=home_kb())
+        _status(cid, "❌ خطا در ارتباط با VirusTotal.", reply_markup=home_kb(), final=True)
         return
 
     msg = _format_vt_result(result, filename)
@@ -9585,11 +9800,11 @@ def do_virusscan_url(cid: int, url: str):
             cid, "⚠️ کلید API VirusTotal تنظیم نشده است.", reply_markup=home_kb()
         )
         return
-    send_message(cid, f"🔍 در حال بررسی آدرس در VirusTotal…")
+    _status(cid, f"🔍 در حال بررسی آدرس در VirusTotal…")
     chat_action(cid, "typing")
     result = virustotal_scan_url(url)
     if result is None:
-        send_message(cid, "❌ خطا در ارتباط با VirusTotal.", reply_markup=home_kb())
+        _status(cid, "❌ خطا در ارتباط با VirusTotal.", reply_markup=home_kb(), final=True)
         return
     msg = _format_vt_result(result, url)
     send_message(cid, msg, parse_mode="Markdown", reply_markup=home_kb())
@@ -9604,7 +9819,7 @@ def do_virusscan_url(cid: int, url: str):
 def do_youtube_thumbnail(cid: int, url: str):
     """Download and send YouTube video thumbnail at highest available resolution."""
     bump(cid, "downloads")
-    send_message(cid, "⏳ در حال دریافت کاور ویدیو…")
+    _status(cid, "⏳ در حال دریافت کاور ویدیو…")
     # yt-dlp --dump-json to get thumbnail URL, then try maxresdefault → hqdefault
     try:
         r = subprocess.run(
@@ -9635,17 +9850,17 @@ def do_youtube_thumbnail(cid: int, url: str):
                 if data and len(data) > 5000:
                     fname = f"thumbnail_{vid_id or 'yt'}.jpg"
                     send_photo(cid, data, caption=f"🖼 {title}")
-                    send_message(cid, "✅ کاور ارسال شد.", reply_markup=home_kb())
+                    _status(cid, "✅ کاور ارسال شد.", reply_markup=home_kb(), final=True)
                     return
     except Exception as e:
         log.error("do_youtube_thumbnail: %s", e)
-    send_message(cid, "❌ دریافت کاور ناموفق بود.", reply_markup=home_kb())
+    _status(cid, "❌ دریافت کاور ناموفق بود.", reply_markup=home_kb(), final=True)
 
 
 def do_youtube_stats(cid: int, url: str):
     """Fetch YouTube video stats (views, likes, description) and send as a card."""
     bump(cid, "searches")
-    send_message(cid, "⏳ در حال دریافت آمار ویدیو…")
+    _status(cid, "⏳ در حال دریافت آمار ویدیو…")
     try:
         r = subprocess.run(
             [YTDLP_BIN, "--no-warnings", "--dump-json", "--no-playlist", url],
@@ -9654,7 +9869,7 @@ def do_youtube_stats(cid: int, url: str):
             timeout=25,
         )
         if r.returncode != 0:
-            send_message(cid, "❌ دریافت اطلاعات ناموفق بود.", reply_markup=home_kb())
+            _status(cid, "❌ دریافت اطلاعات ناموفق بود.", reply_markup=home_kb(), final=True)
             return
         import json as _j
 
@@ -9710,7 +9925,7 @@ def do_youtube_stats(cid: int, url: str):
         send_message(cid, text, parse_mode="Markdown", reply_markup=home_kb())
     except Exception as e:
         log.error("do_youtube_stats: %s", e)
-        send_message(cid, "❌ دریافت آمار ناموفق بود.", reply_markup=home_kb())
+        _status(cid, "❌ دریافت آمار ناموفق بود.", reply_markup=home_kb(), final=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9867,7 +10082,7 @@ def do_instagram_profile_pic(cid: int, username: str):
     """Download and send Instagram profile picture at full size."""
     bump(cid, "downloads")
     username = username.strip().lstrip("@")
-    send_message(cid, f"⏳ در حال دریافت عکس پروفایل @{username}…")
+    _status(cid, f"⏳ در حال دریافت عکس پروفایل @{username}…")
 
     # Try public API first
     user = _ig_fetch_user_info(username)
@@ -9891,10 +10106,10 @@ def do_instagram_profile_pic(cid: int, username: str):
         data = download_bytes(pic_url, MAX_IMAGE_SIZE)
         if data and len(data) > 1000:
             send_photo(cid, data, caption=f"🖼 تصویر پروفایل @{username}")
-            send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
+            _status(cid, "✅ ارسال شد.", reply_markup=home_kb(), final=True)
             return
 
-    send_message(cid, "❌ دریافت عکس پروفایل ناموفق بود.", reply_markup=home_kb())
+    _status(cid, "❌ دریافت عکس پروفایل ناموفق بود.", reply_markup=home_kb(), final=True)
 
 
 def do_instagram_profile_screenshot(cid: int, username: str):
@@ -9905,7 +10120,7 @@ def do_instagram_profile_screenshot(cid: int, username: str):
     """
     bump(cid, "downloads")
     username = username.strip().lstrip("@")
-    send_message(cid, f"⏳ در حال ساخت اسکرین‌شات پروفایل @{username}…")
+    _status(cid, f"⏳ در حال ساخت اسکرین‌شات پروفایل @{username}…")
     try:
         import textwrap as _tw
         from io import BytesIO as _BIO
@@ -9936,11 +10151,10 @@ def do_instagram_profile_screenshot(cid: int, username: str):
                 log.error("do_instagram_profile_screenshot instaloader: %s", ie)
 
         if not user:
-            send_message(
+            _status(
                 cid,
                 "❌ پروفایل یافت نشد.\n• نام کاربری را بررسی کنید\n• پروفایل باید عمومی باشد",
-                reply_markup=home_kb(),
-            )
+                reply_markup=home_kb(), final=True)
             return
 
         full_name = user.get("full_name") or username
@@ -10096,17 +10310,16 @@ def do_instagram_profile_screenshot(cid: int, username: str):
         card = buf.getvalue()
         log.info("ig_profile_shot: %dx%d  %.1fKB", W, H, len(card) / 1024)
         send_photo(cid, card, caption=f"📸 پروفایل @{username}")
-        send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
+        _status(cid, "✅ ارسال شد.", reply_markup=home_kb(), final=True)
 
     except Exception as e:
         log.error("do_instagram_profile_screenshot: %s", e)
-        send_message(
+        _status(
             cid,
             "❌ ساخت اسکرین‌شات ناموفق بود.\n"
             "• پروفایل باید عمومی باشد\n"
             "• `instaloader` نصب باشد",
-            reply_markup=home_kb(),
-        )
+            reply_markup=home_kb(), final=True)
 
 
 def do_instagram_mosaic(cid: int, url: str):
@@ -10115,7 +10328,7 @@ def do_instagram_mosaic(cid: int, url: str):
     Sends the grid as a single PNG.
     """
     bump(cid, "downloads")
-    send_message(cid, "⏳ در حال دانلود اسلایدها و ساخت موزاییک…")
+    _status(cid, "⏳ در حال دانلود اسلایدها و ساخت موزاییک…")
     try:
         from io import BytesIO as _BIO
 
@@ -10124,9 +10337,8 @@ def do_instagram_mosaic(cid: int, url: str):
         items = instagram_download_all(url)
         images = [it for it in items if not it.get("is_video") and it.get("data")]
         if not images:
-            send_message(
-                cid, "❌ تصویری برای موزاییک یافت نشد.", reply_markup=home_kb()
-            )
+            _status(
+                cid, "❌ تصویری برای موزاییک یافت نشد.", reply_markup=home_kb(), final=True)
             return
 
         n = len(images)
@@ -10169,11 +10381,11 @@ def do_instagram_mosaic(cid: int, url: str):
         )
         if caption and len(caption) > 1024:
             send_message(cid, caption[:4096])
-        send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
+        _status(cid, "✅ ارسال شد.", reply_markup=home_kb(), final=True)
 
     except Exception as e:
         log.error("do_instagram_mosaic: %s", e)
-        send_message(cid, "❌ ساخت موزاییک ناموفق بود.", reply_markup=home_kb())
+        _status(cid, "❌ ساخت موزاییک ناموفق بود.", reply_markup=home_kb(), final=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -10215,7 +10427,7 @@ def do_soundcloud_info(cid: int, url: str):
         except Exception:
             pass
 
-    send_message(cid, "⏳ در حال دریافت اطلاعات آهنگ…")
+    _status(cid, "⏳ در حال دریافت اطلاعات آهنگ…")
     try:
         r = subprocess.run(
             [YTDLP_BIN, "--no-warnings", "--dump-json", "--no-playlist", url],
@@ -10374,12 +10586,12 @@ def bsky_get_post(url: str) -> Optional[dict]:
 def do_bluesky_dl(cid: int, url: str):
     """Download media + text from a Bluesky post."""
     bump(cid, "downloads")
-    send_message(cid, "⏳ در حال دریافت از Bluesky…")
+    _status(cid, "⏳ در حال دریافت از Bluesky…")
     chat_action(cid, "upload_photo")
 
     post = bsky_get_post(url)
     if not post:
-        send_message(cid, "❌ پست یافت نشد یا خصوصی است.", reply_markup=home_kb())
+        _status(cid, "❌ پست یافت نشد یا خصوصی است.", reply_markup=home_kb(), final=True)
         return
 
     text = post.get("text", "")
@@ -10414,7 +10626,7 @@ def do_bluesky_dl(cid: int, url: str):
             )
 
     if not downloaded:
-        send_message(cid, "❌ دانلود رسانه ناموفق بود.", reply_markup=home_kb())
+        _status(cid, "❌ دانلود رسانه ناموفق بود.", reply_markup=home_kb(), final=True)
         return
 
     caption = f"🦋 @{author}\n\n{text}".strip() if text else f"🦋 @{author}"
@@ -10437,7 +10649,7 @@ def do_bluesky_dl(cid: int, url: str):
     if len(caption) > BALE_CAPTION_LIMIT:
         send_message(cid, caption[:4096])
 
-    send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
+    _status(cid, "✅ ارسال شد.", reply_markup=home_kb(), final=True)
     clear_state(cid)
 
 
@@ -10468,7 +10680,7 @@ def handle_message(msg: dict):
         return
     if text.startswith("/cancel"):
         clear_state(cid)
-        send_message(cid, "✅ لغو شد.", reply_markup=main_menu_kb())
+        _status(cid, "✅ لغو شد.", reply_markup=main_menu_kb(), final=True)
         return
     if text.startswith("/ocr"):
         reply = msg.get("reply_to_message")
@@ -10517,13 +10729,12 @@ def handle_message(msg: dict):
 
             file_url = get_file_url(doc["file_id"])
             if not file_url:
-                send_message(
-                    cid, "❌ دریافت لینک فایل ناموفق بود.", reply_markup=home_kb()
-                )
+                _status(
+                    cid, "❌ دریافت لینک فایل ناموفق بود.", reply_markup=home_kb(), final=True)
                 return
             file_data = download_bytes(file_url, VT_LIMIT)
             if not file_data:
-                send_message(cid, "❌ دانلود فایل ناموفق بود.", reply_markup=home_kb())
+                _status(cid, "❌ دانلود فایل ناموفق بود.", reply_markup=home_kb(), final=True)
                 return
             fname = doc.get("file_name") or f"file_{doc['file_id'][:8]}"
             # Capture platform BEFORE spawning thread — _ctx is thread-local,
@@ -10764,9 +10975,8 @@ def handle_callback(cb: dict):
     if data.startswith("trlang_"):
         lang = data.split("_", 1)[1]
         set_state(cid, mode="translate", target_lang=lang)
-        send_message(
-            cid, f"✅ زبان انتخاب شد. متن را بفرستید:", reply_markup=cancel_kb()
-        )
+        _status(
+            cid, f"✅ زبان انتخاب شد. متن را بفرستید:", reply_markup=cancel_kb(), final=True)
         return
 
     if data == "mode_ocr":
@@ -10793,7 +11003,7 @@ def handle_callback(cb: dict):
         key, idx = m.group(1), int(m.group(2))
         results = cache_get(key)
         if not results or idx >= len(results):
-            send_message(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید.")
+            _status(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید.", final=True)
             return
         vid = results[idx]
 
@@ -10873,7 +11083,7 @@ def handle_callback(cb: dict):
         dl_type, dl_key = m.group(1), m.group(2)
         vids = cache_get(dl_key)
         if not vids:
-            send_message(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید.")
+            _status(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید.", final=True)
             return
         vid = vids[0]
         audio_only = dl_type == "audio"
@@ -10914,12 +11124,12 @@ def handle_callback(cb: dict):
         url_key, info_key, fmt_idx = m.group(1), m.group(2), int(m.group(3))
         info_list = cache_get(info_key)
         if not info_list:
-            send_message(cid, "❌ اطلاعات منقضی. دوباره امتحان کنید.")
+            _status(cid, "❌ اطلاعات منقضی. دوباره امتحان کنید.", final=True)
             return
         info = info_list[0]
         formats = info.get("formats", [])
         if fmt_idx >= len(formats):
-            send_message(cid, "❌ کیفیت انتخابی موجود نیست.")
+            _status(cid, "❌ کیفیت انتخابی موجود نیست.", final=True)
             return
         chosen = formats[fmt_idx]
         fmt_spec = chosen["fmt_spec"]
@@ -11019,7 +11229,7 @@ def handle_callback(cb: dict):
         key, idx = m.group(1), int(m.group(2))
         results = cache_get(key)
         if not results or idx >= len(results):
-            send_message(cid, "❌ نتیجه منقضی شده.")
+            _status(cid, "❌ نتیجه منقضی شده.", final=True)
             return
         repo = results[idx]
         full = repo.get("full_name", "")
@@ -11076,7 +11286,7 @@ def handle_callback(cb: dict):
             )
             send_message(cid, txt, parse_mode="Markdown", reply_markup=home_kb())
         else:
-            send_message(cid, "❌ اطلاعاتی یافت نشد.", reply_markup=home_kb())
+            _status(cid, "❌ اطلاعاتی یافت نشد.", reply_markup=home_kb(), final=True)
         return
 
     # GitHub release asset download
@@ -11087,19 +11297,19 @@ def handle_callback(cb: dict):
         akey = f"ghrel_{m.group(1)}"
         assets = cache_get(akey)
         if not assets or idx >= len(assets):
-            send_message(cid, "❌ نتیجه منقضی.")
+            _status(cid, "❌ نتیجه منقضی.", final=True)
             return
         asset = assets[idx]
         url = asset.get("browser_download_url", "")
         size_mb = asset.get("size", 0) / 1024 / 1024
-        send_message(cid, f"⏳ دانلود: {asset['name']} ({size_mb:.1f}MB)…")
+        _status(cid, f"⏳ دانلود: {asset['name']} ({size_mb:.1f}MB)…")
         chat_action(cid, "upload_document")
         d = download_bytes(url, 500 * 1024 * 1024)  # allow up to 500MB download
         if d:
             smart_send(cid, d, asset["name"], caption=f"📦 {repo}")
-            send_message(cid, "✅ ارسال شد.", reply_markup=home_kb())
+            _status(cid, "✅ ارسال شد.", reply_markup=home_kb(), final=True)
         else:
-            send_message(cid, "❌ دانلود ناموفق.", reply_markup=home_kb())
+            _status(cid, "❌ دانلود ناموفق.", reply_markup=home_kb(), final=True)
         return
 
     # GitHub release page navigation
@@ -11131,9 +11341,8 @@ def handle_callback(cb: dict):
         src = img_src_map[data]
         query = st.get("last_query", "")
         if not query:
-            send_message(
-                cid, "❌ ابتدا کلمه کلیدی وارد کنید.", reply_markup=cancel_kb()
-            )
+            _status(
+                cid, "❌ ابتدا کلمه کلیدی وارد کنید.", reply_markup=cancel_kb(), final=True)
             return
         set_state(cid, mode=f"img_{src}", last_query=query, img_source=src, page=0)
         do_images(cid, query, src, 0)
@@ -11156,9 +11365,9 @@ def handle_callback(cb: dict):
         cached_cid = get_url_chat(url_key)
         target_cid = cached_cid if cached_cid else cid
         if not ia_url:
-            send_message(target_cid, "❌ لینک منقضی شده.", reply_markup=home_kb())
+            _status(target_cid, "❌ لینک منقضی شده.", reply_markup=home_kb(), final=True)
             return
-        send_message(target_cid, "⏳ در حال دانلود از Internet Archive…")
+        _status(target_cid, "⏳ در حال دانلود از Internet Archive…")
         chat_action(target_cid, "upload_document")
         sess = _libgen_session()
         try:
@@ -11171,14 +11380,14 @@ def handle_callback(cb: dict):
             if resp.status_code == 200 and len(resp.content) > 5000:
                 fname = ia_url.split("/")[-1].split("?")[0] or "book.pdf"
                 if smart_send(target_cid, resp.content, fname, caption=f"📚 {fname}"):
-                    send_message(target_cid, "✅ کتاب ارسال شد.", reply_markup=home_kb())
+                    _status(target_cid, "✅ کتاب ارسال شد.", reply_markup=home_kb(), final=True)
                 else:
-                    send_message(target_cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+                    _status(target_cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb(), final=True)
             else:
-                send_message(target_cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb())
+                _status(target_cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb(), final=True)
         except Exception as e:
             log.warning("book_ia: %s", e)
-            send_message(target_cid, "❌ خطا در دانلود.", reply_markup=home_kb())
+            _status(target_cid, "❌ خطا در دانلود.", reply_markup=home_kb(), final=True)
         clear_state(target_cid)
         return
 
@@ -11192,7 +11401,7 @@ def handle_callback(cb: dict):
         if ol_url:
             send_message(target_cid, f"🌐 لینک Open Library:\n{ol_url}", reply_markup=home_kb())
         else:
-            send_message(target_cid, "❌ لینک منقضی شده.", reply_markup=home_kb())
+            _status(target_cid, "❌ لینک منقضی شده.", reply_markup=home_kb(), final=True)
         return
 
     # paper_item_{cache_key}_{idx} — user clicked a paper in results
@@ -11201,7 +11410,7 @@ def handle_callback(cb: dict):
         key, idx = m.group(1), int(m.group(2))
         results = cache_get(key)
         if not results or idx >= len(results):
-            send_message(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید.")
+            _status(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید.", final=True)
             return
         paper = results[idx]
         title = paper.get("title", "")
@@ -11261,7 +11470,7 @@ def handle_callback(cb: dict):
         cached_cid = get_url_chat(url_key)
         target_cid = cached_cid if cached_cid else cid
         if not doi:
-            send_message(target_cid, "❌ DOI یافت نشد.")
+            _status(target_cid, "❌ DOI یافت نشد.", final=True)
             return
         _do_paper_dl_doi(target_cid, doi)
         return
@@ -11274,9 +11483,9 @@ def handle_callback(cb: dict):
         cached_cid = get_url_chat(url_key)
         target_cid = cached_cid if cached_cid else cid
         if not oa_url:
-            send_message(target_cid, "❌ لینک یافت نشد.")
+            _status(target_cid, "❌ لینک یافت نشد.", final=True)
             return
-        send_message(target_cid, "⏳ در حال دانلود Open Access PDF…")
+        _status(target_cid, "⏳ در حال دانلود Open Access PDF…")
         chat_action(target_cid, "upload_document")
         sess = _libgen_session()
         try:
@@ -11293,14 +11502,14 @@ def handle_callback(cb: dict):
                 if not fname.endswith(".pdf"):
                     fname += ".pdf"
                 if smart_send(target_cid, resp.content, fname, caption=f"📄 {fname}"):
-                    send_message(target_cid, "✅ مقاله ارسال شد.", reply_markup=home_kb())
+                    _status(target_cid, "✅ مقاله ارسال شد.", reply_markup=home_kb(), final=True)
                 else:
-                    send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+                    _status(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb(), final=True)
             else:
-                send_message(cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb())
+                _status(cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb(), final=True)
         except Exception as e:
             log.warning("paper_oa: %s", e)
-            send_message(cid, "❌ خطا در دانلود.", reply_markup=home_kb())
+            _status(cid, "❌ خطا در دانلود.", reply_markup=home_kb(), final=True)
         clear_state(cid)
         return
 
@@ -11324,7 +11533,7 @@ def handle_callback(cb: dict):
         key, idx = m.group(1), int(m.group(2))
         results = cache_get(key)
         if not results or idx >= len(results):
-            send_message(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید.")
+            _status(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید.", final=True)
             return
         app = results[idx]
         # Fetch full info
@@ -11357,15 +11566,13 @@ def handle_callback(cb: dict):
         results = cache_get(key) if key else []
         if results:
             kb = apk_results_kb(results, key)
-            send_message(
-                cid, f"📱 نتایج برای: _{query}_", parse_mode="Markdown", reply_markup=kb
-            )
+            _status(
+                cid, f"📱 نتایج برای: _{query}_", parse_mode="Markdown", reply_markup=kb, final=True)
         else:
-            send_message(
+            _status(
                 cid,
                 "❌ جستجو منقضی شده. دوباره جستجو کنید.",
-                reply_markup=main_menu_kb(),
-            )
+                reply_markup=main_menu_kb(), final=True)
         return
 
     # ── Z-Library callbacks ───────────────────────────────────────────────
@@ -11411,9 +11618,8 @@ def handle_callback(cb: dict):
         results = cache_get(key) if key else []
         if results:
             kb = book_results_kb(results, key)
-            send_message(
-                cid, f"📚 نتایج: _{query}_", parse_mode="Markdown", reply_markup=kb
-            )
+            _status(
+                cid, f"📚 نتایج: _{query}_", parse_mode="Markdown", reply_markup=kb, final=True)
         else:
             send_message(cid, "🏠", reply_markup=main_menu_kb())
         return
@@ -11424,7 +11630,7 @@ def handle_callback(cb: dict):
         key, idx = m.group(1), int(m.group(2))
         results = cache_get(key)
         if not results or idx >= len(results):
-            send_message(cid, "❌ نتیجه منقضی.")
+            _status(cid, "❌ نتیجه منقضی.", final=True)
             return
         do_book_show_book(cid, results[idx])
         return
@@ -11435,7 +11641,7 @@ def handle_callback(cb: dict):
         url_key = m.group(1)
         stored = get_url(url_key)
         if not stored:
-            send_message(cid, "❌ لینک منقضی شده.")
+            _status(cid, "❌ لینک منقضی شده.", final=True)
             return
         # Parse libgen:{md5}:{ext} format
         if stored.startswith("libgen:"):
@@ -11444,7 +11650,7 @@ def handle_callback(cb: dict):
                 md5, ext = parts[1], parts[2]
                 do_book_download(cid, f"{md5}_{ext}")
                 return
-        send_message(cid, "❌ اطلاعات کتاب نامعتبر است.")
+        _status(cid, "❌ اطلاعات کتاب نامعتبر است.", final=True)
         return
 
     # ── RSS callbacks ─────────────────────────────────────────────────────
@@ -11468,12 +11674,12 @@ def handle_callback(cb: dict):
             url_key = m.group(1)
             url = get_url(url_key)
             if not url:
-                send_message(cid, "❌ لینک منقضی.")
+                _status(cid, "❌ لینک منقضی.", final=True)
                 return
-            send_message(cid, "⏳ دریافت فید…")
+            _status(cid, "⏳ دریافت فید…")
             items = rss_fetch(url, 15)
             if not items:
-                send_message(cid, "❌ فید خالی یا نامعتبر.", reply_markup=home_kb())
+                _status(cid, "❌ فید خالی یا نامعتبر.", reply_markup=home_kb(), final=True)
                 return
             key = make_cache_key("rss", url, 0)
             cache_set(key, items)
@@ -11487,7 +11693,7 @@ def handle_callback(cb: dict):
             key, idx = m.group(1), int(m.group(2))
             items = cache_get(key)
             if not items or idx >= len(items):
-                send_message(cid, "❌ خبر منقضی.")
+                _status(cid, "❌ خبر منقضی.", final=True)
                 return
             _show_rss_item(cid, items[idx])
             return
@@ -11498,7 +11704,7 @@ def handle_callback(cb: dict):
         action, url_key = m.group(1), m.group(2)
         url = get_url(url_key)
         if not url:
-            send_message(cid, "❌ لینک منقضی شده.", reply_markup=home_kb())
+            _status(cid, "❌ لینک منقضی شده.", reply_markup=home_kb(), final=True)
             return
         chat_action(cid, "upload_document")
         if action == "text":
@@ -11511,24 +11717,24 @@ def handle_callback(cb: dict):
             if html:
                 send_document(cid, html, "page.html", caption=f"🌐 {url[:60]}")
             else:
-                send_message(cid, "❌ خطا در دریافت HTML.", reply_markup=home_kb())
+                _status(cid, "❌ خطا در دریافت HTML.", reply_markup=home_kb(), final=True)
         elif action == "zip":
-            send_message(cid, "⏳ در حال ساخت ZIP…")
+            _status(cid, "⏳ در حال ساخت ZIP…")
             zdata = page_to_zip(url)
             if zdata:
                 domain = urllib.parse.urlparse(url).netloc.replace(".", "_")
                 send_document(cid, zdata, f"{domain}_offline.zip")
             else:
-                send_message(cid, "❌ خطا در ZIP.", reply_markup=home_kb())
+                _status(cid, "❌ خطا در ZIP.", reply_markup=home_kb(), final=True)
         elif action == "pdf":
-            send_message(cid, "⏳ در حال تولید PDF…")
+            _status(cid, "⏳ در حال تولید PDF…")
             pdf = page_to_pdf(url)
             if pdf:
                 ext = "pdf" if pdf[:4] == b"%PDF" else "html"
                 send_document(cid, pdf, f"page.{ext}", caption=f"📑 {url[:60]}")
             else:
-                send_message(cid, "❌ خطا در PDF.", reply_markup=home_kb())
-        send_message(cid, "✅", reply_markup=site_view_kb(url_key))
+                _status(cid, "❌ خطا در PDF.", reply_markup=home_kb(), final=True)
+        _status(cid, "✅", reply_markup=site_view_kb(url_key), final=True)
         return
 
     # ── Search result click (web, scholar) ────────────────────────────────
@@ -11537,7 +11743,7 @@ def handle_callback(cb: dict):
         key, idx = m.group(1), int(m.group(2))
         results = cache_get(key)
         if not results or idx >= len(results):
-            send_message(cid, "❌ نتیجه منقضی.")
+            _status(cid, "❌ نتیجه منقضی.", final=True)
             return
         r = results[idx]
         # Show detail with options
@@ -11565,16 +11771,15 @@ def handle_callback(cb: dict):
         url_key = m.group(1)
         url = get_url(url_key)
         if not url:
-            send_message(cid, "❌ لینک منقضی.")
+            _status(cid, "❌ لینک منقضی.", final=True)
             return
-        send_message(cid, f"⏳ گرفتن اسکرین‌شات…")
+        _status(cid, f"⏳ گرفتن اسکرین‌شات…")
         ss = screenshot_page(url)
         if ss:
             send_photo(cid, ss, caption=url[:60], reply_markup=site_view_kb(url_key))
         else:
-            send_message(
-                cid, "❌ اسکرین‌شات ممکن نبود.", reply_markup=site_view_kb(url_key)
-            )
+            _status(
+                cid, "❌ اسکرین‌شات ممکن نبود.", reply_markup=site_view_kb(url_key), final=True)
         return
 
     if data == "results_back":
@@ -11595,7 +11800,7 @@ def handle_callback(cb: dict):
         kind, page = pm.group(1), int(pm.group(2))
         query = st.get("last_query", "")
         if not query:
-            send_message(cid, "❌ جستجوی قبلی یافت نشد.")
+            _status(cid, "❌ جستجوی قبلی یافت نشد.", final=True)
             return
         if kind == "ws":
             do_search(cid, query, page)
@@ -11609,7 +11814,7 @@ def handle_callback(cb: dict):
                 do_book_search(cid, query)
             else:
                 # Combined search - re-run with page
-                send_message(
+                _status(
                     cid, f"⏳ در حال جستجوی ترکیبی: _{query}_…", parse_mode="Markdown"
                 )
                 scholar_results = scholar_search(query, page)
@@ -11618,7 +11823,7 @@ def handle_callback(cb: dict):
                 key = make_cache_key("uni", query, page)
                 cache_set(key, combined_results)
                 if not combined_results:
-                    send_message(cid, "❌ نتیجه‌ای یافت نشد.", reply_markup=home_kb())
+                    _status(cid, "❌ نتیجه‌ای یافت نشد.", reply_markup=home_kb(), final=True)
                     return
                 text = f"🔍 *جستجوی ترکیبی:* _{query}_ (صفحه {page + 1})"
                 kb = search_results_kb(
@@ -11633,7 +11838,7 @@ def handle_callback(cb: dict):
         key, idx, lang = m.group(1), int(m.group(2)), m.group(3)
         results = cache_get(key)
         if not results or idx >= len(results):
-            send_message(cid, "❌ نتیجه منقضی.")
+            _status(cid, "❌ نتیجه منقضی.", final=True)
             return
         article = results[idx]
         do_wiki_article(cid, article["title"], lang)
@@ -11658,9 +11863,8 @@ def handle_callback(cb: dict):
     if data == "tg_read_mtproto":
         if not TG_API_ID or not TG_API_HASH:
             log.error("tg_read_mtproto: TG_API_ID/TG_API_HASH not configured")
-            send_message(
-                cid, "❌ این قابلیت در حال حاضر در دسترس نیست.", reply_markup=home_kb()
-            )
+            _status(
+                cid, "❌ این قابلیت در حال حاضر در دسترس نیست.", reply_markup=home_kb(), final=True)
             return
         set_state(cid, mode="tg_mtproto")
         send_message(
@@ -11826,7 +12030,7 @@ def handle_callback(cb: dict):
         cached_cid = get_url_chat(url_key)
         target_cid = cached_cid if cached_cid else cid
         if not url:
-            send_message(target_cid, "❌ لینک منقضی شده.")
+            _status(target_cid, "❌ لینک منقضی شده.", final=True)
             return
         # Capture platform BEFORE spawning thread — _ctx is thread-local,
         # the new thread would otherwise default to Bale and send to the
@@ -11846,7 +12050,7 @@ def handle_callback(cb: dict):
         platform, key, idx = m.group(1), m.group(2), int(m.group(3))
         results = cache_get(key)
         if not results or idx >= len(results):
-            send_message(cid, "❌ نتیجه منقضی.")
+            _status(cid, "❌ نتیجه منقضی.", final=True)
             return
         item = results[idx]
         if platform == "tg":
@@ -11923,7 +12127,7 @@ def handle_callback(cb: dict):
         platform, url_key = m.group(1), m.group(2)
         url = get_url(url_key) or ""
         if not url:
-            send_message(cid, "❌ لینک منقضی.")
+            _status(cid, "❌ لینک منقضی.", final=True)
             return
         if platform == "tg":
             do_tg_dl_media(cid, url)
@@ -11941,7 +12145,7 @@ def handle_callback(cb: dict):
         key, idx = m.group(1), int(m.group(2))
         results = cache_get(key)
         if not results or idx >= len(results):
-            send_message(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید.")
+            _status(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید.", final=True)
             return
         track = results[idx]
         url = track.get("url", "")
@@ -11985,7 +12189,7 @@ def handle_callback(cb: dict):
         key, idx = m.group(1), int(m.group(2))
         results = cache_get(key)
         if not results or idx >= len(results):
-            send_message(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید.")
+            _status(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید.", final=True)
             return
         result = results[idx]
 
@@ -12139,8 +12343,6 @@ def _poll_platform(platform: str, token: str):
 def run():
     threads = []
 
-    _warp_selfcheck()
-
     if BALE_TOKEN:
         log.info("Bale platform enabled — token …%s", BALE_TOKEN[-6:])
         t = _tl_threading.Thread(
@@ -12192,6 +12394,8 @@ def run():
     except KeyboardInterrupt:
         log.info("Bot stopped.")
         _update_executor.shutdown(wait=False)
+
+    _warp_selfcheck()
 
 
 if __name__ == "__main__":
