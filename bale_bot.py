@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v3.2)
+بله قربان — Bale Bot  (v3.3)
 Full-featured web assistant for Bale messenger.
 """
 
@@ -208,18 +208,50 @@ SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 WARP_PROXY = os.getenv("WARP_PROXY", "")  # e.g. "socks5://127.0.0.1:40000"
 
 def _warp_selfcheck():
+    """Log whether traffic is actually routed through WARP.
+
+    We do NOT trust Cloudflare's warp= flag: reaching Cloudflare's own site
+    through the WARP proxy often reports warp=off even when routing works.
+    Instead we compare the public egress IP direct vs via the proxy (if it
+    changes, traffic goes through WARP) and probe a normally DNS-blocked host.
+    """
     if not WARP_PROXY:
-        log.warning("WARP self-check: WARP_PROXY NOT set — Sci-Hub/Anna's/blocked DNS will FAIL.")
+        log.warning("WARP self-check: WARP_PROXY NOT set \u2014 Sci-Hub/Anna's/blocked DNS will FAIL.")
         return
     px = WARP_PROXY.replace("socks5://", "socks5h://")
+    proxies = {"http": px, "https": px}
+
+    def _egress(use_proxy):
+        try:
+            r = requests.get("https://api.ipify.org/",
+                             proxies=proxies if use_proxy else None, timeout=10)
+            if r.status_code == 200:
+                return r.text.strip()
+        except Exception as e:
+            log.debug("WARP self-check egress proxy=%s: %s", use_proxy, e)
+        return ""
+
+    direct_ip = _egress(False)
+    proxy_ip = _egress(True)
+
+    dns_bypass = False
     try:
-        r = requests.get("https://www.cloudflare.com/cdn-cgi/trace/",
-                         proxies={"http": px, "https": px}, timeout=10)
-        on = ("warp=on" in r.text) or ("warp=plus" in r.text)
-        log.info("WARP self-check: proxy=%s  ->  warp=%s", WARP_PROXY,
-                 "ON ✅" if on else "OFF ❌ (proxy up but traffic not on WARP)")
+        rr = requests.get("https://sci-hub.wf/", proxies=proxies, timeout=15,
+                          allow_redirects=True)
+        dns_bypass = rr.status_code < 500
     except Exception as e:
-        log.error("WARP self-check: proxy %s UNREACHABLE — %s", WARP_PROXY, e)
+        log.debug("WARP self-check dns probe: %s", e)
+
+    routed = bool(proxy_ip and proxy_ip != direct_ip)
+    ok = routed or dns_bypass
+    log.info(
+        "WARP self-check: direct_ip=%s proxy_ip=%s routed=%s blocked_site=%s => %s",
+        direct_ip or "?", proxy_ip or "?",
+        "YES" if routed else "NO",
+        "reachable" if dns_bypass else "unreachable",
+        "WORKING \u2705" if ok else "NOT WORKING \u274c",
+    )
+
 
 # Cobalt API — self-hosted instance for reliable social/YouTube downloads.
 # Self-host: https://github.com/imputnet/cobalt
@@ -12107,8 +12139,6 @@ def _poll_platform(platform: str, token: str):
 def run():
     threads = []
 
-    _warp_selfcheck()
-
     if BALE_TOKEN:
         log.info("Bale platform enabled — token …%s", BALE_TOKEN[-6:])
         t = _tl_threading.Thread(
@@ -12160,6 +12190,8 @@ def run():
     except KeyboardInterrupt:
         log.info("Bot stopped.")
         _update_executor.shutdown(wait=False)
+
+    _warp_selfcheck()
 
 
 if __name__ == "__main__":
