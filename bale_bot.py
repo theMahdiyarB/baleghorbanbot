@@ -44,6 +44,11 @@ _ctx = _tl_threading.local()  # _ctx.base_url, _ctx.platform, _ctx.kb_*
 BALE_TOKEN = os.getenv("BALE_TOKEN", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 
+# Local Bot API server (https://github.com/tdlib/telegram-bot-api).
+# Set TELEGRAM_API_BASE=http://127.0.0.1:8081 to enable 2000MB uploads.
+TELEGRAM_API_BASE = os.getenv("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
+LOCAL_BOT_API = TELEGRAM_API_BASE != "https://api.telegram.org"
+
 
 # Define session maker before platform config
 def _make_session(proxy: str = "") -> requests.Session:
@@ -87,10 +92,11 @@ _PLATFORM_CFG = {
         "session": _make_session(),
     },
     "telegram": {
-        "base_url": f"https://api.telegram.org/bot{TELEGRAM_TOKEN}",
+        "base_url": f"{TELEGRAM_API_BASE}/bot{TELEGRAM_TOKEN}",
         "kb_rows": 8,
         "kb_cols": 3,
-        "chunk_size": 49 * 1024 * 1024,  # Telegram: 50MB limit → 49MB chunks
+        # Local server → ~2000MB; cloud → 49MB.
+        "chunk_size": (1990 if LOCAL_BOT_API else 49) * 1024 * 1024,
         "session": _make_session(),
     },
 }
@@ -107,6 +113,10 @@ def _set_platform_ctx(platform: str):
     _ctx.session = cfg["session"]  # shared persistent Session (thread-safe reads)
     # Also set max video duration for splitting (Telegram allows larger files)
     _ctx.video_split_mb = 48.0 if platform == "telegram" else 18.0
+    if platform == "telegram":
+        _ctx.video_split_mb = 1990.0 if LOCAL_BOT_API else 48.0
+    else:
+        _ctx.video_split_mb = 18.0
 
 
 # Helpers to read thread-local context — fall back to Bale defaults
@@ -233,6 +243,9 @@ ANNAS_ARCHIVE_MIRRORS = [
 SCIHUB_MIRRORS = [
     "https://sci-hub.se",
     "https://sci-hub.st",
+    "https://sci-hub.ru",
+    "https://sci-hub.wf",
+    "https://sci-hub.ee",
 ]
 
 
@@ -1379,8 +1392,13 @@ def paged_kb(prev_cb, next_cb, page, has_next):
 def image_source_kb():
     return {
         "inline_keyboard": [
+            [{"text": "🌐 چند منبع (پیشنهادی)", "callback_data": "img_src_multi"}],
             [
-                {"text": "🖼 تصاویر Bing", "callback_data": "img_src_bing"},
+                {"text": "🦆 DuckDuckGo", "callback_data": "img_src_ddg"},
+                {"text": "🖼 Bing", "callback_data": "img_src_bing"},
+            ],
+            [
+                {"text": "🔍 Google", "callback_data": "img_src_google"},
                 {"text": "📌 پینترست", "callback_data": "img_src_pinterest"},
             ],
             [
@@ -3031,7 +3049,7 @@ def _cobalt_download_all(
             payload["tiktokH265"] = False  # Prefer H264 for better compatibility
 
         resp = WEB.post(
-            f"{COBALT_URL}/json",
+            COBALT_URL,   # Cobalt v10 API is POST / (was POST /json → 404)
             json=payload,
             headers={"Accept": "application/json", "Content-Type": "application/json"},
             timeout=30,
@@ -5011,88 +5029,63 @@ def instagram_get_profile(username: str) -> list[dict]:
 
 # ─── TikTok ──────────────────────────────────────────────────────────────────
 def tiktok_download(url: str) -> Optional[tuple[bytes, str]]:
-    """Download TikTok video.
-    Strategy 1: Cobalt API (self-hosted, most reliable for TikTok)
-    Strategy 2: yt-dlp with cookies for age-restricted content
-    Strategy 3: Alternative TikTok APIs (tikwm.com, snaptik.app)
-    """
+    """Download a TikTok video WITH audio (tikwm first for muxed audio)."""
     log.info("tiktok_download: %s", url)
-    
-    # Try Cobalt first
-    cobalt = _cobalt_download(url)
-    if cobalt:
-        return cobalt
-    
-    # Try yt-dlp with TikTok-specific options and cookies
-    result = social_download_ytdlp(url, audio_only=False, cookies_file=TWITTER_COOKIES_FILE or YOUTUBE_COOKIES_FILE)
-    if result:
-        return result
-    
-    # Fallback: try alternative TikTok APIs
+    # Strategy 1: tikwm.com — single muxed MP4 (audio+video, no watermark).
     try:
-        # Try tikwm.com API
-        vid_id = ""
-        m = re.search(r"/video/(\d+)", url)
-        if m:
-            vid_id = m.group(1)
-        else:
-            # Try to get video ID from short URL
-            try:
-                resp = WEB.head(url, timeout=10, allow_redirects=True)
-                final_url = resp.url
-                m = re.search(r"/video/(\d+)", final_url)
-                if m:
-                    vid_id = m.group(1)
-            except Exception:
-                pass
-        
-        if vid_id:
-            log.info("tiktok_download: trying tikwm.com API for vid=%s", vid_id)
-            api_url = f"https://www.tikwm.com/api/?url=https://www.tiktok.com/video/{vid_id}"
-            r = WEB.get(api_url, headers={"User-Agent": UA_DESK}, timeout=15)
-            if r.status_code == 200:
-                j = r.json()
-                if j.get("code") == 0 and j.get("data", {}).get("play"):
-                    video_url = j["data"]["play"]
-                    log.info("tiktok_download: got URL from tikwm: %s", video_url[:80])
-                    video_data = WEB.get(video_url, timeout=60).content
-                    if len(video_data) > 10000:
-                        title = j["data"].get("title", "tiktok_video")[:60]
-                        fname = f"{title}.mp4"
-                        log.info("tiktok_download OK via tikwm: %.1fMB", len(video_data)/1024/1024)
-                        return video_data, fname
-            log.debug("tiktok_download: tikwm failed, response: %s", r.text[:200])
+        r = WEB.post("https://www.tikwm.com/api/", data={"url": url, "hd": "1"},
+                     headers={"User-Agent": UA_DESK}, timeout=20)
+        if r.status_code == 200:
+            j = r.json()
+            d = j.get("data", {}) if j.get("code") == 0 else {}
+            play = d.get("hdplay") or d.get("play") or d.get("wmplay")
+            if play:
+                if play.startswith("/"):
+                    play = "https://www.tikwm.com" + play
+                vr = WEB.get(play, headers={"User-Agent": UA_DESK,
+                             "Referer": "https://www.tikwm.com/"}, timeout=90)
+                data = vr.content
+                if len(data) > 10000 and _has_audio_stream(data, "tt.mp4"):
+                    title = (d.get("title") or "tiktok_video")[:60] or "tiktok_video"
+                    log.info("tiktok_download OK via tikwm: %.1fMB", len(data)/1024/1024)
+                    return data, f"{title}.mp4"
+                log.warning("tiktok_download: tikwm file silent/small, falling back")
     except Exception as e:
-        log.warning("tiktok_download: tikwm fallback error: %s", e)
-    
-    # Last resort: try snaptik.app
+        log.warning("tiktok_download: tikwm error: %s", e)
+
+    # Strategy 2: yt-dlp — ONLY accept if it actually carries audio.
+    result = social_download_ytdlp(url, audio_only=False,
+                                   cookies_file=TWITTER_COOKIES_FILE or YOUTUBE_COOKIES_FILE)
+    if result and _has_audio_stream(result[0], result[1]):
+        return result
+
+    # Strategy 3: Cobalt (tiktokFullAudio) — only if it has audio.
+    cobalt = _cobalt_download(url)
+    if cobalt and _has_audio_stream(cobalt[0], cobalt[1]):
+        return cobalt
+
+    # Strategy 4: snaptik.app
     try:
         log.info("tiktok_download: trying snaptik.app")
-        r = WEB.post(
-            "https://snaptik.app/action-2024.php",
-            data={"url": url},
-            headers={
-                "User-Agent": UA_DESK,
-                "Referer": "https://snaptik.app/",
-                "X-Requested-With": "XMLHttpRequest"
-            },
-            timeout=15
-        )
+        r = WEB.post("https://snaptik.app/action-2024.php", data={"url": url},
+                     headers={"User-Agent": UA_DESK, "Referer": "https://snaptik.app/",
+                              "X-Requested-With": "XMLHttpRequest"}, timeout=15)
         if r.status_code == 200 and "download.php" in r.text:
-            # Extract download link
             dl_match = re.search(r'href=["\']([^"\']*download\.php[^"\']*)["\']', r.text)
             if dl_match:
                 dl_url = dl_match.group(1)
                 if not dl_url.startswith("http"):
                     dl_url = "https://snaptik.app/" + dl_url
-                log.info("tiktok_download: got snaptik URL: %s", dl_url[:80])
                 video_data = WEB.get(dl_url, timeout=60).content
                 if len(video_data) > 10000:
-                    log.info("tiktok_download OK via snaptik: %.1fMB", len(video_data)/1024/1024)
                     return video_data, "tiktok_video.mp4"
     except Exception as e:
         log.warning("tiktok_download: snaptik fallback error: %s", e)
-    
+
+    # Last resort: return whatever yt-dlp produced (maybe silent) rather than nothing.
+    if result:
+        log.warning("tiktok_download: returning possibly-silent yt-dlp file")
+        return result
     log.error("tiktok_download: all methods failed")
     return None
 
@@ -5232,26 +5225,19 @@ def github_zip(repo_url: str) -> Optional[bytes]:
 
 # ─── Images ───────────────────────────────────────────────────────────────────
 def images_bing(query: str, max_results=8) -> list[dict]:
-    """Search Bing Images by parsing the real result markup.
-
-    Bing renders each result as ``<a class="iusc" m='{"murl":"...","turl":"..."}'>``
-    (JSON in the ``m`` attribute, HTML-entity escaped). Scanning the whole page
-    for any "murl"/"contentUrl" substring (the old approach) also matches
-    unrelated static assets embedded on every page, which is why it used to
-    return the same single stray image regardless of the query.
-    """
+    """Bing Images with SafeSearch=STRICT forced (query params + cookie)."""
     log.info("images_bing: %r", query)
     try:
         r = WEB.get(
             "https://www.bing.com/images/search",
-            params={"q": query, "form": "HDRSC2", "first": "1"},
-            headers={"User-Agent": UA_DESK, "Referer": "https://www.bing.com/"},
+            params={"q": query, "form": "HDRSC2", "first": "1",
+                    "safeSearch": "strict", "adlt": "strict"},
+            headers={"User-Agent": UA_DESK, "Referer": "https://www.bing.com/",
+                     "Cookie": "SRCHHPGUSR=ADLT=STRICT; _EDGE_S=ui=en-us"},
             timeout=20,
         )
         log.debug("bing_images: status=%d len=%d", r.status_code, len(r.text))
-        results = []
-        seen: set[str] = set()
-
+        results, seen = [], set()
         soup = BeautifulSoup(r.text, "html.parser")
         for a in soup.find_all("a", class_="iusc"):
             m_attr = a.get("m")
@@ -5265,45 +5251,100 @@ def images_bing(query: str, max_results=8) -> list[dict]:
             if not u or u in seen:
                 continue
             seen.add(u)
-            results.append(
-                {
-                    "url": u,
-                    "title": meta.get("t") or query,
-                    "_referer": "https://www.bing.com/",
-                }
-            )
+            results.append({"url": u, "title": meta.get("t") or query,
+                            "_referer": "https://www.bing.com/"})
             if len(results) >= max_results:
                 break
-
-        # Fallback: some Bing responses only include result data inside
-        # <div class="iuscp"> wrappers or escaped JSON blobs — try the
-        # historical regex extraction as a last resort.
         if not results:
-            for pattern in [
-                r'"murl":"(https?://[^"]+?)"',
-                r'"turl":"(https?://[^"]+?)"',
-            ]:
+            for pattern in [r'"murl":"(https?://[^"]+?)"', r'"turl":"(https?://[^"]+?)"']:
                 for u in re.findall(pattern, r.text):
                     u = u.replace("\\/", "/").replace("&amp;", "&")
-                    if u in seen or any(
-                        x in u
-                        for x in ("bing.com/rp/", "microsoft.com", "127.0.0.1", "localhost")
-                    ):
+                    if u in seen or any(x in u for x in ("bing.com/rp/", "microsoft.com", "127.0.0.1", "localhost")):
                         continue
                     seen.add(u)
-                    results.append(
-                        {"url": u, "title": query, "_referer": "https://www.bing.com/"}
-                    )
+                    results.append({"url": u, "title": query, "_referer": "https://www.bing.com/"})
                     if len(results) >= max_results:
                         break
                 if results:
                     break
-
-        log.info("images_bing: %d results", len(results))
+        log.info("images_bing: %d results (safesearch=strict)", len(results))
         return results
     except Exception as e:
         log.error("images_bing: %s", e, exc_info=True)
         return []
+
+def images_duckduckgo(query: str, max_results=8) -> list[dict]:
+    """DuckDuckGo image search, SafeSearch strict (p=1). No API key."""
+    log.info("images_duckduckgo: %r", query)
+    try:
+        hdrs = {"User-Agent": UA_DESK, "Referer": "https://duckduckgo.com/"}
+        tok = WEB.post("https://duckduckgo.com/", data={"q": query}, headers=hdrs, timeout=15)
+        m = re.search(r'vqd=["\']?([\d-]+)', tok.text) or re.search(r"vqd=([\d-]+)&", tok.text)
+        if not m:
+            log.warning("images_duckduckgo: no vqd token")
+            return []
+        vqd = m.group(1)
+        r = WEB.get("https://duckduckgo.com/i.js",
+                    params={"l": "us-en", "o": "json", "q": query, "vqd": vqd, "f": ",,,", "p": "1"},
+                    headers={**hdrs, "Accept": "application/json"}, timeout=15)
+        if r.status_code != 200:
+            log.warning("images_duckduckgo: i.js status=%d", r.status_code)
+            return []
+        results = []
+        for it in r.json().get("results", []):
+            u = it.get("image", "")
+            if u:
+                results.append({"url": u, "title": it.get("title", query)[:80],
+                                "_referer": "https://duckduckgo.com/"})
+            if len(results) >= max_results:
+                break
+        log.info("images_duckduckgo: %d results", len(results))
+        return results
+    except Exception as e:
+        log.error("images_duckduckgo: %s", e, exc_info=True)
+        return []
+
+def images_google(query: str, max_results=8) -> list[dict]:
+    """Google Images scrape, SafeSearch active. Best-effort fallback."""
+    log.info("images_google: %r", query)
+    try:
+        r = WEB.get("https://www.google.com/search",
+                    params={"q": query, "tbm": "isch", "safe": "active", "hl": "en"},
+                    headers={"User-Agent": UA_DESK, "Accept-Language": "en-US,en;q=0.9"},
+                    timeout=20)
+        if r.status_code != 200:
+            return []
+        results, seen = [], set()
+        for u in re.findall(r'\["(https?://[^"]+?\.(?:jpg|jpeg|png|webp))",\d+,\d+\]', r.text):
+            u = u.replace("\\u003d", "=").replace("\\u0026", "&")
+            if u in seen or "gstatic.com" in u or "google.com" in u:
+                continue
+            seen.add(u)
+            results.append({"url": u, "title": query})
+            if len(results) >= max_results:
+                break
+        log.info("images_google: %d results", len(results))
+        return results
+    except Exception as e:
+        log.error("images_google: %s", e, exc_info=True)
+        return []
+
+def images_multi(query: str, max_results=8) -> list[dict]:
+    """Aggregate DuckDuckGo -> Bing(strict) -> Wikimedia -> Google, deduped."""
+    log.info("images_multi: %r", query)
+    out, seen = [], set()
+    for fn in (images_duckduckgo, images_bing, images_wikimedia, images_google):
+        try:
+            for r in fn(query, max_results=max_results):
+                u = r.get("url", "")
+                if u and u not in seen:
+                    seen.add(u)
+                    out.append(r)
+                if len(out) >= max_results:
+                    return out
+        except Exception as e:
+            log.debug("images_multi %s: %s", getattr(fn, "__name__", fn), e)
+    return out
 
 
 def images_pinterest(query: str, max_results=8) -> list[dict]:
@@ -7614,7 +7655,10 @@ def do_images(cid: int, query: str, source: str, page=0):
     bump(cid, "searches")
     chat_action(cid, "upload_photo")
     source_names = {
+        "multi": "🌐 چند منبع (پیشنهادی)",
+        "ddg": "🦆 DuckDuckGo",
         "bing": "🖼 Bing",
+        "google": "🔍 Google",
         "pinterest": "📌 پینترست",
         "pexels": "📷 Pixabay",
         "wiki": "🎨 Wikimedia",
@@ -7626,11 +7670,15 @@ def do_images(cid: int, query: str, source: str, page=0):
     )
     offset = page * 6
     fn_map = {
+        "multi": images_multi,
+        "ddg": images_duckduckgo,
         "bing": images_bing,
+        "google": images_google,
         "pinterest": images_pinterest,
         "pexels": images_pexels,
         "wiki": images_wikimedia,
     }
+fn = fn_map.get(source, images_multi)
     fn = fn_map.get(source, images_bing)
     results = fn(query, max_results=offset + 8)
     page_results = results[offset : offset + 6]
@@ -8512,9 +8560,77 @@ def do_paper_search(cid: int, query: str):
         reply_markup=kb,
     )
 
+def _oa_pdf(doi: str, sess) -> Optional[tuple[bytes, str]]:
+    """Try every free OA source for a DOI. Returns (pdf_bytes, source_name)."""
+    clean = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi).strip().rstrip(".,)")
+    hdrs = {"User-Agent": UA_DESK}
+
+    def _try(pdf_url: str) -> Optional[bytes]:
+        if not pdf_url:
+            return None
+        try:
+            rr = sess.get(pdf_url, headers=hdrs, timeout=60, allow_redirects=True)
+            if rr.status_code == 200 and len(rr.content) > 5000 and (
+                rr.content[:4] == b"%PDF" or "pdf" in rr.headers.get("Content-Type", "").lower()):
+                return rr.content
+        except Exception as e:
+            log.debug("_oa_pdf fetch %s: %s", pdf_url[:60], e)
+        return None
+
+    # 1) Unpaywall
+    try:
+        up = sess.get(f"https://api.unpaywall.org/v2/{clean}",
+                      params={"email": UNPAYWALL_EMAIL}, timeout=12)
+        if up.status_code == 200:
+            loc = (up.json().get("best_oa_location") or {})
+            data = _try(loc.get("url_for_pdf") or loc.get("url", ""))
+            if data:
+                return data, "Unpaywall"
+    except Exception as e:
+        log.debug("_oa_pdf unpaywall: %s", e)
+
+    # 2) OpenAlex
+    try:
+        oa = sess.get(f"https://api.openalex.org/works/https://doi.org/{clean}", timeout=12)
+        if oa.status_code == 200:
+            j = oa.json()
+            loc = j.get("best_oa_location") or j.get("primary_location") or {}
+            data = _try(loc.get("pdf_url", ""))
+            if data:
+                return data, "OpenAlex"
+    except Exception as e:
+        log.debug("_oa_pdf openalex: %s", e)
+
+    # 3) Semantic Scholar
+    try:
+        s2 = sess.get(f"https://api.semanticscholar.org/graph/v1/paper/DOI:{clean}",
+                      params={"fields": "openAccessPdf"}, timeout=12)
+        if s2.status_code == 200:
+            data = _try((s2.json().get("openAccessPdf") or {}).get("url", ""))
+            if data:
+                return data, "Semantic Scholar"
+    except Exception as e:
+        log.debug("_oa_pdf s2: %s", e)
+
+    # 4) Europe PMC (PMC full-text PDF)
+    try:
+        ep = sess.get("https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+                      params={"query": f"DOI:{clean}", "format": "json", "resultType": "core"}, timeout=12)
+        if ep.status_code == 200:
+            for res in ep.json().get("resultList", {}).get("result", []):
+                pmcid = res.get("pmcid")
+                if pmcid:
+                    data = _try(f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextPDF")
+                    if data:
+                        return data, "Europe PMC"
+    except Exception as e:
+        log.debug("_oa_pdf europepmc: %s", e)
+
+    return None
+
 
 def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
-    """Download paper by DOI. Priority: Unpaywall OA → Sci-Hub → LibGen."""
+    """Download paper by DOI. OA sources -> Sci-Hub (WARP) -> LibGen scimag."""
     if sess is None:
         sess = _libgen_session()
     send_message(cid, f"⏳ در حال دانلود مقاله…\n`{doi[:60]}`", parse_mode="Markdown")
@@ -8522,119 +8638,87 @@ def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
 
     safe_title = re.sub(r"[^\w\-]", "_", title or doi)[:60]
     fname = f"{safe_title}.pdf"
-
-    # Clean DOI for all strategies
     clean_doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi).strip().rstrip(".,)")
 
-    # ── Strategy 1: Unpaywall (free OA PDF, no auth) ─────────────────────────
+    # ── Strategy 1: Open Access (Unpaywall/OpenAlex/Semantic Scholar/Europe PMC)
+    oa = _oa_pdf(doi, sess)
+    if oa:
+        data, src = oa
+        if smart_send(cid, data, fname, caption=f"📄 {title or doi}"):
+            send_message(cid, f"✅ مقاله ارسال شد (Open Access – {src}).", reply_markup=home_kb())
+        else:
+            send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+        clear_state(cid)
+        return
+
+    # ── Strategy 2: Sci-Hub (route through WARP if configured to dodge DNS blocks)
+    scihub_sess = _get_web(use_warp=True) if WARP_PROXY else sess
+    result = _scihub_download(doi, scihub_sess)
+    if result:
+        data, f = result
+        if smart_send(cid, data, f, caption=f"📄 {title or doi}"):
+            send_message(cid, "✅ مقاله ارسال شد (Sci-Hub).", reply_markup=home_kb())
+        else:
+            send_message(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb())
+        clear_state(cid)
+        return
+
+    # ── Strategy 3: LibGen scimag (search by DOI → md5 → download)
     try:
-        log.debug("_do_paper_dl_doi Unpaywall: trying clean_doi=%r", clean_doi)
-        up = sess.get(
-            f"https://api.unpaywall.org/v2/{clean_doi}",
-            params={"email": UNPAYWALL_EMAIL},
-            headers={"User-Agent": f"BaleBot/1.0 (mailto:{UNPAYWALL_EMAIL})"},
-            timeout=10,
-        )
-        log.debug(
-            "_do_paper_dl_doi Unpaywall: HTTP %d body=%r",
-            up.status_code,
-            up.text[:100] if up.text else "",
-        )
-        if up.status_code == 200:
-            try:
-                jdata = up.json()
-                oa_url = (jdata.get("best_oa_location") or {}).get("url_for_pdf", "")
-                if oa_url:
-                    log.debug("_do_paper_dl_doi Unpaywall: got OA URL %s", oa_url[:80])
-                    resp = sess.get(
-                        oa_url,
-                        headers={"User-Agent": UA_DESK},
-                        timeout=60,
-                        allow_redirects=True,
-                    )
-                    if resp.status_code == 200 and len(resp.content) > 5000:
-                        log.info(
-                            "_do_paper_dl_doi: OK via Unpaywall %.1fMB",
-                            len(resp.content) / 1024 / 1024,
-                        )
-                        if smart_send(
-                            cid, resp.content, fname, caption=f"📄 {title or doi}"
-                        ):
-                            send_message(
-                                cid,
-                                "✅ مقاله ارسال شد (Open Access).",
-                                reply_markup=home_kb(),
-                            )
-                        else:
-                            send_message(
-                                cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb()
-                            )
-                        clear_state(cid)
-                        return
-            except Exception as je:
-                log.debug("_do_paper_dl_doi Unpaywall JSON parse: %s", je)
-        elif up.status_code == 422:
-            # Unpaywall's email validator rejects some domains/formats outright.
-            # Try a short list of syntactically-valid fallback addresses.
-            fallback_emails = [
-                UNPAYWALL_EMAIL.replace("@", "+bot@")
-                if "@" in UNPAYWALL_EMAIL
-                else "bot@balebot.dev",
-                "bot@balebot.dev",
-                "research@gmail.com",
-            ]
-            for alt_email in fallback_emails:
-                log.debug(
-                    "_do_paper_dl_doi Unpaywall 422, trying alternative email %r",
-                    alt_email,
-                )
-                up2 = sess.get(
-                    f"https://api.unpaywall.org/v2/{clean_doi}",
-                    params={"email": alt_email},
-                    headers={"User-Agent": f"BaleBot/1.0 (mailto:{alt_email})"},
-                    timeout=10,
-                )
-                if up2.status_code != 200:
-                    continue
+        for mirror in LIBGEN_MIRRORS:
+            for params in [{"object": "f", "topic": "a", "doi": clean_doi},
+                           {"req": clean_doi}, {"req": doi}]:
                 try:
-                    jdata = up2.json()
-                    oa_url = (jdata.get("best_oa_location") or {}).get(
-                        "url_for_pdf", ""
-                    )
-                    if oa_url:
-                        log.debug(
-                            "_do_paper_dl_doi Unpaywall: got OA URL %s", oa_url[:80]
-                        )
-                        resp = sess.get(
-                            oa_url,
-                            headers={"User-Agent": UA_DESK},
-                            timeout=60,
-                            allow_redirects=True,
-                        )
-                        if resp.status_code == 200 and len(resp.content) > 5000:
-                            log.info(
-                                "_do_paper_dl_doi: OK via Unpaywall %.1fMB",
-                                len(resp.content) / 1024 / 1024,
-                            )
-                            if smart_send(
-                                cid, resp.content, fname, caption=f"📄 {title or doi}"
-                            ):
-                                send_message(
-                                    cid,
-                                    "✅ مقاله ارسال شد (Open Access).",
-                                    reply_markup=home_kb(),
-                                )
-                            else:
-                                send_message(
-                                    cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb()
-                                )
-                            clear_state(cid)
-                            return
-                    break  # got a valid 200 JSON — no OA url, stop trying emails
-                except Exception as je2:
-                    log.debug("_do_paper_dl_doi Unpaywall JSON parse (retry): %s", je2)
+                    r = sess.get(f"{mirror}/json.php", params=params,
+                                 headers={"User-Agent": UA_DESK}, timeout=15)
+                    if r.status_code != 200 or len(r.content) < 5:
+                        continue
+                    md5 = ""
+                    try:
+                        jdata = r.json()
+                        items = (list(jdata.values()) if isinstance(jdata, dict)
+                                 else (jdata if isinstance(jdata, list) else []))
+                        for item in items:
+                            if isinstance(item, dict) and item.get("md5"):
+                                md5 = str(item["md5"]).lower().strip()
+                                break
+                    except Exception as je:
+                        log.debug("paper libgen json parse: %s", je)
+                    if not md5:
+                        continue
+                    ads = sess.get(f"{mirror}/ads.php?md5={md5}",
+                                   headers={"User-Agent": UA_DESK}, timeout=15)
+                    if ads.status_code == 200 and len(ads.content) > 500:
+                        soup = BeautifulSoup(ads.text, "html.parser")
+                        dl_a = (soup.select_one("a[href*='get.php']")
+                                or soup.select_one("a[href*='download']"))
+                        if dl_a:
+                            href = dl_a.get("href", "")
+                            dl_url = href if href.startswith("http") else f"{mirror}{href}"
+                            resp = sess.get(dl_url, headers={"User-Agent": UA_DESK, "Referer": f"{mirror}/"},
+                                            timeout=90, allow_redirects=True)
+                            if resp.status_code == 200 and len(resp.content) > 5000:
+                                if smart_send(cid, resp.content, fname, caption=f"📄 {title or doi}"):
+                                    send_message(cid, "✅ مقاله ارسال شد (LibGen).", reply_markup=home_kb())
+                                    clear_state(cid)
+                                    return
+                except Exception as pe:
+                    log.debug("paper libgen attempt: %s", pe)
     except Exception as e:
-        log.warning("_do_paper_dl_doi Unpaywall: %s", e)
+        log.warning("paper libgen: %s", e)
+
+    # ── Final: honest coverage message
+    send_message(
+        cid,
+        "❌ این مقاله در دسترس نبود.\n\n"
+        "ℹ️ راهنما: ربات می‌تواند مقالات زیر را بدهد:\n"
+        "• مقالات Open Access (Unpaywall / OpenAlex / Semantic Scholar / Europe PMC)\n"
+        "• مقالات موجود در Sci-Hub / LibGen\n\n"
+        "مقالات پولی جدید (که در Sci-Hub نیستند) قابل دریافت نیستند.\n"
+        f"🔗 DOI: `{doi}`",
+        parse_mode="Markdown", reply_markup=home_kb(),
+    )
+    clear_state(cid)
 
     # ── Strategy 2: Sci-Hub ──────────────────────────────────────────────────
     result = _scihub_download(doi, sess)
@@ -11095,6 +11179,9 @@ def handle_message(msg: dict):
         "img_pinterest": lambda: do_images(cid, st.get("last_query", ""), "pinterest"),
         "img_pexels": lambda: do_images(cid, st.get("last_query", ""), "pexels"),
         "img_wiki": lambda: do_images(cid, st.get("last_query", ""), "wiki"),
+        "img_multi": lambda: do_images(cid, st.get("last_query", ""), "multi"),
+        "img_ddg": lambda: do_images(cid, st.get("last_query", ""), "ddg"),
+        "img_google": lambda: do_images(cid, st.get("last_query", ""), "google"),
         "tg_read": lambda: do_tg_read(cid, text, False),
         "tg_mtproto": lambda: do_tg_read(cid, text, True),
         "tg_dl": lambda: do_tg_dl_media(cid, text),
@@ -11629,7 +11716,10 @@ def handle_callback(cb: dict):
         return
 
     img_src_map = {
+        "img_src_multi": "multi",
+        "img_src_ddg": "ddg",
         "img_src_bing": "bing",
+        "img_src_google": "google",
         "img_src_pinterest": "pinterest",
         "img_src_pexels": "pexels",
         "img_src_wiki": "wiki",
