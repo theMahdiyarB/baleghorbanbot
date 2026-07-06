@@ -7678,7 +7678,7 @@ def do_images(cid: int, query: str, source: str, page=0):
         "pexels": images_pexels,
         "wiki": images_wikimedia,
     }
-fn = fn_map.get(source, images_multi)
+    fn = fn_map.get(source, images_multi)
     fn = fn_map.get(source, images_bing)
     results = fn(query, max_results=offset + 8)
     page_results = results[offset : offset + 6]
