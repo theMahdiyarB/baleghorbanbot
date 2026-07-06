@@ -207,6 +207,20 @@ SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 # Install: https://pkg.cloudflareclient.com/ then: warp-cli set-mode proxy && warp-cli connect
 WARP_PROXY = os.getenv("WARP_PROXY", "")  # e.g. "socks5://127.0.0.1:40000"
 
+def _warp_selfcheck():
+    if not WARP_PROXY:
+        log.warning("WARP self-check: WARP_PROXY NOT set — Sci-Hub/Anna's/blocked DNS will FAIL.")
+        return
+    px = WARP_PROXY.replace("socks5://", "socks5h://")
+    try:
+        r = requests.get("https://www.cloudflare.com/cdn-cgi/trace/",
+                         proxies={"http": px, "https": px}, timeout=10)
+        on = ("warp=on" in r.text) or ("warp=plus" in r.text)
+        log.info("WARP self-check: proxy=%s  ->  warp=%s", WARP_PROXY,
+                 "ON ✅" if on else "OFF ❌ (proxy up but traffic not on WARP)")
+    except Exception as e:
+        log.error("WARP self-check: proxy %s UNREACHABLE — %s", WARP_PROXY, e)
+
 # Cobalt API — self-hosted instance for reliable social/YouTube downloads.
 # Self-host: https://github.com/imputnet/cobalt
 # Default assumes local instance on port 9000.
@@ -228,25 +242,37 @@ LIBGEN_MIRRORS = [
     "https://libgen.gs",
     "https://libgen.vg",
     "https://libgen.la",
+    "https://libgen.bz",
+    "https://libgen.gl",
 ]
 LIBGEN_DL_MIRRORS = [
     "https://libgen.li",
     "https://libgen.gs",
     "https://libgen.vg",
     "https://libgen.la",
+    "https://libgen.bz",
+    "https://libgen.gl",
 ]
 # Anna's Archive - comprehensive open access directory (mirrors libgen + more)
 ANNAS_ARCHIVE_MIRRORS = [
+    "https://annas-archive.gl",
+    "https://annas-archive.pk",
+    "https://annas-archive.gd",
     "https://annas-archive.org",
     "https://annas-archive.se",
 ]
 # Sci-Hub for scientific papers - only reliable mirrors
 SCIHUB_MIRRORS = [
+    "https://sci-hub.su",
     "https://sci-hub.se",
     "https://sci-hub.st",
     "https://sci-hub.ru",
     "https://sci-hub.wf",
     "https://sci-hub.ee",
+    "https://sci-hub.red",
+    "https://sci-hub.box",
+    "https://sci-net.xyz",
+
 ]
 
 
@@ -12132,6 +12158,8 @@ def run():
     except KeyboardInterrupt:
         log.info("Bot stopped.")
         _update_executor.shutdown(wait=False)
+
+    _warp_selfcheck()
 
 
 if __name__ == "__main__":
