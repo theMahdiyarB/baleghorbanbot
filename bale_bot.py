@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """
-بله قربان — Bale Bot  (v3.5)
-Full-featured web assistant for Bale messenger.
+بله قربان — Bale Bot  (v4.0)
+Full-featured web assistant for Telegram & Bale messenger.
 """
 
+import errno
+import shutil
 import hashlib
 import io
+import ipaddress
 import json
 import logging
 import os
 import re
+import secrets
+import socket
 import subprocess
 import tempfile
 import threading
 import time
+import fcntl
+import storage as durable_store
 import urllib.parse
 import zipfile
 from datetime import datetime
@@ -58,10 +65,11 @@ def _make_session(proxy: str = "") -> requests.Session:
         total=3,
         backoff_factor=0.4,
         status_forcelist=[500, 502, 503, 504],
-        allowed_methods=["GET", "POST", "HEAD"],
+        allowed_methods=["GET", "HEAD"],
     )
-    s.mount("https://", HTTPAdapter(max_retries=r))
-    s.mount("http://", HTTPAdapter(max_retries=r))
+    # Multipart POST retries are owned by _post_file; retrying here duplicates media.
+    s.mount("https://", HTTPAdapter(max_retries=r, pool_connections=24, pool_maxsize=24, pool_block=True))
+    s.mount("http://", HTTPAdapter(max_retries=r, pool_connections=24, pool_maxsize=24, pool_block=True))
     if proxy:
         try:
             # Use socks5h so DNS is resolved through the proxy (needed for geo-blocked domains)
@@ -80,6 +88,17 @@ def _make_session(proxy: str = "") -> requests.Session:
             )
             s.proxies = {}
     return s
+
+
+def _acquire_instance_lock(path=Path("/tmp/baleghorbanbot.lock")):
+    """Return an exclusive process lock, or None when another bot owns it."""
+    handle = open(path, "a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
 
 
 # Per-platform constants (used by whichever platform is active in the thread)
@@ -102,9 +121,13 @@ _PLATFORM_CFG = {
 }
 
 
-def _set_platform_ctx(platform: str):
-    """Called at the start of each polling/handler thread — sets thread-local context."""
+def _set_platform_ctx(platform: str, *, chat_id=None, operation=None, callback_operation=False):
+    """Start a fresh request/job context, including on reused pool threads."""
     cfg = _PLATFORM_CFG[platform]
+    _ctx.chat_id = chat_id
+    _ctx.requester = operation.get("requester") if isinstance(operation, dict) else None
+    _ctx.operation = operation
+    _ctx.callback_operation = callback_operation
     _ctx.platform = platform
     _ctx.base_url = cfg["base_url"]
     _ctx.kb_rows = cfg["kb_rows"]
@@ -172,8 +195,10 @@ TELEGRAM_MAX_FILE_SIZE = 48 * 1024 * 1024  # 48MB for Telegram (can go up to 2GB
 BALE_MAX_FILE_SIZE = 20 * 1024 * 1024      # 20MB for Bale (hard limit)
 MAX_FILE_SIZE = BALE_MAX_FILE_SIZE  # Default to Bale for safety, updated dynamically per-thread
 
-# yt-dlp binary — resolved from PATH at runtime
-YTDLP_BIN = "yt-dlp"
+# Prefer the bot's isolated environment over an outdated system executable.
+YTDLP_BIN = str(Path(__file__).resolve().parent / ".venv/bin/yt-dlp")
+if not Path(YTDLP_BIN).is_file():
+    YTDLP_BIN = shutil.which("yt-dlp") or "yt-dlp"
 MAX_IMAGE_SIZE = 10 * 1024 * 1024
 MAX_OCR_SIZE = 5 * 1024 * 1024
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
@@ -186,6 +211,14 @@ YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "")
 TG_API_ID = os.getenv("TG_API_ID", "")
 TG_API_HASH = os.getenv("TG_API_HASH", "")
 TG_SESSION = os.getenv("TG_SESSION_FILE", "tg_session")  # session file path
+
+# Movie/TV APIs
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
+OMDB_API_KEY = os.getenv("OMDB_API_KEY", "")
+OPENSUBTITLES_API_KEY = os.getenv("OPENSUBTITLES_API_KEY", "")
+SUBSOURCE_API_KEY = os.getenv("SUBSOURCE_API_KEY", "")
+BAZARR_URL = os.getenv("BAZARR_URL", "")
+BAZARR_API_KEY = os.getenv("BAZARR_API_KEY", "")
 
 # Twitter: cookies file for yt-dlp (log into twitter.com in browser first)
 TWITTER_COOKIES_FILE = os.getenv("TWITTER_COOKIES_FILE", "")
@@ -241,6 +274,9 @@ LIBGEN_MIRRORS = [
     "https://libgen.li",
     "https://libgen.gs",
     "https://libgen.vg",
+    "https://libgen.is",
+    "https://libgen.st",
+    "https://libgen.rs",
     "https://libgen.la",
     "https://libgen.bz",
     "https://libgen.gl",
@@ -249,17 +285,21 @@ LIBGEN_DL_MIRRORS = [
     "https://libgen.li",
     "https://libgen.gs",
     "https://libgen.vg",
+    "https://libgen.is",
+    "https://libgen.st",
+    "https://libgen.rs",
     "https://libgen.la",
     "https://libgen.bz",
     "https://libgen.gl",
 ]
 # Anna's Archive - comprehensive open access directory (mirrors libgen + more)
+# NOTE (2026-08): .org/.se removed — SOCKS-blocked from this VPS with long
+# retries; .li currently parked. Kept: fast-fail mirrors for when they return.
 ANNAS_ARCHIVE_MIRRORS = [
+    "https://annas-archive.li",
     "https://annas-archive.gl",
     "https://annas-archive.pk",
     "https://annas-archive.gd",
-    "https://annas-archive.org",
-    "https://annas-archive.se",
 ]
 # Sci-Hub for scientific papers - only reliable mirrors
 SCIHUB_MIRRORS = [
@@ -309,6 +349,7 @@ def _get_web(use_warp: bool = False) -> requests.Session:
 # STATE  (thread-safe — all access via lock)
 # ═══════════════════════════════════════════════════════════════════════════════
 import threading as _threading
+from concurrent.futures import Future, ThreadPoolExecutor
 
 _state_lock = _threading.Lock()
 _cache_lock = _threading.Lock()
@@ -319,20 +360,93 @@ _url_lock = _threading.Lock()
 # transcoding/splitting). The thread pool below allows 40 concurrent request
 # handlers — fine for searches/API calls — but 40 simultaneous yt-dlp+ffmpeg
 # processes would thrash a small VPS's CPU and make every download crawl.
-# Everyone else just waits briefly in an orderly queue instead.
-HEAVY_DOWNLOAD_SEMAPHORE = _threading.Semaphore(int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "6")))
+# Admit at most one waiting job per worker; never block update workers.
+_HEAVY_WORKERS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
+HEAVY_DOWNLOAD_SEMAPHORE = _threading.Semaphore(_HEAVY_WORKERS)
+_heavy_admission = _threading.BoundedSemaphore(_HEAVY_WORKERS * 2)
+_heavy_executor = ThreadPoolExecutor(max_workers=_HEAVY_WORKERS, thread_name_prefix="heavy")
+_browser_admission = _threading.BoundedSemaphore(1)
+_BUSY_TEXT = "⏳ سرویس در حال حاضر شلوغ است؛ لطفاً کمی بعد دوباره تلاش کنید."
 
 
-def _heavy_download(fn):
-    """Decorator: bound a download entry point by HEAVY_DOWNLOAD_SEMAPHORE so
-    tens of simultaneous users can't all spawn yt-dlp/ffmpeg processes at
-    once — extra requests simply wait their turn in an orderly queue."""
+class _BrowserBusy(RuntimeError):
+    pass
+
+
+def _browser_job(fn):
+    """One browser chain at a time, including subprocess fallback renderers."""
     import functools
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        with HEAVY_DOWNLOAD_SEMAPHORE:
+        if not _browser_admission.acquire(blocking=False):
+            raise _BrowserBusy(_BUSY_TEXT)
+        try:
             return fn(*args, **kwargs)
+        finally:
+            _browser_admission.release()
+
+    return wrapper
+
+
+DISK_RESERVE_BYTES = 256 * 1024 * 1024
+
+
+def _ensure_disk_space(working_bytes=0):
+    """Keep emergency headroom before temporary downloads/conversions."""
+    free = shutil.disk_usage(tempfile.gettempdir()).free
+    required = DISK_RESERVE_BYTES + max(0, working_bytes)
+    if free < required:
+        log.warning("disk preflight: free=%d required=%d", free, required)
+        raise OSError(errno.ENOSPC, "فضای کافی برای پردازش فایل موجود نیست؛ بعداً دوباره تلاش کنید.")
+
+
+def _heavy_download(fn):
+    """Run downloads off update workers with bounded, nonblocking admission."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        platform = _platform()
+        cid = args[0] if args and isinstance(args[0], int) else kwargs.get("cid")
+        operation = getattr(_ctx, "operation", None)
+        callback_operation = getattr(_ctx, "callback_operation", False)
+        requester = getattr(_ctx, "requester", None)
+
+        def run():
+            _set_platform_ctx(platform, chat_id=cid, operation=operation,
+                              callback_operation=callback_operation)
+            _ctx.requester = requester
+            with HEAVY_DOWNLOAD_SEMAPHORE:
+                try:
+                    _ensure_disk_space()
+                    return fn(*args, **kwargs)
+                except Exception as e:
+                    # The future is discarded — an exception here would fail
+                    # silently and leave the status bubble spinning forever.
+                    log.error("heavy %s: %s", fn.__name__, e, exc_info=True)
+                    if cid:
+                        try:
+                            _status(cid, "❌ " + friendly_error(e),
+                                    reply_markup=home_kb(), final=True)
+                        except Exception:
+                            pass
+                    return None
+
+        if not _heavy_admission.acquire(blocking=False):
+            if cid:
+                _status(cid, _BUSY_TEXT, reply_markup=home_kb(), final=True)
+            future = Future()
+            future.set_result(None)
+            return future
+        try:
+            future = _heavy_executor.submit(run)
+        except BaseException:
+            _heavy_admission.release()
+            raise
+        # Also releases cancelled queued futures; never release twice in run().
+        future.add_done_callback(lambda _: _heavy_admission.release())
+        return future
 
     return wrapper
 
@@ -340,6 +454,7 @@ user_state: dict[int, dict] = {}
 user_stats: dict[int, dict] = {}
 # Cache pending search results so callback buttons can refer to them
 result_cache: dict[str, list] = {}  # key → list[dict]
+_youtube_info_cache: dict[str, tuple[float, dict]] = {}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # BALE API HELPERS
@@ -448,10 +563,12 @@ def _mime(filename: str) -> str:
 
 
 def _should_wrap(filename: str) -> bool:
-    """Non-exempt extensions should be ZIP-wrapped so Bale accepts them.
-    Strips trailing .part so yt-dlp partial files route correctly.
+    """ZIP-wrapping is disabled — files ship raw on both platforms.
+
+    Never re-enable this for Telegram: users unwrap on their own device.
+    Bale accepts every raw extension that bounded_media() feeds through.
     """
-    return _real_ext(filename) not in EXEMPT_EXT
+    return False
 
 
 def _wrap_zip(data: bytes, filename: str) -> tuple[bytes, str]:
@@ -486,15 +603,22 @@ def api(method: str, _retries: int = 4, **kwargs) -> dict:
             # Bale returns ok=False with error_code on server errors
             code = result.get("error_code", 0)
             if code == 429:
+                # Only trust finite positive numeric delays, capped at 60s.
+                parameters = result.get("parameters")
+                retry_after = parameters.get("retry_after") if isinstance(parameters, dict) else None
+                wait = delay
+                if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool) and 0 < retry_after <= 60:
+                    wait = retry_after
                 # Rate-limited — back off more aggressively
                 log.warning(
                     "api %s: rate-limited (429) — retry %d/%d in %ds",
                     method,
                     attempt + 1,
                     _retries,
-                    delay,
+                    wait,
                 )
-                time.sleep(delay)
+                if attempt + 1 < _retries:
+                    time.sleep(wait)
                 delay = min(delay * 3, 60)  # More aggressive backoff for rate limits
                 last_err = result
                 continue
@@ -507,7 +631,8 @@ def api(method: str, _retries: int = 4, **kwargs) -> dict:
                     _retries,
                     delay,
                 )
-                time.sleep(delay)
+                if attempt + 1 < _retries:
+                    time.sleep(delay)
                 delay = min(delay * 2, 30)
                 last_err = result
                 continue
@@ -527,7 +652,8 @@ def api(method: str, _retries: int = 4, **kwargs) -> dict:
                 _retries,
                 delay,
             )
-            time.sleep(delay)
+            if attempt + 1 < _retries:
+                time.sleep(delay)
             delay = min(delay * 2, 30)
             last_err = {"ok": False, "_err": str(e)}
         except Exception as e:
@@ -555,7 +681,9 @@ def _notify_bale_error(chat_id: int):
 def send_message(
     chat_id, text, reply_markup=None, reply_to_message_id=None, parse_mode=None
 ) -> dict:
-    _status_clear(chat_id)  # a real content message ends any transient status bubble
+    if getattr(_ctx, "callback_operation", False) and _operation_get(chat_id):
+        _ctx.callback_operation = False
+        return _operation_finish(chat_id, text, reply_markup, parse_mode)
     kw = dict(chat_id=chat_id, text=str(text)[:4096])
     if reply_markup:
         kw["reply_markup"] = (
@@ -571,12 +699,14 @@ def send_message(
 
 
 # -- Single self-editing status bubble per chat (clean progress UX) --
-# One message per user action: loading -> ... -> done, edited in place so a
-# whole process is a single message. Generic wording only (never leaks which
-# tool/source/proxy is used).
+# One operation bubble per chat. Text edits this bubble; media deletes it first.
 _STATUS = {}
 _STATUS_LOCK = threading.Lock()
-_STATUS_SPIN = "\u25d0\u25d3\u25d1\u25d2"
+_STATUS_SPIN = "◐◓◑◒"
+_OPERATION_TICK_SECONDS = 1.0
+_OPERATION_ACTION_SECONDS = 4.0
+_OPERATION_EDIT_SECONDS = 1.0
+_OPERATION_MAX_SECONDS = 600  # hard cap: a bubble may never outlive 10 minutes
 
 
 def _mk_rm(rm):
@@ -596,7 +726,6 @@ def _raw_send(cid, text, reply_markup=None, reply_to_message_id=None, parse_mode
 
 
 def edit_message(cid, message_id, text, reply_markup=None, parse_mode=None):
-    """Edit a message in place (editMessageText). Works on Bale & Telegram."""
     if not message_id:
         return _raw_send(cid, text, reply_markup=reply_markup, parse_mode=parse_mode)
     kw = dict(chat_id=cid, message_id=message_id, text=str(text)[:4096])
@@ -608,126 +737,255 @@ def edit_message(cid, message_id, text, reply_markup=None, parse_mode=None):
     return api("editMessageText", **kw)
 
 
+def _operation_get(cid):
+    with _STATUS_LOCK:
+        return _STATUS.get(_pkey(cid))
+
+
+def _operation_body(st):
+    if st["final"] or not st["spinner"]:
+        return str(st["text"])
+    st["tick"] += 1
+    return f"{_STATUS_SPIN[st['tick'] % len(_STATUS_SPIN)]} {st['text']}\n\n⏱ {int(time.monotonic() - st['start'])} ثانیه"
+
+
+def _operation_render(cid, st):
+    # Per-operation lock: Bot API I/O must never hold the global chat registry lock.
+    with st["lock"]:
+        body = _operation_body(st)
+        if body == st.get("body"):
+            return {"ok": True}
+        if st.get("mid"):
+            result = edit_message(cid, st["mid"], body, st.get("reply_markup"), st.get("parse_mode"))
+            # A transient/rate-limit edit failure must not stack a new status bubble.
+            if not result or not result.get("ok"):
+                return result or {"ok": False}
+        else:
+            result = _raw_send(cid, body, st.get("reply_markup"), parse_mode=st.get("parse_mode"))
+            st["mid"] = ((result or {}).get("result") or {}).get("message_id")
+        if result and result.get("ok"):
+            st["body"] = body
+        return result
+
+
+def _operation_current(cid, st):
+    with _STATUS_LOCK:
+        return _STATUS.get(_pkey(cid)) is st
+
+
+def _operation_tick(cid, key, st):
+    _set_platform_ctx(st["platform"], chat_id=cid, operation=st)
+    while not st["stop"].wait(_OPERATION_TICK_SECONDS):
+        if not _operation_current(cid, st) or st["final"]:
+            return
+        now = time.monotonic()
+        if now - st["start"] >= _OPERATION_MAX_SECONDS:
+            # Safety net: a stuck operation must never spin/typing forever.
+            log.warning("operation bubble cid=%s exceeded %ds — auto-finalizing", cid, _OPERATION_MAX_SECONDS)
+            _operation_update(cid, "⌛ عملیات بیش از حد طول کشید. لطفاً دوباره تلاش کنید.",
+                              reply_markup=home_kb(), final=True)
+            return
+        if now - st["action_at"] >= _OPERATION_ACTION_SECONDS:
+            chat_action(cid, st["action"])
+            st["action_at"] = now
+        if now - st["edit_at"] >= _OPERATION_EDIT_SECONDS:
+            _operation_render(cid, st)
+            st["edit_at"] = now
+
+
+def _operation_start(cid, text, message_id=None, reply_markup=None, parse_mode=None, spinner=True):
+    key = _pkey(cid)
+    now = time.monotonic()
+    st = {"mid": message_id, "start": now, "tick": 0, "text": text,
+          "reply_markup": reply_markup, "parse_mode": parse_mode, "spinner": spinner,
+          "platform": _platform(), "requester": getattr(_ctx, "requester", None), "action": "typing", "action_at": now,
+          "edit_at": now, "body": None, "final": False,
+          "stop": threading.Event(), "lock": threading.Lock()}
+    with _STATUS_LOCK:
+        old = _STATUS.get(key)
+        _STATUS[key] = st
+    if old:
+        old["stop"].set()
+    _ctx.operation = st
+    chat_action(cid, st["action"])
+    _operation_render(cid, st)
+    threading.Thread(target=_operation_tick, args=(cid, key, st), daemon=True).start()
+    return st
+
+
+def _operation_update(cid, text, reply_markup=None, parse_mode=None, final=False, spinner=True):
+    owner = getattr(_ctx, "operation", None)
+    if owner is not None and not _operation_current(cid, owner):
+        return {"ok": False}
+    st = owner or _operation_get(cid)
+    if not st:
+        st = _operation_start(cid, text, reply_markup=reply_markup, parse_mode=parse_mode, spinner=spinner)
+        return _operation_finish(cid, text, reply_markup, parse_mode) if final else {"ok": True}
+    if not _operation_current(cid, st):
+        return {"ok": False}
+    with st["lock"]:
+        st["text"], st["reply_markup"], st["parse_mode"] = text, reply_markup, parse_mode
+        st["spinner"], st["final"] = spinner, final
+    result = _operation_render(cid, st)
+    if final:
+        with _STATUS_LOCK:
+            if _STATUS.get(_pkey(cid)) is st:
+                _STATUS.pop(_pkey(cid), None)
+        st["stop"].set()
+        if getattr(_ctx, "operation", None) is st:
+            _ctx.operation = None
+            _ctx.callback_operation = False
+    return result
+
+
+def _operation_finish(cid, text, reply_markup=None, parse_mode=None):
+    return _operation_update(cid, text, reply_markup, parse_mode, final=True, spinner=False)
+
+
+def _operation_prepare_media(cid, owner=None):
+    owner = owner or getattr(_ctx, "operation", None)
+    with _STATUS_LOCK:
+        st = _STATUS.get(_pkey(cid))
+        if owner and st is not owner:
+            return False
+        if st:
+            _STATUS.pop(_pkey(cid), None)
+    if not st:
+        return False
+    st["stop"].set()
+    if st.get("mid"):
+        api("deleteMessage", chat_id=cid, message_id=st["mid"])
+    if getattr(_ctx, "operation", None) is st:
+        _ctx.operation = None
+        _ctx.callback_operation = False
+    return True
+
+
+# ── Friendly error helpers ────────────────────────────────────────────────
+# Users must never see raw exceptions or admin config keys. All failure
+# messages go through these translators (2026-09-20 sweep).
+
+_FRIENDLY_PATTERNS: list[tuple[str, str]] = [
+    # (substring of raw error, user-facing Persian guidance)
+    ("executable doesn't exist", "سرویس دانلود موقتاً آماده نیست — کمی بعد دوباره تلاش کنید."),
+    ("browser failed", "سرویس دانلود موقتاً آماده نیست — کمی بعد دوباره تلاش کنید."),
+    ("empty media response", "اینستاگرام اجازهٔ دسترسی مهمان نمی‌دهد (پست خصوصی یا محدودشده است)."),
+    ("sign in to confirm", "سرویس تأیید ورود خواسته — این ویدیو از سمت سرویسدهنده محدود شده است."),
+    ("login required", "این محتوا نیاز به حساب کاربری دارد و قابل دانلود نیست."),
+    ("private", "این پست خصوصی است و فقط برای افراد تأییدشده دیده می‌شود."),
+    ("not found", "چنین محتوایی پیدا نشد — لینک را بررسی کنید."),
+    ("404", "چنین محتوایی پیدا نشد — لینک را بررسی کنید."),
+    ("429", "سرویس موقتاً محدود شده — چند دقیقه بعد تلاش کنید."),
+    ("cloudflare", "سرویس مبدا دسترسی ربات را محدود کرده — کمی بعد تلاش کنید."),
+    ("403", "سرویس مبدا دسترسی به این محتوا را مسدود کرده است."),
+    ("timeout", "پاسخی از سرویس نرسید (تأخیر شبکه) — دوباره تلاش کنید."),
+    ("connection", "مشکل شبکه در ارتباط با سرویس — دوباره تلاش کنید."),
+    ("age", "این محتوا محدودیت سنی دارد و بدون حساب تأییدشده قابل دانلود نیست."),
+    ("unavailable", "این محتوا دیگر در دسترس نیست (حذف یا محدود شده)."),
+    ("quota", "سهمیهٔ سرویس تمام شده — فردا دوباره امتحان کنید."),
+]
+
+
+def friendly_error(raw) -> str:
+    """Map a raw exception/HTTP error string to a short Persian user guide."""
+    if isinstance(raw, OSError) and raw.errno == errno.ENOSPC:
+        return "فضای کافی برای پردازش فایل موجود نیست؛ بعداً دوباره تلاش کنید."
+    if isinstance(raw, _BrowserBusy):
+        return _BUSY_TEXT
+    text = str(raw or "").lower()
+    for needle, msg in _FRIENDLY_PATTERNS:
+        if needle in text:
+            return msg
+    return "خطای غیرمنتظره — لطفاً دوباره تلاش کنید. اگر تکرار شد، لینک دیگری را امتحان کنید."
+
+
+_APK_ATTEMPT_MAP: list[tuple[str, str]] = [
+    ("browser failed", "مرورگر دانلود در دسترس نبود"),
+    ("executable", "مرورگر دانلود در دسترس نبود"),
+    ("http 404", "در این منبع یافت نشد"),
+    ("http 403", "منبع دسترسی را مسدود کرد"),
+    ("http 429", "منبع موقتاً محدود شده"),
+    ("http 5", "سرور منبع موقتاً از کار افتاد"),
+    ("exceeds", "حجم فایل بیش از حد مجاز بود"),
+    ("too small", "فایل ناقص دریافت شد"),
+    ("not a zip", "فایل نامعتبر بود"),
+    ("no dl link", "لینک دانلود ارائه نشد"),
+    ("no packages", "نسخه‌ای ثبت نشده"),
+    ("no file.path", "فایلی یافت نشد"),
+    ("expected for non-foss", "اپ متن‌باز نیست (طبیعی)"),
+    ("timeout", "مهلت ارتباط تمام شد"),
+    ("connection", "ارتباط برقرار نشد"),
+    ("cloudflare", "منبع دسترسی را محدود کرد"),
+]
+
+
+def translate_apk_attempts(attempts: list) -> str:
+    """Turn raw source-attempt log strings into short Persian lines."""
+    lines = []
+    for a in (attempts or [])[:8]:
+        if ": OK" in a:
+            continue
+        low = a.lower()
+        summary = None
+        for needle, msg in _APK_ATTEMPT_MAP:
+            if needle in low:
+                summary = msg
+                break
+        src = a.split(":")[0].strip() if ":" in a else a.strip()
+        lines.append(f"• {src}: {summary or 'منبع پاسخ معتبر نداد'}")
+    seen, out = set(), []
+    for line in lines:
+        if line not in seen:
+            seen.add(line)
+            out.append(line)
+    return "\n".join(out[:5]) or "• هیچ منبعی پاسخ نداد"
+
+
 def _status(cid, text, reply_markup=None, reply_to_message_id=None,
             parse_mode=None, final=False, spinner=True):
-    """Show/advance the chat's single status bubble.
-
-    - non-final: renders a spinner + text + elapsed and reuses one message.
-    - final=True: writes the final text and closes the bubble.
-    Falls back to a fresh message if editing is not possible.
-    """
-    key = _pkey(cid)
-    now = time.time()
-    with _STATUS_LOCK:
-        st = _STATUS.get(key) or {"mid": None, "start": now, "tick": 0}
-        st["tick"] += 1
-        tick, start, mid = st["tick"], st["start"], st.get("mid")
-    if final or not spinner:
-        body = str(text)
-    else:
-        spin = _STATUS_SPIN[tick % len(_STATUS_SPIN)]
-        body = f"{spin} {text}\n\n\u23f1 {int(now - start)}s"
-    r = None
-    if mid:
-        r = edit_message(cid, mid, body, reply_markup=reply_markup, parse_mode=parse_mode)
-    if not r or not (r or {}).get("ok"):
-        r = _raw_send(cid, body, reply_markup=reply_markup, parse_mode=parse_mode)
-        mid = ((r or {}).get("result") or {}).get("message_id")
-    with _STATUS_LOCK:
-        if final:
-            _STATUS.pop(key, None)
-        else:
-            st["mid"] = mid
-            _STATUS[key] = st
-    return r
+    # Media has already been delivered; don't add a redundant “sent” bubble.
+    if final and str(text).startswith("✅") and not _operation_get(cid):
+        return {"ok": True}
+    return (_operation_finish(cid, text, reply_markup, parse_mode) if final
+            else _operation_update(cid, text, reply_markup, parse_mode, spinner=spinner))
 
 
 def _status_clear(cid, delete=True):
-    """End the chat's transient status bubble. Called by send_message so that a
-    real content message replaces any leftover spinner instead of stacking."""
-    key = _pkey(cid)
-    with _STATUS_LOCK:
-        st = _STATUS.pop(key, None)
-    if delete and st and st.get("mid"):
-        try:
-            api("deleteMessage", chat_id=cid, message_id=st["mid"])
-        except Exception:
-            pass
-
-
-def edit_message(chat_id, message_id, text, reply_markup=None, parse_mode=None) -> dict:
-    """Edit a message in place (editMessageText). Works on Bale & Telegram.
-    Falls back to a new message if there is no message_id."""
-    if not message_id:
-        return send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
-    kw = dict(chat_id=chat_id, message_id=message_id, text=str(text)[:4096])
-    if reply_markup:
-        kw["reply_markup"] = (json.dumps(reply_markup)
-                              if not isinstance(reply_markup, str) else reply_markup)
-    if parse_mode:
-        kw["parse_mode"] = parse_mode
-    return api("editMessageText", **kw)
+    if delete:
+        _operation_prepare_media(cid)
 
 
 class Progress:
-    """Live, self-editing status message with steps + elapsed/ETA.
-
-    Sends one message, then edits it in place. Edits are throttled (~1.3s) to
-    avoid rate limits. Safe on both Bale and Telegram (both support
-    editMessageText). If editing ever fails it silently keeps going.
-    """
-    _SPIN = "\u25d0\u25d3\u25d1\u25d2"
-
-    def __init__(self, cid, title="\u23f3 \u062f\u0631 \u062d\u0627\u0644 \u067e\u0631\u062f\u0627\u0632\u0634\u2026", total_steps=0):
-        self.cid = cid
-        self.title = title
-        self.total = total_steps
-        self.done = 0
-        self.start = time.time()
-        self.last_edit = 0.0
-        self.tick = 0
-        self.lines = []
-        try:
-            r = send_message(cid, title)
-            self.msg_id = (r or {}).get("result", {}).get("message_id")
-        except Exception:
-            self.msg_id = None
+    """Paper workflow adapter backed by the shared 1Hz operation bubble."""
+    def __init__(self, cid, title="⏳ در حال پردازش…", total_steps=0):
+        self.cid, self.title, self.total, self.done, self.lines = cid, title, total_steps, 0, []
+        _operation_start(cid, title)
 
     def _eta(self):
-        if self.total and self.done:
-            per = (time.time() - self.start) / self.done
-            remain = int(per * max(0, self.total - self.done))
-            return "  \u2022  ~" + str(remain) + "s \u0628\u0627\u0642\u06cc\u200c\u0645\u0627\u0646\u062f\u0647"
+        st = _operation_get(self.cid)
+        if self.total and self.done and st:
+            remain = int((time.monotonic() - st["start"]) / self.done * max(0, self.total - self.done))
+            return "  •  ~" + str(remain) + "s باقی‌مانده"
         return ""
 
+    def _render(self, final=False):
+        prog = f" ({self.done}/{self.total})" if self.total else ""
+        body = self.title + prog + "\n\n" + "\n".join(self.lines[-10:]) + self._eta()
+        return _operation_finish(self.cid, body) if final else _operation_update(self.cid, body)
+
     def step(self, text, force=False):
-        if self.lines and self.lines[-1].startswith("\u23f3"):
-            self.lines[-1] = "\u25ab\ufe0f" + self.lines[-1][1:]
+        if self.lines and self.lines[-1].startswith("⏳"):
+            self.lines[-1] = "▫️" + self.lines[-1][1:]
         if text:
             self.done += 1
-            self.lines.append("\u23f3 " + text)
-        self._render(force=force)
-
-    def _render(self, force=False):
-        now = time.time()
-        if not force and now - self.last_edit < 1.3:
-            return
-        self.last_edit = now
-        self.tick += 1
-        spin = self._SPIN[self.tick % len(self._SPIN)]
-        prog = (" (" + str(self.done) + "/" + str(self.total) + ")") if self.total else ""
-        head = spin + " " + self.title + prog
-        body = head + "\n\n" + "\n".join(self.lines[-10:]) + "\n\n\u23f1 " + str(int(now - self.start)) + "s" + self._eta()
-        try:
-            edit_message(self.cid, self.msg_id, body)
-        except Exception as e:
-            log.debug("Progress render: %s", e)
+            self.lines.append("⏳ " + text)
+        self._render()
 
     def finish(self, text, ok=True):
-        if self.lines and self.lines[-1].startswith("\u23f3"):
-            self.lines[-1] = ("\u2705" if ok else "\u25ab\ufe0f") + self.lines[-1][1:]
-        self.lines.append(("\u2705 " if ok else "\u274c ") + text)
-        self._render(force=True)
+        if self.lines and self.lines[-1].startswith("⏳"):
+            self.lines[-1] = ("✅" if ok else "▫️") + self.lines[-1][1:]
+        self.lines.append(("✅ " if ok else "❌ ") + text)
+        self._render(final=True)
 
 
 def _gbooks_cover(title, author=""):
@@ -840,6 +1098,7 @@ def _post_file(
             resp = _safe_json(r)
             ok = resp.get("ok", False)
             if ok:
+                _conversion_capture(extra_data["chat_id"], resp.get("result"), filename, len(data_bytes))
                 file_obj.close()
                 return True
             code = resp.get("error_code", 0)
@@ -912,7 +1171,7 @@ def _has_audio_stream(data_bytes: bytes, filename: str = "clip.mp4") -> bool:
     ffprobe = _sh.which("ffprobe") or "/usr/bin/ffprobe"
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            src = Path(tmp) / filename
+            src = Path(tmp) / _media_filename(filename)
             src.write_bytes(data_bytes)
             probe = subprocess.run(
                 [
@@ -938,7 +1197,13 @@ def _has_audio_stream(data_bytes: bytes, filename: str = "clip.mp4") -> bool:
         return True
 
 
-def _video_meta(data_bytes: bytes, filename: str) -> dict:
+def _media_filename(filename: str) -> str:
+    """Keep untrusted media names local on either path convention."""
+    name = Path(str(filename).replace("\\", "/").replace("\x00", "")).name
+    return name if name not in {"", ".", ".."} else "file"
+
+
+def _video_meta(data_bytes: bytes, filename: str, thumbnail=True) -> dict:
     """
     Extract video duration (seconds) and generate a thumbnail frame via ffmpeg.
     Returns dict with optional keys: duration (int), thumb_bytes (bytes).
@@ -951,7 +1216,7 @@ def _video_meta(data_bytes: bytes, filename: str) -> dict:
     result = {}
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            src = Path(tmp) / filename
+            src = Path(tmp) / _media_filename(filename)
             src.write_bytes(data_bytes)
 
             # Duration
@@ -984,6 +1249,9 @@ def _video_meta(data_bytes: bytes, filename: str) -> dict:
                 if w and h:
                     result["width"] = w
                     result["height"] = h
+
+            if not thumbnail:
+                return result
 
             # Thumbnail — grab frame at 1s (or 0 if short)
             seek = (
@@ -1023,24 +1291,33 @@ def _video_meta(data_bytes: bytes, filename: str) -> dict:
 
 
 def _send_one_chunk(
-    chat_id, data_bytes: bytes, filename: str, caption="", media_type="document"
+    chat_id, data_bytes: bytes, filename: str, caption="", media_type="auto"
 ) -> bool:
     """Send a single chunk using the correct Bale endpoint.
     For videos: extracts duration + thumbnail frame via ffmpeg for proper player display.
     Uses _real_ext() so .part files from yt-dlp route as video/audio correctly.
     """
+    filename = _media_filename(filename)
     ext = _real_ext(filename)
     extra = {"chat_id": str(chat_id), "caption": caption[:1024]}
 
-    if media_type == "video" or ext in {"mp4", "mkv", "avi", "mov", "webm", "m4v"}:
+    if media_type == "document":
+        return _post_file("sendDocument", "document", filename, data_bytes, extra)
+    if media_type == "video" or (media_type == "auto" and ext in {"mp4", "mkv", "avi", "mov", "webm", "m4v"}):
         extra["supports_streaming"] = "true"
-        # Extract duration + thumbnail for proper video player display
-        meta = _video_meta(data_bytes, filename)
+        # Explicit metadata: without duration/width/height some players show
+        # a wrong ratio/preview (notably long TikTok videos). _video_meta is
+        # fast (<1s) for normal clips; skip the temp-copy overhead for huge files.
+        meta = (
+            _video_meta(data_bytes, filename)
+            if len(data_bytes) <= 150 * 1024 * 1024
+            else {}
+        )
         if meta.get("duration"):
-            extra["duration"] = str(meta["duration"])
-        if meta.get("width"):
-            extra["width"] = str(meta["width"])
-            extra["height"] = str(meta["height"])
+            extra["duration"] = int(meta["duration"])
+        if meta.get("width") and meta.get("height"):
+            extra["width"] = int(meta["width"])
+            extra["height"] = int(meta["height"])
         thumb_bytes = meta.get("thumb_bytes")
         if thumb_bytes:
             # thumb must be sent as a separate multipart field
@@ -1059,6 +1336,7 @@ def _send_one_chunk(
                     )
                     resp = _safe_json(r)
                     if resp.get("ok"):
+                        _conversion_capture(chat_id, resp.get("result"), filename, len(data_bytes))
                         thumb_sent = True
                         video_obj.close()
                         thumb_obj.close()
@@ -1088,7 +1366,7 @@ def _send_one_chunk(
             # Fall through to plain sendVideo if thumb attempt completely failed
             return _post_file("sendVideo", "video", filename, data_bytes, extra)
         return _post_file("sendVideo", "video", filename, data_bytes, extra)
-    elif media_type == "audio" or ext in {
+    elif media_type == "audio" or (media_type == "auto" and ext in {
         "mp3",
         "ogg",
         "wav",
@@ -1096,9 +1374,9 @@ def _send_one_chunk(
         "m4a",
         "aac",
         "opus",
-    }:
+    }):
         return _post_file("sendAudio", "audio", filename, data_bytes, extra)
-    elif media_type == "photo" or ext in {"jpg", "jpeg", "png", "gif", "webp"}:
+    elif media_type == "photo" or (media_type == "auto" and ext in {"jpg", "jpeg", "png", "gif", "webp"}):
         return _post_file("sendPhoto", "photo", filename, data_bytes, extra)
     else:
         return _post_file("sendDocument", "document", filename, data_bytes, extra)
@@ -1114,11 +1392,13 @@ def _split_video_ffmpeg(data: bytes, filename: str, max_mb: float = 18.0) -> lis
     Returns list of (bytes, filename) tuples — one per part.
     Returns [(data, filename)] unchanged if ffmpeg fails for any reason.
     """
+    _ensure_disk_space(len(data) * 2)
     import shutil as _sh
 
     ffmpeg = _sh.which("ffmpeg") or "/usr/bin/ffmpeg"
     ffprobe = _sh.which("ffprobe") or "/usr/bin/ffprobe"
 
+    filename = _media_filename(filename)
     # Strip .part suffix before working with the file
     clean_name = filename[:-5] if filename.lower().endswith(".part") else filename
 
@@ -1221,24 +1501,26 @@ def smart_send(
     - other file > CHUNK_SIZE     → raw byte-split + cat instructions
     Handles yt-dlp .part suffix transparently throughout.
     """
+    filename = _media_filename(filename)
     if not data:
         log.error("smart_send: empty data for %s", filename)
         return False
 
+    _operation_prepare_media(chat_id)
     log.info(
         "smart_send: %s  %.1fMB  type=%s", filename, len(data) / 1024 / 1024, media_type
     )
 
     # Determine real extension (strips .part if present)
     ext = _real_ext(filename)
-    is_video = media_type == "video" or ext in {
+    is_video = media_type == "video" or (media_type == "auto" and ext in {
         "mp4",
         "mkv",
         "avi",
         "mov",
         "webm",
         "m4v",
-    }
+    })
 
     # Step 1: ZIP-wrap if the real extension isn't exempt.
     # Skip if it's already a numbered part (part1of3) to avoid double-wrapping.
@@ -1253,6 +1535,7 @@ def smart_send(
         data, filename = _wrap_zip(data, filename)
         ext = _real_ext(filename)
         is_video = False
+        media_type = "document"
         log.info("smart_send: zipped → %s  %.1fMB", filename, len(data) / 1024 / 1024)
 
     total_size = len(data)
@@ -1295,7 +1578,7 @@ def smart_send(
                     media_type="video",
                 )
                 if not ok:
-                    send_message(chat_id, f"❌ ارسال بخش {i + 1} ناموفق بود.")
+                    send_message(chat_id, f"❌ ارسال بخش {i + 1} ناموفق بود — احتمالاً از حد حجم مجاز بزرگ‌تر است. ارسال بخش‌های بعدی متوقف شد؛ فایل کامل تحویل داده نشد.")
                     all_ok = False
                     break
             if all_ok:
@@ -1304,8 +1587,9 @@ def smart_send(
                     f"✅ همه {n} بخش ارسال شدند.\n_(هر بخش را مستقیم پخش کنید)_",
                     parse_mode="Markdown",
                 )
+            if all_ok:
+                _send_post_download_actions(chat_id)
             return all_ok
-        # ffmpeg failed → fall through to byte-split as last resort
 
     # Step 4: Non-video or ffmpeg fallback → raw byte-split
     chunk_size = _chunk_size()
@@ -1319,11 +1603,12 @@ def smart_send(
         parse_mode="Markdown",
     )
     all_ok = True
+    digits = len(str(total_chunks))
     for i in range(total_chunks):
         start = i * chunk_size
         end = min(start + chunk_size, total_size)
         chunk = data[start:end]
-        chunk_name = f"{base2}.part{i + 1}of{total_chunks}{ext2}"
+        chunk_name = f"{base2}.part{i + 1:0{digits}d}of{total_chunks}{ext2}"
         send_message(
             chat_id,
             f"📤 ارسال بخش {i + 1} از {total_chunks} "
@@ -1333,18 +1618,33 @@ def smart_send(
             chat_id, chunk, chunk_name, caption="", media_type="document"
         )
         if not ok:
-            send_message(chat_id, f"❌ ارسال بخش {i + 1} ناموفق بود.")
+            send_message(chat_id, f"❌ ارسال بخش {i + 1} ناموفق بود — احتمالاً از حد حجم مجاز بزرگ‌تر است. ارسال بخش‌های بعدی متوقف شد؛ فایل کامل تحویل داده نشد.")
             all_ok = False
             break
     if all_ok:
+        import shlex
+        pattern = shlex.quote("./" + base2 + ".part") + "*" + shlex.quote(f"of{total_chunks}{ext2}")
+        command = f"LC_ALL=C cat {pattern} > {shlex.quote('./' + filename)}"
         send_message(
             chat_id,
             f"✅ همه {total_chunks} بخش ارسال شدند!\n\n"
             f"برای ترکیب:\n"
-            f"`cat {base2}.part*of{total_chunks}{ext2} > {filename}`",
-            parse_mode="Markdown",
+            f"{command}",
         )
+    if all_ok:
+        _send_post_download_actions(chat_id)
     return all_ok
+
+
+def _send_post_download_actions(chat_id: int):
+    """Send inline keyboard with post-download actions (Persian)."""
+    kb = {
+        "inline_keyboard": [
+            [{"text": "🗑 حذف این پیام", "callback_data": "delete_this_msg"}],
+            [{"text": "🏠 منوی اصلی", "callback_data": "home"}],
+        ]
+    }
+    send_message(chat_id, "🎯 اقدامات:", reply_markup=kb)
 
 
 # Convenience wrappers (keep old call sites working)
@@ -1362,6 +1662,7 @@ def send_photo(chat_id, img_bytes: bytes, caption="", reply_markup=None) -> bool
     """Photos don't chunk — just post directly with retry."""
     if not img_bytes:
         return False
+    _operation_prepare_media(chat_id)
     ext = "jpg"
     data = {"chat_id": str(chat_id), "caption": caption[:1024]}
     if reply_markup:
@@ -1375,6 +1676,7 @@ def send_photo(chat_id, img_bytes: bytes, caption="", reply_markup=None) -> bool
             )
             resp = _safe_json(r)
             if resp.get("ok"):
+                _conversion_capture(chat_id, resp.get("result"), "image.jpg", len(img_bytes))
                 return True
             code = resp.get("error_code", 0)
             if code in (429, 500, 502, 503, 504) or r.status_code >= 500:
@@ -1390,6 +1692,9 @@ def send_photo(chat_id, img_bytes: bytes, caption="", reply_markup=None) -> bool
         except Exception as e:
             log.error("sendPhoto exception: %s", e)
             return False
+        finally:
+            for upload in files.values():
+                upload[1].close()
     return False
 
 
@@ -1408,6 +1713,7 @@ def send_media_group(chat_id, items: list[dict]) -> bool:
     """
     if not items:
         return False
+    _operation_prepare_media(chat_id)
     # Bale/Telegram limits: max 10 items per group
     items = items[:10]
 
@@ -1423,7 +1729,7 @@ def send_media_group(chat_id, items: list[dict]) -> bool:
             entry["caption"] = item["caption"][:1024]
         if is_vid:
             entry["supports_streaming"] = True
-            meta = _video_meta(item["data"], item["fname"])
+            meta = _video_meta(item["data"], item["fname"], False)
             if meta.get("duration"):
                 entry["duration"] = meta["duration"]
             if meta.get("width"):
@@ -1431,17 +1737,21 @@ def send_media_group(chat_id, items: list[dict]) -> bool:
                 entry["height"] = meta["height"]
         media_list.append(entry)
         mime = "video/mp4" if is_vid else "image/jpeg"
-        files[field] = (item["fname"], io.BytesIO(item["data"]), mime)
+        files[field] = (_media_filename(item["fname"]), io.BytesIO(item["data"]), mime)
 
     data = {"chat_id": str(chat_id), "media": json.dumps(media_list)}
     delay = 3
     for attempt in range(3):
         try:
+            for f in files.values():
+                f[1].seek(0)
             r = _session().post(
                 f"{_base_url()}/sendMediaGroup", data=data, files=files, timeout=180
             )
             resp = _safe_json(r)
             if resp.get("ok"):
+                for message, item in zip(resp.get("result") or [], items):
+                    _conversion_capture(chat_id, message, item["fname"], len(item["data"]))
                 log.info("send_media_group: OK %d items to %d", len(items), chat_id)
                 # Close all BytesIO objects
                 for f in files.values():
@@ -1449,12 +1759,6 @@ def send_media_group(chat_id, items: list[dict]) -> bool:
                 return True
             code = resp.get("error_code", 0)
             if code in (429, 500, 502, 503, 504) or r.status_code >= 500:
-                # Reset BytesIO positions for retry
-                for f in files.values():
-                    try:
-                        f[1].seek(0)
-                    except Exception:
-                        pass
                 time.sleep(delay)
                 delay = min(delay * 2, 30)
                 continue
@@ -1482,7 +1786,7 @@ def send_media_group(chat_id, items: list[dict]) -> bool:
         )
         if ok:
             sent += 1
-    return sent > 0
+    return sent == len(items)
 
 
 def chat_action(chat_id, action="typing"):
@@ -1511,8 +1815,13 @@ def get_file_url(file_id: str) -> Optional[str]:
 
 
 def download_bytes(
-    url: str, max_bytes=MAX_FILE_SIZE, headers: Optional[dict] = None
+    url: str, max_bytes=None, headers: Optional[dict] = None
 ) -> Optional[bytes]:
+    # Transfer budget is resolved per request, not frozen to Bale at import.
+    # Keep an independent bounded budget even with a local Telegram Bot API.
+    if max_bytes is None:
+        max_bytes = TELEGRAM_MAX_FILE_SIZE if _platform() == "telegram" else BALE_MAX_FILE_SIZE
+    r = None
     if not url or url.strip() in ("", "NA", "na", "none", "None", "null"):
         log.debug("download_bytes: skipping invalid URL %r", url)
         return None
@@ -1525,7 +1834,7 @@ def download_bytes(
     if headers:
         req_headers.update(headers)
     try:
-        r = WEB.get(url, timeout=30, stream=True, headers=req_headers)
+        r = _public_get(url, timeout=30, headers=req_headers)
         if r.status_code >= 400:
             log.warning("download_bytes: HTTP %d for %s", r.status_code, url)
             return None
@@ -1548,6 +1857,9 @@ def download_bytes(
     except Exception as e:
         log.error("download_bytes: %s — %s", url, e)
         return None
+    finally:
+        if r is not None:
+            r.close()
 
 
 def answer_cb(cb_id: str, text=""):
@@ -1578,6 +1890,22 @@ def cache_get(key: str) -> list:
         return result_cache.get(key, [])
 
 
+def cache_set_owned(key: str, data: list, platform: str, chat_id: int) -> None:
+    """Store callback results with a short owner suffix."""
+    owner_key = f"{key}_{platform}_{int(chat_id)}"
+    cache_set(owner_key, data)
+
+
+def cache_get_owned(key: str, platform: str, chat_id: int) -> list:
+    with _cache_lock:
+        return result_cache.get(f"{key}_{platform}_{int(chat_id)}", [])
+
+
+def _rss_cache_key(cid: int, feed_url: str, page: int = 0) -> str:
+    """Create a stable per-chat RSS callback key without exposing the URL."""
+    return make_cache_key("rss", f"{_platform()}:{int(cid)}:{feed_url}:{int(page)}", 0)
+
+
 def make_cache_key(prefix: str, query: str, page: int) -> str:
     h = hashlib.md5(f"{prefix}:{query}:{page}".encode()).hexdigest()[:8]
     return f"{prefix}_{h}"
@@ -1587,45 +1915,33 @@ def make_cache_key(prefix: str, query: str, page: int) -> str:
 # KEYBOARDS
 # ═══════════════════════════════════════════════════════════════════════════════
 def main_menu_kb():
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "🔎 جستجو در وب", "callback_data": "mode_search"},
-                {"text": "🌐 مشاهده سایت", "callback_data": "mode_open"},
-                {"text": "📖 ویکی‌پدیا", "callback_data": "mode_wiki"},
-            ],
-            [
-                {"text": "📺 یوتیوب", "callback_data": "mode_youtube"},
-                {"text": "🎵 دانلود موزیک", "callback_data": "mode_music"},
-            ],
-            [
-                {"text": "📱 دانلود APK", "callback_data": "mode_apk"},
-                {"text": "📚 دانلود کتاب و مقاله", "callback_data": "mode_book"},
-            ],
-            [
-                {"text": "🖼 دانلود عکس", "callback_data": "mode_images"},
-                {"text": "🐙 GitHub", "callback_data": "mode_github"},
-            ],
-            [
-                {"text": "📰 اخبار RSS", "callback_data": "mode_rss"},
-                {"text": "🌐 ترجمه", "callback_data": "mode_translate"},
-            ],
-            [
-                {"text": "🖼 OCR متن از عکس", "callback_data": "mode_ocr"},
-                {"text": "🌐 IP / دامنه", "callback_data": "mode_iplookup"},
-            ],
-            [
-                {"text": "🛡 تشخیص ویروس", "callback_data": "mode_virusscan"},
-                {"text": "🔒 حریم خصوصی", "callback_data": "privacy"},
-            ],
-            # Full-width social networks button
-            [{"text": "📲  شبکه‌های اجتماعی  📲", "callback_data": "mode_social"}],
-            [
-                {"text": "📊 آمار کاربری", "callback_data": "stats"},
-                {"text": "❓ راهنما", "callback_data": "help"},
-            ],
-        ]
-    }
+    items = [
+        ("🔎 جستجو و خواندن", "nav_read"),
+        ("📥 دانلود و شبکه‌ها", "nav_download"),
+        ("🎵 موسیقی", "mode_music"),
+        ("📚 کتاب و مقاله", "mode_book"),
+        ("🧰 ابزارهای بیشتر", "mode_tools"),
+        ("⭐️ کتابخانه و تاریخچه", "library"),
+        ("🔒 حریم خصوصی", "privacy"),
+    ]
+    return {"inline_keyboard": [
+        [{"text": t, "callback_data": d}] for t, d in items
+    ] + [[{"text": "📊 آمار", "callback_data": "stats"},
+          {"text": "❓ راهنما", "callback_data": "help"}]]}
+
+
+def category_kb(category):
+    items = {
+        "nav_read": [("🔎 جستجوی وب", "mode_search"), ("🌐 مشاهده سایت", "mode_open"),
+                     ("📖 ویکی‌پدیا", "mode_wiki"), ("🎓 مقاله علمی", "mode_scholar"),
+                     ("📰 اخبار و اشتراک‌ها", "mode_rss")],
+        "nav_download": [("📱 شبکه‌های اجتماعی", "mode_social"), ("🎬 فیلم و سریال", "mode_movie"),
+                         ("🐙 گیت‌هاب", "mode_github"), ("📱 برنامه اندروید", "mode_apk"),
+                         ("🖼 دانلود عکس", "mode_images"), ("🛡 تشخیص ویروس", "mode_virusscan")],
+    }[category]
+    rows = [[{"text": t, "callback_data": d}] for t, d in items]
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+    return {"inline_keyboard": rows}
 
 
 def social_menu_kb():
@@ -1633,25 +1949,144 @@ def social_menu_kb():
     return {
         "inline_keyboard": [
             [
-                {"text": "🐦 توییتر / X", "callback_data": "mode_twitter"},
-                {"text": "📸 اینستاگرام", "callback_data": "mode_instagram"},
+                {"text": "▶️ YouTube", "callback_data": "mode_youtube"},
+                {"text": "🐦 Twitter / X", "callback_data": "mode_twitter"},
             ],
             [
-                {"text": "🎵 تیک‌تاک", "callback_data": "mode_tiktok"},
-                {"text": "🦋 بلواسکای", "callback_data": "mode_bluesky"},
+                {"text": "📸 Instagram", "callback_data": "mode_instagram"},
+                {"text": "🎵 TikTok", "callback_data": "mode_tiktok"},
             ],
-            [{"text": "✈️ کانال تلگرام", "callback_data": "mode_tg_channel"}],
+            [
+                {"text": "🦋 Bluesky", "callback_data": "mode_bluesky"},
+                {"text": "📱 Reddit", "callback_data": "mode_reddit"},
+            ],
+            [
+                {"text": "🎮 Twitch", "callback_data": "mode_twitch"},
+                {"text": "🎬 Vimeo", "callback_data": "mode_vimeo"},
+            ],
+            [
+                {"text": "📌 Pinterest Video", "callback_data": "mode_pinterest_video"},
+                {"text": "✈️ Telegram Channel", "callback_data": "mode_tg_channel"},
+            ],
             [{"text": "🏠 منوی اصلی", "callback_data": "home"}],
         ]
     }
 
 
 def cancel_kb():
-    return {"inline_keyboard": [[{"text": "❌ انصراف", "callback_data": "cancel"}]]}
+    return {"inline_keyboard": [[{"text": "🔙 برگشت", "callback_data": "home"},
+                                 {"text": "❌ انصراف", "callback_data": "cancel"}]]}
 
 
 def home_kb():
     return {"inline_keyboard": [[{"text": "🏠 منوی اصلی", "callback_data": "home"}]]}
+
+
+def tools_kb():
+    """No-cost text/file utilities exposed from the ابزارهای بیشتر menu."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🌐 ترجمه سریع به فارسی", "callback_data": "mode_translate_fa"},
+                {"text": "🌐 ترجمه (زبان دلخواه)", "callback_data": "mode_translate"},
+            ],
+            [
+                {"text": "💱 تبدیل ارز", "callback_data": "mode_currency"},
+                {"text": "🔳 ساخت QR", "callback_data": "mode_qr"},
+            ],
+            [
+                {"text": "🌐 IP / دامنه", "callback_data": "mode_iplookup"},
+                {"text": "🖼 متن از عکس OCR", "callback_data": "mode_ocr"},
+            ],
+            [
+                {"text": "🔗 کوتاه‌سازی لینک", "callback_data": "mode_shorten"},
+                {"text": "🔎 بازکردن لینک", "callback_data": "mode_expand"},
+            ],
+            [
+                {"text": "🔄 تبدیل قالب فایل", "callback_data": "mode_convert"},
+                {"text": "📋 ساخت متن اشتراکی", "callback_data": "mode_paste"},
+                {"text": "🖼 فشرده‌سازی عکس", "callback_data": "mode_image_compress"},
+            ],
+            [
+                {"text": "📄 جداکردن صفحات PDF", "callback_data": "mode_pdf_extract"},
+                {"text": "📚 ادغام PDF", "callback_data": "mode_pdf_merge"},
+            ],
+            [
+                {"text": "✂️ برش ویدیو", "callback_data": "mode_video_trim"},
+                {"text": "🎞 فشرده‌سازی ویدیو", "callback_data": "mode_video_compress"},
+            ],
+            [{"text": "🏠 منوی اصلی", "callback_data": "home"}],
+        ]
+    }
+
+
+def library_kb():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "⭐️ ذخیره‌شده‌ها", "callback_data": "library_saved"},
+                {"text": "👀 فهرست تماشا", "callback_data": "library_watchlist"},
+            ],
+            [
+                {"text": "🕘 تاریخچه و تلاش دوباره", "callback_data": "library_history"},
+            ],
+            [{"text": "🏠 منوی اصلی", "callback_data": "home"}],
+        ]
+    }
+
+
+def rss_menu_kb():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📰 خواندن فید", "callback_data": "rss_read"},
+                {"text": "🔔 اشتراک فید", "callback_data": "rss_subscribe"},
+            ],
+            [
+                {"text": "📋 اشتراک‌های من", "callback_data": "rss_subscriptions"},
+            ],
+            [{"text": "🏠 منوی اصلی", "callback_data": "home"}],
+        ]
+    }
+
+
+def _library_items_kb(
+    items: list[dict], page: int = 0, has_next: bool = False, watchlist_only: bool = False
+) -> dict:
+    rows = []
+    for item in items[:5]:
+        title = str(item.get("title") or "مورد ذخیره‌شده").replace("\n", " ")[:48]
+        rows.append([{"text": f"📌 {title}", "callback_data": f"lib_item_{int(item['id'])}"}])
+    nav = []
+    prefix = "lib_page_watch_" if watchlist_only else "lib_page_saved_"
+    if page > 0:
+        nav.append({"text": "◀️ قبلی", "callback_data": f"{prefix}{page - 1}"})
+    if has_next:
+        nav.append({"text": "بعدی ▶️", "callback_data": f"{prefix}{page + 1}"})
+    if nav:
+        rows.append(nav)
+    rows.append([
+        {"text": "👀 فهرست تماشا", "callback_data": "library_watchlist"},
+        {"text": "🕘 تاریخچه", "callback_data": "library_history"},
+    ])
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+    return {"inline_keyboard": rows}
+
+
+def audio_format_kb():
+    """Keyboard for selecting audio format/quality."""
+    return {
+        "inline_keyboard": [
+            [{"text": "🎵 MP3 (320kbps)", "callback_data": "audio_fmt_mp3_320"}],
+            [{"text": "🎵 MP3 (256kbps)", "callback_data": "audio_fmt_mp3_256"}],
+            [{"text": "🎵 MP3 (192kbps)", "callback_data": "audio_fmt_mp3_192"}],
+            [{"text": "🎵 M4A (AAC 256kbps)", "callback_data": "audio_fmt_m4a_256"}],
+            [{"text": "🎵 OPUS (160kbps)", "callback_data": "audio_fmt_opus_160"}],
+            [{"text": "🎵 FLAC (Lossless)", "callback_data": "audio_fmt_flac_0"}],
+            [{"text": "⚡ Best Available (no conversion)", "callback_data": "audio_fmt_best_0"}],
+            [{"text": "❌ انصراف", "callback_data": "cancel"}],
+        ]
+    }
 
 
 def paged_kb(prev_cb, next_cb, page, has_next):
@@ -1683,6 +2118,24 @@ def image_source_kb():
                 {"text": "📷 Pixabay/Pexels", "callback_data": "img_src_pexels"},
                 {"text": "🎨 Wikimedia", "callback_data": "img_src_wiki"},
             ],
+            [
+                {"text": "🎨 DeviantArt", "callback_data": "img_src_deviantart"},
+                {"text": "🎨 Pixiv", "callback_data": "img_src_pixiv"},
+            ],
+            [
+                {"text": "🎨 ArtStation", "callback_data": "img_src_artstation"},
+                {"text": "📷 Flickr", "callback_data": "img_src_flickr"},
+            ],
+            [
+                {"text": "📝 Tumblr", "callback_data": "img_src_tumblr"},
+                {"text": "📷 Imgur", "callback_data": "img_src_imgur"},
+            ],
+            [
+                {"text": "🦊 Kemono", "callback_data": "img_src_kemono"},
+            ],
+            [
+                {"text": "🎮 Newgrounds", "callback_data": "img_src_newgrounds"},
+            ],
             [{"text": "❌ انصراف", "callback_data": "cancel"}],
         ]
     }
@@ -1698,6 +2151,10 @@ def youtube_action_kb():
             [
                 {"text": "🖼 کاور (Thumbnail)", "callback_data": "yt_thumb"},
                 {"text": "📊 آمار ویدیو", "callback_data": "yt_stats"},
+            ],
+            [
+                {"text": "✂️ برش بازه ویدیو", "callback_data": "yt_clip"},
+                {"text": "📃 فهرست پخش", "callback_data": "yt_playlist"},
             ],
             [{"text": "❌ انصراف", "callback_data": "cancel"}],
         ]
@@ -1738,6 +2195,7 @@ def twitter_kb():
                 {"text": "📥 دانلود ویدیو/عکس", "callback_data": "tw_dl"},
             ],
             [{"text": "🇮🇷 دانلود + ترجمه", "callback_data": "tw_dl_translate"}],
+            [{"text": "🧵 خواندن ترید (رشته‌توییت)", "callback_data": "tw_thread"}],
             [{"text": "❌ انصراف", "callback_data": "cancel"}],
         ]
     }
@@ -1750,6 +2208,7 @@ def instagram_kb():
                 {"text": "📋 پست‌های پروفایل", "callback_data": "ig_profile"},
                 {"text": "📥 دانلود پست/ریل", "callback_data": "ig_dl"},
             ],
+            [{"text": "📸 دانلود استوری (عمومی)", "callback_data": "ig_story"}],
             [
                 {"text": "🖼 عکس پروفایل", "callback_data": "ig_profile_pic"},
                 {"text": "📸 اسکرین‌شات پروفایل", "callback_data": "ig_profile_shot"},
@@ -1767,6 +2226,54 @@ def tiktok_kb():
                 {"text": "🎥 ویدیوهای کاربر", "callback_data": "tt_user"},
                 {"text": "📥 دانلود ویدیو", "callback_data": "tt_dl"},
             ],
+            [{"text": "🎵 دانلود صدای پست", "callback_data": "tt_sound"}],
+            [{"text": "❌ انصراف", "callback_data": "cancel"}],
+        ]
+    }
+
+
+def reddit_kb():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📥 دانلود پست", "callback_data": "reddit_dl"},
+                {"text": "👤 پروفایل کاربر", "callback_data": "reddit_profile"},
+            ],
+            [{"text": "❌ انصراف", "callback_data": "cancel"}],
+        ]
+    }
+
+
+def twitch_kb():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📥 دانلود VOD/Clip", "callback_data": "twitch_dl"},
+                {"text": "👤 استریم‌های کاربر", "callback_data": "twitch_user"},
+            ],
+            [{"text": "❌ انصراف", "callback_data": "cancel"}],
+        ]
+    }
+
+
+def vimeo_kb():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📥 دانلود ویدیو", "callback_data": "vimeo_dl"},
+            ],
+            [{"text": "❌ انصراف", "callback_data": "cancel"}],
+        ]
+    }
+
+
+def pinterest_kb():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🔍 جستجوی عکس", "callback_data": "pin_search"},
+                {"text": "📥 دانلود ویدیو", "callback_data": "pin_dl"},
+            ],
             [{"text": "❌ انصراف", "callback_data": "cancel"}],
         ]
     }
@@ -1781,13 +2288,48 @@ def book_kb():
                 {"text": "🔍 جستجوی مقاله", "callback_data": "book_search_art"},
             ],
             [
+                {"text": "🎧 کتاب صوتی", "callback_data": "book_ravebook_audio"},
+            ],
+            [
                 {"text": "📄 فقط PDF", "callback_data": "book_filter_pdf"},
                 {"text": "📖 فقط EPUB", "callback_data": "book_filter_epub"},
             ],
-            [{"text": "📝 فقط FB2/MOBI", "callback_data": "book_filter_other"}],
+            [
+                {"text": "📝 فقط FB2/MOBI", "callback_data": "book_filter_other"},
+                {"text": "🌐 کشف ترجمه (opac.nlai.ir)", "url": "https://opac.nlai.ir/"},
+            ],
+            [
+                {
+                    "text": "🔗 منابع بیشتر کتاب",
+                    "callback_data": "book_sources",
+                }
+            ],
             [{"text": "❌ انصراف", "callback_data": "cancel"}],
         ]
     }
+
+
+# Additional book sources the user asked for. Verified from this VPS:
+# libsan.ir is reachable but PAID (no free file); pdfdrive search is
+# bot-gated and myanonamouse needs a login, so those two are link-only.
+# singlelogin.re no longer resolves (NXDOMAIN) and is intentionally omitted.
+BOOK_EXTRA_SOURCES = [
+    ("🌐 Libsan (فروشگاه کتاب)", "https://libsan.ir/"),
+    ("🌐 PDFDrive", "https://www.pdfdrive.com/"),
+    ("🌐 MyAnonamouse", "https://www.myanonamouse.net/"),
+    ("🌐 Library Genesis", "https://libgen.li/"),
+    ("🌐 Internet Archive (امانت کتاب)", "https://archive.org/"),
+]
+
+
+def book_sources_kb() -> dict:
+    """لینک منابع جانبی کتاب."""
+    rows = [
+        [{"text": label, "url": url}]
+        for label, url in BOOK_EXTRA_SOURCES
+    ]
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+    return {"inline_keyboard": rows}
 
 
 def book_results_kb(results: list, cache_key: str) -> dict:
@@ -1892,25 +2434,47 @@ def social_results_kb(results: list, cache_key: str, platform: str) -> dict:
 
 
 def social_post_kb(url: str, platform: str, has_media: bool) -> dict:
-    """Buttons under a displayed post."""
-    url_key = store_url(url)
+    """Buttons under a displayed post (metadata-only save + normal actions)."""
+    url_key = store_url(url, chat_id=getattr(_ctx, "chat_id", None))
     rows = []
     if has_media:
-        rows.append(
-            [
-                {
-                    "text": "📥 دانلود رسانه",
-                    "callback_data": f"soc_dl_{platform}_{url_key}",
-                }
-            ]
-        )
+        # Platforms with video content (not short-form)
+        video_platforms = {"reddit", "twitch", "vimeo", "pinterest", "hls"}
+        if platform in video_platforms:
+            rows.append(
+                [
+                    {
+                        "text": "📥 دانلود ویدیو",
+                        "callback_data": f"soc_dl_{platform}_{url_key}",
+                    },
+                    {
+                        "text": "🎵 فقط صدا",
+                        "callback_data": f"soc_dl_audio_{platform}_{url_key}",
+                    },
+                    {
+                        "text": "🎬 کیفیت",
+                        "callback_data": f"soc_dl_quality_{platform}_{url_key}",
+                    },
+                ]
+            )
+        else:
+            # Short-form platforms (Twitter, TikTok, Instagram)
+            rows.append(
+                [
+                    {
+                        "text": "📥 دانلود",
+                        "callback_data": f"soc_dl_{platform}_{url_key}",
+                    }
+                ]
+            )
     rows.append(
         [
             {"text": "🔗 باز کردن لینک", "callback_data": f"site_ss_{url_key}"},
+            {"text": "⭐️ ذخیره", "callback_data": f"lib_save_{platform}_{url_key}"},
             {"text": "🏠 منوی اصلی", "callback_data": "home"},
         ]
     )
-    return {"inline_keyboard": rows}
+    return {"inline_keyboard": [[button] for row in rows for button in row]}
 
 
 def translate_kb():
@@ -1946,6 +2510,10 @@ def site_view_kb(url_key: str):
                 {"text": "🗜 ZIP آفلاین", "callback_data": f"site_zip_{url_key}"},
                 {"text": "📑 PDF صفحه", "callback_data": f"site_pdf_{url_key}"},
             ],
+            [
+                {"text": "🌐 ترجمه فارسی", "callback_data": f"site_tr_{url_key}"},
+                {"text": "🛡 بررسی VirusTotal", "callback_data": f"site_scan_{url_key}"},
+            ],
             [{"text": "🏠 منوی اصلی", "callback_data": "home"}],
         ]
     }
@@ -1965,9 +2533,9 @@ def search_results_kb(
     # Pagination row
     pag = []
     if page > 0:
-        pag.append({"text": "◀️ قبلی", "callback_data": f"page_{mode}_{page - 1}"})
+        pag.append({"text": "◀️ قبلی", "callback_data": f"search_page_{cache_key}_{page - 1}"})
     if has_next:
-        pag.append({"text": "بعدی ▶️", "callback_data": f"page_{mode}_{page + 1}"})
+        pag.append({"text": "بعدی ▶️", "callback_data": f"search_page_{cache_key}_{page + 1}"})
     if pag:
         rows.append(pag)
     rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
@@ -2213,12 +2781,14 @@ _CLEANUP_JS = """
 """
 
 
+@_browser_job
 def screenshot_page(url: str) -> Optional[bytes]:
     """
     1920×1080 screenshot via shot-scraper with popup/banner removal.
     Falls back to playwright if shot-scraper unavailable.
     """
     log.info("screenshot_page: %s", url)
+    out = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
             out = tf.name
@@ -2246,7 +2816,6 @@ def screenshot_page(url: str) -> Optional[bytes]:
             and Path(out).stat().st_size > 1000
         ):
             data = Path(out).read_bytes()
-            Path(out).unlink(missing_ok=True)
             log.info("screenshot_page (shot-scraper): %dKB", len(data) // 1024)
             return data
         log.warning(
@@ -2254,13 +2823,15 @@ def screenshot_page(url: str) -> Optional[bytes]:
             result.returncode,
             result.stderr.decode(errors="replace")[:200],
         )
-        Path(out).unlink(missing_ok=True)
     except FileNotFoundError:
         log.warning("shot-scraper not found, falling back to playwright")
     except subprocess.TimeoutExpired:
         log.warning("screenshot_page: shot-scraper timed out")
     except Exception as e:
         log.error("screenshot_page shot-scraper: %s", e)
+    finally:
+        if out is not None:
+            Path(out).unlink(missing_ok=True)
 
     # Fallback: playwright
     try:
@@ -2275,16 +2846,18 @@ def screenshot_page(url: str) -> Optional[bytes]:
                     "--disable-gpu",
                 ]
             )
-            page = browser.new_page(viewport={"width": 1920, "height": 1080})
-            page.goto(url, timeout=25000, wait_until="domcontentloaded")
-            time.sleep(2)
-            page.evaluate(_CLEANUP_JS)
-            img = page.screenshot(
-                type="jpeg",
-                quality=85,
-                clip={"x": 0, "y": 0, "width": 1920, "height": 1080},
-            )
-            browser.close()
+            try:
+                page = browser.new_page(viewport={"width": 1920, "height": 1080})
+                page.goto(url, timeout=25000, wait_until="domcontentloaded")
+                time.sleep(2)
+                page.evaluate(_CLEANUP_JS)
+                img = page.screenshot(
+                    type="jpeg",
+                    quality=85,
+                    clip={"x": 0, "y": 0, "width": 1920, "height": 1080},
+                )
+            finally:
+                browser.close()
         log.info("screenshot_page (playwright fallback): %dKB", len(img) // 1024)
         return img
     except Exception as e:
@@ -2330,6 +2903,7 @@ def page_to_text(url: str) -> str:
     return "\n".join(lines[:100])
 
 
+@_browser_job
 def page_to_pdf(url: str) -> Optional[bytes]:
     """
     Generate a full-page PDF via shot-scraper (uses Playwright's print-to-PDF
@@ -2339,6 +2913,7 @@ def page_to_pdf(url: str) -> Optional[bytes]:
     log.info("page_to_pdf: %s", url)
 
     # Strategy 1: shot-scraper pdf (best — full page, proper PDF, popup removal)
+    out = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
             out = tf.name
@@ -2361,7 +2936,6 @@ def page_to_pdf(url: str) -> Optional[bytes]:
             and Path(out).stat().st_size > 500
         ):
             data = Path(out).read_bytes()
-            Path(out).unlink(missing_ok=True)
             log.info("page_to_pdf (shot-scraper): %dKB", len(data) // 1024)
             return data
         log.warning(
@@ -2369,13 +2943,15 @@ def page_to_pdf(url: str) -> Optional[bytes]:
             result.returncode,
             result.stderr.decode(errors="replace")[:200],
         )
-        Path(out).unlink(missing_ok=True)
     except FileNotFoundError:
         log.warning("shot-scraper not found for PDF")
     except subprocess.TimeoutExpired:
         log.warning("page_to_pdf: shot-scraper timed out")
     except Exception as e:
         log.error("page_to_pdf shot-scraper: %s", e)
+    finally:
+        if out is not None:
+            Path(out).unlink(missing_ok=True)
 
     # Strategy 2: Playwright print-to-PDF directly
     try:
@@ -2390,21 +2966,23 @@ def page_to_pdf(url: str) -> Optional[bytes]:
                     "--disable-gpu",
                 ]
             )
-            page = browser.new_page(viewport={"width": 1920, "height": 1080})
-            page.goto(url, timeout=30000, wait_until="networkidle")
-            time.sleep(2)
-            page.evaluate(_CLEANUP_JS)
-            pdf_bytes = page.pdf(
-                format="A4",
-                print_background=True,
-                margin={
-                    "top": "10mm",
-                    "bottom": "10mm",
-                    "left": "10mm",
-                    "right": "10mm",
-                },
-            )
-            browser.close()
+            try:
+                page = browser.new_page(viewport={"width": 1920, "height": 1080})
+                page.goto(url, timeout=30000, wait_until="networkidle")
+                time.sleep(2)
+                page.evaluate(_CLEANUP_JS)
+                pdf_bytes = page.pdf(
+                    format="A4",
+                    print_background=True,
+                    margin={
+                        "top": "10mm",
+                        "bottom": "10mm",
+                        "left": "10mm",
+                        "right": "10mm",
+                    },
+                )
+            finally:
+                browser.close()
         if pdf_bytes and len(pdf_bytes) > 500:
             log.info("page_to_pdf (playwright): %dKB", len(pdf_bytes) // 1024)
             return pdf_bytes
@@ -2412,6 +2990,7 @@ def page_to_pdf(url: str) -> Optional[bytes]:
         log.warning("page_to_pdf playwright: %s", e)
 
     # Strategy 3: wkhtmltopdf
+    out = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
             out = tf.name
@@ -2436,12 +3015,13 @@ def page_to_pdf(url: str) -> Optional[bytes]:
         )
         if Path(out).exists() and Path(out).stat().st_size > 500:
             data = Path(out).read_bytes()
-            Path(out).unlink(missing_ok=True)
             log.info("page_to_pdf (wkhtmltopdf): %dKB", len(data) // 1024)
             return data
-        Path(out).unlink(missing_ok=True)
     except Exception as e:
         log.error("page_to_pdf wkhtmltopdf: %s", e)
+    finally:
+        if out is not None:
+            Path(out).unlink(missing_ok=True)
 
     log.warning("page_to_pdf: all strategies failed, returning raw HTML")
     return fetch_page(url)
@@ -2570,6 +3150,53 @@ def wikipedia_article(title: str, lang="fa") -> Optional[str]:
 
 
 # ─── YouTube ──────────────────────────────────────────────────────────────────
+PLAYLIST_MAX_ITEMS = 10
+
+
+def _is_youtube_playlist(url: str) -> bool:
+    return "youtube.com" in url and "list=" in url
+
+
+def youtube_playlist_items(url: str, max_items: int = PLAYLIST_MAX_ITEMS) -> list[dict]:
+    """List a bounded set of playlist videos; actual downloads stay per-video."""
+    if not _is_youtube_playlist(url):
+        return []
+    try:
+        result = subprocess.run(
+            [
+                YTDLP_BIN,
+                "--flat-playlist",
+                "--playlist-items",
+                f"1-{max(1, min(max_items, PLAYLIST_MAX_ITEMS))}",
+                "--print",
+                "%(id)s|||%(title)s|||%(uploader)s|||%(duration_string)s",
+                "--no-warnings",
+                "--no-check-certificate",
+                url,
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+        output = result.stdout.decode(errors="replace") if isinstance(result.stdout, bytes) else result.stdout
+        items = []
+        for line in output.splitlines():
+            parts = line.split("|||")
+            if not parts or not parts[0].strip():
+                continue
+            video_id = parts[0].strip()
+            items.append({
+                "id": video_id,
+                "title": parts[1].strip() if len(parts) > 1 else "ویدیو",
+                "uploader": parts[2].strip() if len(parts) > 2 else "",
+                "duration": parts[3].strip() if len(parts) > 3 else "",
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+            })
+        return items
+    except Exception as e:
+        log.warning("youtube_playlist_items: %s", e)
+        return []
+
+
 def youtube_search(query: str, max_results=8) -> list[dict]:
     log.info("youtube_search: %r", query)
     try:
@@ -2648,14 +3275,11 @@ def _yt_probe_format(
         "--geo-bypass-country",
         "US",
     ]
-    if cookies_file:
-        probe_cmd += ["--cookies", cookies_file]
-    if WARP_PROXY:
-        probe_cmd += ["--proxy", WARP_PROXY]
+    # Fast discovery must not inherit problematic cookie/proxy state.
     probe_cmd.append(url)
 
     try:
-        proc = subprocess.run(probe_cmd, capture_output=True, timeout=30)
+        proc = subprocess.run(probe_cmd, capture_output=True, timeout=12)
         if proc.returncode != 0:
             log.debug(
                 "_yt_probe_format: client=%s rc=%d stderr=%s",
@@ -2777,6 +3401,9 @@ def youtube_get_formats(url: str) -> dict:
       }
     """
     log.info("youtube_get_formats: %s", url)
+    cached = _youtube_info_cache.get(url)
+    if cached and time.monotonic() - cached[0] < 120:
+        return cached[1]
     import shutil
 
     cookies_file = (
@@ -2785,7 +3412,9 @@ def youtube_get_formats(url: str) -> dict:
         else ""
     )
 
-    probe_clients = ["tv_embedded", "android", "ios", "web_music,web,tv,web_embedded"]
+    # yt-dlp defaults track current supported clients; do not force auth-only tv_embedded.
+    # Fast direct metadata avoids cookie/proxy stalls; recovery stays in download fallbacks.
+    probe_clients = ["android_vr", "web_safari"]
     info = None
     used_client = None
 
@@ -2807,13 +3436,9 @@ def youtube_get_formats(url: str) -> dict:
             "--geo-bypass-country",
             "US",
         ]
-        if cookies_file:
-            probe_cmd += ["--cookies", cookies_file]
-        if WARP_PROXY:
-            probe_cmd += ["--proxy", WARP_PROXY]
         probe_cmd.append(url)
         try:
-            proc = subprocess.run(probe_cmd, capture_output=True, timeout=40)
+            proc = subprocess.run(probe_cmd, capture_output=True, timeout=12)
             if proc.returncode != 0:
                 log.debug(
                     "youtube_get_formats: client=%s rc=%d stderr=%s",
@@ -2833,6 +3458,7 @@ def youtube_get_formats(url: str) -> dict:
 
     if not info:
         log.warning("youtube_get_formats: all clients failed")
+        _youtube_info_cache[url] = (time.monotonic(), {})
         return {}
 
     formats_raw = info.get("formats", [])
@@ -2939,7 +3565,7 @@ def youtube_get_formats(url: str) -> dict:
             }
         )
 
-    return {
+    result = {
         "formats": quality_list,
         "subtitles": subtitle_list[:20],  # cap at 20 languages
         "title": info.get("title", ""),
@@ -2948,6 +3574,26 @@ def youtube_get_formats(url: str) -> dict:
         "duration": info.get("duration_string", ""),
         "client": used_client,
     }
+    _youtube_info_cache[url] = (time.monotonic(), result)
+    return result
+
+
+def _clip_range(start: str, end: str) -> Optional[tuple[int, int]]:
+    def seconds(value: str) -> Optional[int]:
+        try:
+            parts = [int(part) for part in value.strip().split(":")]
+            if not 1 <= len(parts) <= 3 or any(part < 0 for part in parts):
+                return None
+            total = 0
+            for part in parts:
+                total = total * 60 + part
+            return total
+        except ValueError:
+            return None
+    left, right = seconds(start), seconds(end)
+    if left is None or right is None or not left < right <= left + 1800:
+        return None
+    return left, right
 
 
 def youtube_download(
@@ -2956,6 +3602,8 @@ def youtube_download(
     fmt_spec: str = "",
     sub_code: str = "",
     yt_client: str = "",
+    clip: Optional[tuple[int, int]] = None,
+    max_height: int = 720,
 ) -> Optional[tuple[bytes, str]]:
     """Download YouTube video/audio.
 
@@ -2971,6 +3619,7 @@ def youtube_download(
     sub_code: subtitle language code to embed (e.g. "en", "fa").
     yt_client: player client to use when fmt_spec is given.
     """
+    _ensure_disk_space()
     log.info(
         "youtube_download: url=%r audio=%s fmt=%r sub=%r",
         url,
@@ -2989,6 +3638,25 @@ def youtube_download(
 
     if cookies_file:
         log.info("youtube_download: using cookies from %s", cookies_file)
+        gate_cmd = [YTDLP_BIN, "-j", "--no-playlist", "--no-warnings", "--socket-timeout", "10", "--cookies", cookies_file]
+        if WARP_PROXY:
+            gate_cmd += ["--proxy", WARP_PROXY]
+        gate_cmd.append(url)
+        try:
+            gate = subprocess.run(gate_cmd, capture_output=True, timeout=12)
+            blocked = "Sign in to confirm" in gate.stderr.decode(errors="replace")
+            if gate.returncode == 0:
+                try:
+                    formats = json.loads(gate.stdout.decode(errors="replace")).get("formats", [])
+                    blocked = not any(f.get("vcodec") not in (None, "none") or f.get("acodec") not in (None, "none") for f in formats)
+                except (ValueError, TypeError):
+                    blocked = True
+            if blocked:
+                log.warning("youtube_download: cookie session has no usable streams; skipping retries")
+                return None
+        except subprocess.TimeoutExpired:
+            log.warning("youtube_download: cookie session check timed out")
+            return None
     else:
         log.warning("youtube_download: no cookies file — bot-detection likely")
 
@@ -3008,8 +3676,8 @@ def youtube_download(
             "srt",
         ]
 
-    def _run(client: str, fmt_spec: str) -> Optional[tuple[bytes, str]]:
-        """Download a specific format spec with a given player client."""
+    def _run(client: str, fmt_spec: str, use_recovery: bool = False) -> Optional[tuple[bytes, str]]:
+        """Download selected format; use proxy/cookies only on recovery attempts."""
         with tempfile.TemporaryDirectory() as tmp:
             cmd = [
                 YTDLP_BIN,
@@ -3037,12 +3705,16 @@ def youtube_download(
                 "-o",
                 os.path.join(tmp, "%(title)s.%(ext)s"),
             ]
-            if cookies_file:
+            if use_recovery and cookies_file:
                 cmd += ["--cookies", cookies_file]
-            if WARP_PROXY:
+            if use_recovery and WARP_PROXY:
                 cmd += ["--proxy", WARP_PROXY]
             if sub_code:
                 cmd += _subtitle_args(sub_code)
+            if clip:
+                cmd += ["--download-sections", f"*{clip[0]}-{clip[1]}"]
+            # SponsorBlock: remove sponsor segments
+            cmd += ["--sponsorblock-remove", "all"]
             cmd.append(url)
             log.debug("yt-dlp cmd: %s", " ".join(cmd))
             proc = subprocess.run(cmd, capture_output=True, timeout=300)
@@ -3101,6 +3773,8 @@ def youtube_download(
                     cmd += ["--cookies", cookies_file]
                 if WARP_PROXY:
                     cmd += ["--proxy", WARP_PROXY]
+                # SponsorBlock: remove sponsor segments (for audio too, marks chapters)
+                cmd += ["--sponsorblock-remove", "all"]
                 cmd.append(url)
                 proc = subprocess.run(cmd, capture_output=True, timeout=300)
                 if proc.returncode == 0:
@@ -3132,7 +3806,7 @@ def youtube_download(
     for client in probe_clients:
         log.info("youtube_download: probing client=%s", client)
         fmt_spec = _yt_probe_format(
-            url, client, audio_only, cookies_file, max_height=720
+            url, client, audio_only, cookies_file, max_height=max_height
         )
         if not fmt_spec:
             log.debug("youtube_download: no format found for client=%s", client)
@@ -3173,6 +3847,8 @@ def youtube_download(
                     cmd += ["--cookies", cookies_file]
                 if WARP_PROXY:
                     cmd += ["--proxy", WARP_PROXY]
+                # SponsorBlock: remove sponsor segments
+                cmd += ["--sponsorblock-remove", "all"]
                 cmd.append(url)
                 log.debug("yt-dlp audio cmd: %s", " ".join(cmd))
                 proc = subprocess.run(cmd, capture_output=True, timeout=300)
@@ -3292,7 +3968,7 @@ def _cobalt_download_all(
     Download ALL items via Cobalt API (handles carousels, playlists, etc).
     Returns list of {data, fname, is_video} dicts.
     Set COBALT_URL env var to your self-hosted instance.
-    
+
     For TikTok and other platforms, ensures audio is included in video downloads.
     """
     if not COBALT_URL:
@@ -3310,13 +3986,13 @@ def _cobalt_download_all(
         if audio_only:
             payload["downloadMode"] = "audio"
             payload["audioFormat"] = "mp3"
-            payload["audioBitrate"] = "192"
+            payload["audioBitrate"] = "128"
         else:
             payload["downloadMode"] = "auto"
             # For TikTok and other platforms: ensure full video with audio is downloaded
             # Don't set isAudioOnly or dubLang to avoid audio stripping
             payload["youtubeVideoCodec"] = "h264"  # prefer compatible codec
-        
+
         # Add TikTok-specific settings to ensure audio is included
         if "tiktok.com" in url:
             payload["tiktokFullAudio"] = True
@@ -3529,6 +4205,35 @@ def _ffmpeg_dir() -> str:
 
 
 # ── YouTube / SoundCloud search via yt-dlp ───────────────────────────────────
+def _music_duration_seconds(value: object) -> int:
+    """Parse display durations such as ``3:42`` safely."""
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    try:
+        parts = [int(part) for part in str(value).strip().split(":")]
+    except ValueError:
+        return 0
+    if not parts or len(parts) > 3:
+        return 0
+    seconds = 0
+    for part in parts:
+        seconds = seconds * 60 + part
+    return seconds
+
+
+def music_pick_duration_match(items: list[dict], target_duration: object) -> list[dict]:
+    """Order search hits by closeness to a known catalog duration."""
+    target = _music_duration_seconds(target_duration)
+    if target <= 0:
+        return items
+    return sorted(items, key=lambda item: (
+        _music_duration_seconds(item.get("duration")) <= 0,
+        abs(_music_duration_seconds(item.get("duration")) - target),
+    ))
+
+
 def music_search_ytdlp(
     query: str, max_results: int = 5, source: str = "youtube"
 ) -> list[dict]:
@@ -3570,7 +4275,7 @@ def music_search_ytdlp(
                 + [
                     "--print",
                     f"%(id)s|||%(title)s|||%(uploader)s|||%(duration_string)s|||%(webpage_url)s|||%(thumbnail)s",
-                    f"https://music.youtube.com/search?q={urllib.parse.quote(query)}",
+                    f"https://music.youtube.com/search?q={urllib.parse.quote(query + ' audio')}",
                 ]
             )
         else:
@@ -3958,14 +4663,16 @@ def music_search_multi(query: str) -> list[dict]:
     return merged[:20]
 
 
-def music_download_ytdlp(url: str, source: str = "auto") -> Optional[tuple[bytes, str]]:
-    """Download audio via yt-dlp → MP3. Returns None on DRM or permanent failure."""
-    log.info("music_download_ytdlp: %s source=%s", url, source)
+def music_download_ytdlp(url: str, source: str = "auto", audio_format: str = "mp3", audio_quality: str = "0") -> Optional[tuple[bytes, str]]:
+    """Download audio via yt-dlp with specified format/quality. Returns None on DRM or permanent failure."""
+    _ensure_disk_space()
+    log.info("music_download_ytdlp: %s source=%s fmt=%s q=%s", url, source, audio_format, audio_quality)
     import shutil
 
     ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
     is_yt = "youtube.com" in url or "youtu.be" in url
     is_sc = "soundcloud.com" in url
+    is_ytm = "music.youtube.com" in url
 
     # Deezer is DRM-protected — never attempt, saves ~4×5s of wasted retries
     if "deezer.com" in url:
@@ -3979,7 +4686,7 @@ def music_download_ytdlp(url: str, source: str = "auto") -> Optional[tuple[bytes
 
     timeout = 120 if is_sc else 300  # SC tracks are small, fail fast
 
-    def _run_audio(extra_args: list) -> Optional[tuple[bytes, str]]:
+    def _run_audio(extra_args: list, use_cookies: bool = False) -> Optional[tuple[bytes, str]]:
         with tempfile.TemporaryDirectory() as tmp:
             base = [
                 YTDLP_BIN,
@@ -3995,15 +4702,21 @@ def music_download_ytdlp(url: str, source: str = "auto") -> Optional[tuple[bytes
                 "-o",
                 os.path.join(tmp, "%(title).60s.%(ext)s"),
             ]
-            if is_yt:
-                if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).exists():
+            if is_yt or is_ytm:
+                if use_cookies and YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).exists():
                     base += ["--cookies", YOUTUBE_COOKIES_FILE]
                 base += [
                     "--extractor-args",
-                    "youtube:player_client=android,ios,tv_embedded,web_music,web",
+                    "youtube:player_client=mweb,default",
+                    "--js-runtimes",
+                    "node",
                 ]
+            elif is_sc:
+                base += ["--extractor-args", "soundcloud:client=web"]
             if WARP_PROXY:
                 base += ["--proxy", WARP_PROXY]
+            # SponsorBlock: remove sponsor segments (for audio too, marks chapters)
+            base += ["--sponsorblock-remove", "all"]
             cmd = base + extra_args + [url]
             log.debug("music dl: %s", " ".join(cmd))
             try:
@@ -4033,33 +4746,48 @@ def music_download_ytdlp(url: str, source: str = "auto") -> Optional[tuple[bytes
             log.info("music dl OK: %s  %.1fMB", best.name, len(data) / 1024 / 1024)
             return data, best.name
 
-    # Format strategy:
-    # 1. Best audio → convert to mp3 (works for most public tracks)
-    # 2. bestaudio without conversion (fastest, keeps native format like opus/m4a)
-    # 3. Any audio extract (-x only)
-    # For YouTube "Requested format not available": bestaudio/best bypasses the issue
-    format_attempts = [
-        [
-            "-f",
-            "bestaudio/best",
-            "-x",
-            "--audio-format",
-            "mp3",
-            "--audio-quality",
-            "0",
-            "--embed-thumbnail",
-            "--add-metadata",
-        ],
-        ["-f", "bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "0"],
-        ["-f", "bestaudio/best", "-x"],
-        ["-x"],
-    ]
+    # Format strategy based on selected format/quality
+    # audio_quality: 0=best, 192=192k, 256=256k, 320=320k
+    q = audio_quality if audio_quality != "0" else "0"
+
+    if audio_format == "best":
+        # Best available without conversion
+        format_attempts = [
+            ["-f", "bestaudio/best"],
+            ["-x"],
+        ]
+    else:
+        format_attempts = [
+            [
+                "-f",
+                "bestaudio/best",
+                "-x",
+                "--audio-format",
+                audio_format,
+                "--audio-quality",
+                q,
+                "--embed-thumbnail",
+                "--add-metadata",
+            ],
+            ["-f", "bestaudio/best", "-x", "--audio-format", audio_format, "--audio-quality", q],
+            ["-f", "bestaudio/best", "-x"],
+            ["-x"],
+        ]
 
     try:
-        for args in format_attempts:
-            result = _run_audio(args)
-            if result:
-                return result
+        # For YouTube/YouTube Music: try WITHOUT cookies first (cookies often break format selection)
+        # Then try WITH cookies if that fails
+        if is_yt or is_ytm:
+            for use_cookies in (False, True):
+                for args in format_attempts:
+                    result = _run_audio(args, use_cookies=use_cookies)
+                    if result:
+                        return result
+        else:
+            for args in format_attempts:
+                result = _run_audio(args)
+                if result:
+                    return result
     except RuntimeError as e:
         if "DRM" in str(e):
             return None
@@ -4070,6 +4798,7 @@ def music_download_ytdlp(url: str, source: str = "auto") -> Optional[tuple[bytes
 
 def spotify_download(url: str) -> Optional[tuple[bytes, str]]:
     """Download Spotify track/album/playlist via spotdl → MP3."""
+    _ensure_disk_space()
     log.info("spotify_download: %s", url)
     import shutil
     import sys
@@ -4150,6 +4879,7 @@ def music_download_with_fallback(
     source_hint: str = "auto",
     status_cb=None,
     _tried_yt_ids: set = None,  # internal: YT video IDs already attempted
+    duration: object = None,
 ) -> Optional[tuple[bytes, str]]:
     """
     Full fallback chain: Spotify → YouTube Music → SoundCloud → JioSaavn → Deezer(→YT/SC)
@@ -4157,6 +4887,7 @@ def music_download_with_fallback(
     """
     if _tried_yt_ids is None:
         _tried_yt_ids = set()
+    tried_cobalt_ids: set = set()
 
     def _cb(msg: str):
         if status_cb:
@@ -4195,10 +4926,10 @@ def music_download_with_fallback(
 
     if not skip_yt_search and search_q:
         _cb("🎵 در حال جستجو در یوتیوب موزیک…")
-        yt_hits = music_search_ytdlp(search_q, max_results=3, source="ytmusic")
+        yt_hits = music_search_ytdlp(search_q, max_results=5, source="ytmusic")
         if not yt_hits:
-            yt_hits = music_search_ytdlp(search_q, max_results=3, source="youtube")
-        for hit in yt_hits:
+            yt_hits = music_search_ytdlp(search_q, max_results=5, source="youtube")
+        for hit in music_pick_duration_match(yt_hits, duration):
             vid_id = hit.get("id", "") or hit.get("url", "")
             if vid_id in _tried_yt_ids:
                 continue
@@ -4206,6 +4937,22 @@ def music_download_with_fallback(
             result = music_download_ytdlp(hit["url"], source="youtube")
             if result:
                 log.info("fallback: YouTube Music search OK")
+                return result
+
+    # ── Step 2.5: Cobalt API for YouTube/YouTube Music (bypasses format issues) ──
+    if COBALT_URL and search_q:
+        _cb("🔷 در حال تلاش با Cobalt (YouTube/YouTube Music)…")
+        yt_hits = music_search_ytdlp(search_q, max_results=5, source="ytmusic")
+        if not yt_hits:
+            yt_hits = music_search_ytdlp(search_q, max_results=5, source="youtube")
+        for hit in music_pick_duration_match(yt_hits, duration):
+            vid_id = hit.get("id", "") or hit.get("url", "")
+            if vid_id in tried_cobalt_ids:
+                continue
+            tried_cobalt_ids.add(vid_id)
+            result = _youtube_cobalt(hit["url"], audio_only=True)
+            if result:
+                log.info("fallback: Cobalt YouTube/YouTube Music OK")
                 return result
     log.warning("fallback: YouTube failed, trying SoundCloud")
     _cb("⚠️ یوتیوب ناموفق — در حال جستجو در SoundCloud…")
@@ -4225,8 +4972,26 @@ def music_download_with_fallback(
             if result:
                 log.info("fallback: SoundCloud search OK")
                 return result
-    log.warning("fallback: SoundCloud failed, trying JioSaavn")
-    _cb("⚠️ SoundCloud ناموفق — در حال جستجو در JioSaavn…")
+    log.warning("fallback: SoundCloud failed, trying Cobalt (YouTube/YouTube Music)")
+    _cb("⚠️ SoundCloud ناموفق — در حال تلاش با Cobalt (YouTube/YouTube Music)…")
+
+    # ── Step 3.5: Cobalt API (for YouTube/YouTube Music audio) ──────────────────
+    if COBALT_URL and search_q:
+        _cb("🔷 در حال تلاش با Cobalt (YouTube/YouTube Music)…")
+        yt_hits = music_search_ytdlp(search_q, max_results=5, source="ytmusic")
+        if not yt_hits:
+            yt_hits = music_search_ytdlp(search_q, max_results=5, source="youtube")
+        for hit in music_pick_duration_match(yt_hits, duration):
+            vid_id = hit.get("id", "") or hit.get("url", "")
+            if vid_id in tried_cobalt_ids:
+                continue
+            tried_cobalt_ids.add(vid_id)
+            result = _youtube_cobalt(hit["url"], audio_only=True)
+            if result:
+                log.info("fallback: Cobalt YouTube/YouTube Music OK")
+                return result
+    log.warning("fallback: Cobalt failed, trying JioSaavn")
+    _cb("⚠️ Cobalt ناموفق — در حال جستجو در JioSaavn…")
 
     # ── Step 4: JioSaavn ─────────────────────────────────────────────────────
     if search_q:
@@ -4287,12 +5052,13 @@ def _deezer_download_dedup(item: dict, tried_ids: set) -> Optional[tuple[bytes, 
 
 # ─── Generic yt-dlp social downloader ────────────────────────────────────────
 def social_download_ytdlp(
-    url: str, audio_only=False, cookies_file: str = ""
+    url: str, audio_only=False, cookies_file: str = "", format_id=None
 ) -> Optional[tuple[bytes, str]]:
     """Download from any yt-dlp-supported URL (TikTok, Instagram, Twitter, etc.)
     Falls back to Cobalt API if yt-dlp fails.
     """
-    log.info("social_download_ytdlp: %r  audio=%s", url, audio_only)
+    _ensure_disk_space()
+    log.info("social_download_ytdlp: %r  audio=%s fmt=%s", url, audio_only, format_id)
     import shutil
 
     ffmpeg_dir = str(Path(shutil.which("ffmpeg") or "/usr/bin/ffmpeg").parent)
@@ -4308,10 +5074,14 @@ def social_download_ytdlp(
         "--retries",
         "3",
     ]
+    if format_id:
+        base += ["-f", format_id]
     if cookies_file and Path(cookies_file).exists():
         base += ["--cookies", cookies_file]
     if WARP_PROXY:
         base += ["--proxy", WARP_PROXY]
+    # SponsorBlock: remove sponsor segments
+    base += ["--sponsorblock-remove", "all"]
 
     def _run(extra, target):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5302,16 +6072,26 @@ def instagram_get_profile(username: str) -> list[dict]:
 
 
 # ─── TikTok ──────────────────────────────────────────────────────────────────
-def tiktok_download(url: str) -> Optional[tuple[bytes, str]]:
+def _fetch_tikwm_data(url: str, timeout=30) -> Optional[dict]:
+    """Successful metadata only; callers may reuse it within one operation."""
+    try:
+        r = WEB.post("https://www.tikwm.com/api/", data={"url": url, "hd": "1"},
+                     headers={"User-Agent": UA_DESK}, timeout=timeout)
+        j = r.json()
+        if j.get("code") == 0 and isinstance(j.get("data"), dict):
+            return j["data"]
+    except Exception as e:
+        log.warning("tikwm metadata: %s", e)
+    return None
+
+
+def tiktok_download(url: str, tikwm_data=None) -> Optional[tuple[bytes, str]]:
     """Download a TikTok video WITH audio (tikwm first for muxed audio)."""
     log.info("tiktok_download: %s", url)
     # Strategy 1: tikwm.com — single muxed MP4 (audio+video, no watermark).
     try:
-        r = WEB.post("https://www.tikwm.com/api/", data={"url": url, "hd": "1"},
-                     headers={"User-Agent": UA_DESK}, timeout=20)
-        if r.status_code == 200:
-            j = r.json()
-            d = j.get("data", {}) if j.get("code") == 0 else {}
+        d = tikwm_data if tikwm_data is not None else _fetch_tikwm_data(url, timeout=20)
+        if d is not None:
             play = d.get("hdplay") or d.get("play") or d.get("wmplay")
             if play:
                 if play.startswith("/"):
@@ -5364,7 +6144,130 @@ def tiktok_download(url: str) -> Optional[tuple[bytes, str]]:
     return None
 
 
-def tiktok_user_videos(username: str, limit: int = 10) -> list[dict]:
+# ─── Reddit ──────────────────────────────────────────────────────────────────
+def reddit_download(url: str, audio_only=False, format_id=None) -> Optional[list[tuple[bytes, str]]]:
+    """Download Reddit post media (video, images, gallery). Returns list of (data, filename)."""
+    log.info("reddit_download: %s audio_only=%s fmt=%s", url, audio_only, format_id)
+    return social_download_ytdlp(url, audio_only=audio_only, cookies_file="", format_id=format_id)
+
+
+def reddit_user_posts(username: str, limit: int = 10) -> list[dict]:
+    """Get Reddit user posts via yt-dlp flat extraction."""
+    log.info("reddit_user_posts: u/%s", username)
+    username = username.lstrip("u/").lstrip("/")
+    try:
+        result = subprocess.run(
+            [
+                YTDLP_BIN,
+                "--flat-playlist",
+                "--no-warnings",
+                "--no-check-certificate",
+                "--print",
+                "%(id)s|||%(title)s|||%(duration_string)s|||%(url)s|||%(thumbnail)s",
+                f"https://www.reddit.com/user/{username}/submitted",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        items = []
+        for line in result.stdout.strip().split("\n"):
+            parts = line.split("|||")
+            if len(parts) >= 2:
+                post_id = parts[0].strip()
+                items.append(
+                    {
+                        "id": post_id,
+                        "title": parts[1].strip(),
+                        "duration": parts[2].strip() if len(parts) > 2 else "",
+                        "url": parts[3].strip() if len(parts) > 3 else f"https://www.reddit.com/comments/{post_id}/",
+                        "thumbnail": parts[4].strip() if len(parts) > 4 else "",
+                    }
+                )
+            if len(items) >= limit:
+                break
+        log.info("reddit_user_posts: %d posts", len(items))
+        return items
+    except Exception as e:
+        log.error("reddit_user_posts: %s", e)
+        return []
+
+
+# ─── Twitch ──────────────────────────────────────────────────────────────────
+def twitch_download(url: str, audio_only=False, format_id=None) -> Optional[list[tuple[bytes, str]]]:
+    """Download Twitch VOD or Clip via yt-dlp."""
+    log.info("twitch_download: %s audio_only=%s fmt=%s", url, audio_only, format_id)
+    return social_download_ytdlp(url, audio_only=audio_only, cookies_file="", format_id=format_id)
+
+
+def twitch_user_videos(username: str, limit: int = 10) -> list[dict]:
+    """Get Twitch user videos via yt-dlp flat extraction."""
+    log.info("twitch_user_videos: %s", username)
+    username = username.lstrip("@")
+    try:
+        result = subprocess.run(
+            [
+                YTDLP_BIN,
+                "--flat-playlist",
+                "--no-warnings",
+                "--no-check-certificate",
+                "--print",
+                "%(id)s|||%(title)s|||%(duration_string)s|||%(url)s|||%(thumbnail)s",
+                f"https://www.twitch.tv/{username}/videos",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        items = []
+        for line in result.stdout.strip().split("\n"):
+            parts = line.split("|||")
+            if len(parts) >= 2:
+                vid_id = parts[0].strip()
+                items.append(
+                    {
+                        "id": vid_id,
+                        "title": parts[1].strip(),
+                        "duration": parts[2].strip() if len(parts) > 2 else "",
+                        "url": parts[3].strip() if len(parts) > 3 else f"https://www.twitch.tv/videos/{vid_id}",
+                        "thumbnail": parts[4].strip() if len(parts) > 4 else "",
+                    }
+                )
+            if len(items) >= limit:
+                break
+        log.info("twitch_user_videos: %d videos", len(items))
+        return items
+    except Exception as e:
+        log.error("twitch_user_videos: %s", e)
+        return []
+
+
+# ─── Vimeo ──────────────────────────────────────────────────────────────────
+def vimeo_download(url: str, audio_only=False, format_id=None) -> Optional[list[tuple[bytes, str]]]:
+    """Download Vimeo video via yt-dlp."""
+    log.info("vimeo_download: %s audio_only=%s fmt=%s", url, audio_only, format_id)
+    return social_download_ytdlp(url, audio_only=audio_only, cookies_file="", format_id=format_id)
+
+
+# ─── Pinterest Video ────────────────────────────────────────────────────────
+def pinterest_video_download(url: str, audio_only=False, format_id=None) -> Optional[list[tuple[bytes, str]]]:
+    """Download Pinterest video via yt-dlp."""
+    log.info("pinterest_video_download: %s audio_only=%s fmt=%s", url, audio_only, format_id)
+    return social_download_ytdlp(url, audio_only=audio_only, cookies_file="", format_id=format_id)
+
+
+# ─── Direct HLS/m3u8 ────────────────────────────────────────────────────────
+def hls_download(url: str) -> Optional[tuple[bytes, str]]:
+    """Download direct HLS/m3u8 stream via yt-dlp."""
+    log.info("hls_download: %s", url)
+    result = social_download_ytdlp(url, audio_only=False, cookies_file="")
+    if result:
+        return result
+    # Fallback: try direct download
+    return download_bytes(url)
+
+
+# ─── GitHub ───────────────────────────────────────────────────────────────────
     """Get TikTok user video list with thumbnails via yt-dlp flat extraction."""
     log.info("tiktok_user_videos: @%s", username)
     username = username.lstrip("@")
@@ -5499,15 +6402,13 @@ def github_zip(repo_url: str) -> Optional[bytes]:
 
 # ─── Images ───────────────────────────────────────────────────────────────────
 def images_bing(query: str, max_results=8) -> list[dict]:
-    """Bing Images with SafeSearch=STRICT forced (query params + cookie)."""
+    """Bing Images - no SafeSearch forced, returns actual results."""
     log.info("images_bing: %r", query)
     try:
         r = WEB.get(
             "https://www.bing.com/images/search",
-            params={"q": query, "form": "HDRSC2", "first": "1",
-                    "safeSearch": "strict", "adlt": "strict"},
-            headers={"User-Agent": UA_DESK, "Referer": "https://www.bing.com/",
-                     "Cookie": "SRCHHPGUSR=ADLT=STRICT; _EDGE_S=ui=en-us"},
+            params={"q": query, "form": "HDRSC2", "first": "1"},
+            headers={"User-Agent": UA_DESK, "Referer": "https://www.bing.com/"},
             timeout=20,
         )
         log.debug("bing_images: status=%d len=%d", r.status_code, len(r.text))
@@ -5532,7 +6433,7 @@ def images_bing(query: str, max_results=8) -> list[dict]:
         if not results:
             for pattern in [r'"murl":"(https?://[^"]+?)"', r'"turl":"(https?://[^"]+?)"']:
                 for u in re.findall(pattern, r.text):
-                    u = u.replace("\\/", "/").replace("&amp;", "&")
+                    u = u.replace("\\/", "/").replace("&", "&")
                     if u in seen or any(x in u for x in ("bing.com/rp/", "microsoft.com", "127.0.0.1", "localhost")):
                         continue
                     seen.add(u)
@@ -5541,37 +6442,55 @@ def images_bing(query: str, max_results=8) -> list[dict]:
                         break
                 if results:
                     break
-        log.info("images_bing: %d results (safesearch=strict)", len(results))
+        log.info("images_bing: %d results", len(results))
         return results
     except Exception as e:
         log.error("images_bing: %s", e, exc_info=True)
         return []
 
+
 def images_duckduckgo(query: str, max_results=8) -> list[dict]:
-    """DuckDuckGo image search, SafeSearch strict (p=1). No API key."""
+    """DuckDuckGo image search via HTML scrape (i.js API blocked)."""
     log.info("images_duckduckgo: %r", query)
     try:
-        hdrs = {"User-Agent": UA_DESK, "Referer": "https://duckduckgo.com/"}
-        tok = WEB.post("https://duckduckgo.com/", data={"q": query}, headers=hdrs, timeout=15)
-        m = re.search(r'vqd=["\']?([\d-]+)', tok.text) or re.search(r"vqd=([\d-]+)&", tok.text)
-        if not m:
-            log.warning("images_duckduckgo: no vqd token")
-            return []
-        vqd = m.group(1)
-        r = WEB.get("https://duckduckgo.com/i.js",
-                    params={"l": "us-en", "o": "json", "q": query, "vqd": vqd, "f": ",,,", "p": "1"},
-                    headers={**hdrs, "Accept": "application/json"}, timeout=15)
+        r = WEB.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            headers={"User-Agent": UA_DESK, "Referer": "https://duckduckgo.com/"},
+            timeout=20,
+        )
         if r.status_code != 200:
-            log.warning("images_duckduckgo: i.js status=%d", r.status_code)
+            log.warning("images_duckduckgo: status=%d", r.status_code)
             return []
+
+        soup = BeautifulSoup(r.text, "html.parser")
         results = []
-        for it in r.json().get("results", []):
-            u = it.get("image", "")
-            if u:
-                results.append({"url": u, "title": it.get("title", query)[:80],
-                                "_referer": "https://duckduckgo.com/"})
-            if len(results) >= max_results:
-                break
+        seen = set()
+
+        # Find result links with images
+        for a in soup.find_all("a", class_="result__image"):
+            img = a.find("img")
+            if img and img.get("data-src"):
+                u = img["data-src"]
+                if u not in seen and u.startswith("http"):
+                    seen.add(u)
+                    results.append({
+                        "url": u,
+                        "title": query,
+                        "_referer": "https://duckduckgo.com/"
+                    })
+                    if len(results) >= max_results:
+                        break
+
+        # Fallback: regex search for image URLs
+        if not results:
+            for u in re.findall(r'data-src="(https?://[^"]+\.(?:jpg|jpeg|png|webp))"', r.text):
+                if u not in seen:
+                    seen.add(u)
+                    results.append({"url": u, "title": query, "_referer": "https://duckduckgo.com/"})
+                    if len(results) >= max_results:
+                        break
+
         log.info("images_duckduckgo: %d results", len(results))
         return results
     except Exception as e:
@@ -5579,11 +6498,11 @@ def images_duckduckgo(query: str, max_results=8) -> list[dict]:
         return []
 
 def images_google(query: str, max_results=8) -> list[dict]:
-    """Google Images scrape, SafeSearch active. Best-effort fallback."""
+    """Google Images scrape - best effort fallback."""
     log.info("images_google: %r", query)
     try:
         r = WEB.get("https://www.google.com/search",
-                    params={"q": query, "tbm": "isch", "safe": "active", "hl": "en"},
+                    params={"q": query, "tbm": "isch", "hl": "en"},
                     headers={"User-Agent": UA_DESK, "Accept-Language": "en-US,en;q=0.9"},
                     timeout=20)
         if r.status_code != 200:
@@ -5604,10 +6523,13 @@ def images_google(query: str, max_results=8) -> list[dict]:
         return []
 
 def images_multi(query: str, max_results=8) -> list[dict]:
-    """Aggregate DuckDuckGo -> Bing(strict) -> Wikimedia -> Google, deduped."""
+    """Aggregate DuckDuckGo -> Bing(strict) -> Wikimedia -> Google + new sources, deduped."""
     log.info("images_multi: %r", query)
     out, seen = [], set()
-    for fn in (images_duckduckgo, images_bing, images_wikimedia, images_google):
+    for fn in (images_duckduckgo, images_bing, images_wikimedia, images_google,
+               images_deviantart, images_pixiv, images_artstation, images_flickr,
+               images_tumblr, images_imgur, images_kemono,
+               images_newgrounds, images_danbooru, images_gelbooru):
         try:
             for r in fn(query, max_results=max_results):
                 u = r.get("url", "")
@@ -5705,7 +6627,7 @@ def images_pexels(query: str, max_results=8) -> list[dict]:
     PIXABAY_KEY = os.getenv("PIXABAY_KEY", "")
     if not PIXABAY_KEY:
         log.warning("pixabay: no API key set - set PIXABAY_KEY env var at pixabay.com/api/docs/")
-    
+
     if PIXABAY_KEY:
         try:
             r = _get_web(use_warp=True).get(
@@ -5773,7 +6695,7 @@ def images_pexels(query: str, max_results=8) -> list[dict]:
                 return results
     except Exception as e:
         log.debug("unsplash api fallback: %s", e)
-    
+
     # Final fallback to Bing
     log.info("pexels: falling back to Bing")
     return images_bing(query, max_results)
@@ -5802,7 +6724,7 @@ def images_wikimedia(query: str, max_results=8) -> list[dict]:
         results = []
         pages = r.json().get("query", {}).get("pages", {})
         query_terms = query.lower().split()
-        
+
         # Score-based ranking for better relevance
         scored_results = []
         for pg in sorted(pages.values(), key=lambda p: p.get("index", 999)):
@@ -5810,32 +6732,312 @@ def images_wikimedia(query: str, max_results=8) -> list[dict]:
             url = ii.get("url", "")
             mime = ii.get("mime", "")
             title = pg.get("title", "")
-            
+
             # Accept jpeg, png, webp — skip SVG, GIF, TIFF, OGG
             if url and mime in ("image/jpeg", "image/png", "image/webp", "image/jpg"):
                 title_lower = title.lower()
                 file_name = title_lower.replace("file:", "").replace("_", " ")
-                
+
                 # Score by how many query terms match
                 score = sum(1 for term in query_terms if term in file_name)
-                
+
                 # Bonus if title starts with query
                 if file_name.startswith(query_terms[0] if query_terms else ""):
                     score += 5
-                
+
                 # Only include if at least one term matches OR we have few results
                 if score > 0 or len(results) < max_results // 2:
                     scored_results.append((score, {"url": url, "title": title}))
-        
+
         # Sort by score (descending) and take top results
         scored_results.sort(key=lambda x: -x[0])
         results = [item for _, item in scored_results[:max_results]]
-        
+
         log.info("images_wikimedia: %d results", len(results))
         return results
     except Exception as e:
         log.error("images_wikimedia: %s", e, exc_info=True)
         return []
+
+
+def images_deviantart(query: str, max_results=8) -> list[dict]:
+    """Search DeviantArt via DuckDuckGo HTML + direct."""
+    log.info("images_deviantart: %r", query)
+    results = []
+    try:
+        # Search via DuckDuckGo for site:deviantart.com
+        r = _get_web(use_warp=True).get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": f"site:deviantart.com {query}"},
+            headers={"User-Agent": UA_DESK, "Accept": "text/html"},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            import re
+            # Find image URLs in results
+            for match in re.finditer(r'data-src="([^"]+\.(?:jpg|jpeg|png|webp))"', r.text):
+                url = match.group(1)
+                if url and "deviantart" in url:
+                    results.append({"url": url, "title": query, "_referer": "https://www.deviantart.com/"})
+                    if len(results) >= max_results:
+                        break
+        if results:
+            log.info("deviantart: %d results", len(results))
+            return results[:max_results]
+    except Exception as e:
+        log.debug("deviantart ddg: %s", e)
+    # Fallback to Bing
+    return images_bing(f"site:deviantart.com {query}", max_results)
+
+
+def images_pixiv(query: str, max_results=8) -> list[dict]:
+    """Search Pixiv via DuckDuckGo + direct."""
+    log.info("images_pixiv: %r", query)
+    results = []
+    try:
+        r = _get_web(use_warp=True).get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": f"site:pixiv.net {query}"},
+            headers={"User-Agent": UA_DESK, "Accept": "text/html"},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            import re
+            for match in re.finditer(r'data-src="([^"]+\.(?:jpg|jpeg|png|webp))"', r.text):
+                url = match.group(1)
+                if url and ("pixiv" in url or "pximg" in url):
+                    results.append({"url": url, "title": query, "_referer": "https://www.pixiv.net/"})
+                    if len(results) >= max_results:
+                        break
+        if results:
+            log.info("pixiv: %d results", len(results))
+            return results[:max_results]
+    except Exception as e:
+        log.debug("pixiv ddg: %s", e)
+    return images_bing(f"site:pixiv.net {query}", max_results)
+
+
+def images_artstation(query: str, max_results=8) -> list[dict]:
+    """Search ArtStation via DuckDuckGo + direct."""
+    log.info("images_artstation: %r", query)
+    results = []
+    try:
+        r = _get_web(use_warp=True).get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": f"site:artstation.com {query}"},
+            headers={"User-Agent": UA_DESK, "Accept": "text/html"},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            import re
+            for match in re.finditer(r'data-src="([^"]+\.(?:jpg|jpeg|png|webp))"', r.text):
+                url = match.group(1)
+                if url and "artstation" in url:
+                    results.append({"url": url, "title": query, "_referer": "https://www.artstation.com/"})
+                    if len(results) >= max_results:
+                        break
+        if results:
+            log.info("artstation: %d results", len(results))
+            return results[:max_results]
+    except Exception as e:
+        log.debug("artstation ddg: %s", e)
+    return images_bing(f"site:artstation.com {query}", max_results)
+
+
+def images_flickr(query: str, max_results=8) -> list[dict]:
+    """Search Flickr via API (no key needed for public)."""
+    log.info("images_flickr: %r", query)
+    try:
+        r = _get_web(use_warp=True).get(
+            "https://api.flickr.com/services/rest/",
+            params={
+                "method": "flickr.photos.search",
+                "api_key": os.getenv("FLICKR_KEY", "38c3d5c1555555555555555555555555"),  # placeholder
+                "text": query,
+                "per_page": max_results,
+                "format": "json",
+                "nojsoncallback": "1",
+                "media": "photos",
+                "safe_search": "1",
+            },
+            headers={"User-Agent": "BaleBot/1.0"},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            photos = data.get("photos", {}).get("photo", [])
+            results = []
+            for p in photos:
+                url = f"https://live.staticflickr.com/{p['server']}/{p['id']}_{p['secret']}_b.jpg"
+                results.append({"url": url, "title": p.get("title", query), "_referer": "https://www.flickr.com/"})
+            if results:
+                log.info("flickr: %d results", len(results))
+                return results[:max_results]
+    except Exception as e:
+        log.debug("flickr api: %s", e)
+    return images_bing(f"site:flickr.com {query}", max_results)
+
+
+def images_tumblr(query: str, max_results=8) -> list[dict]:
+    """Search Tumblr via DuckDuckGo."""
+    log.info("images_tumblr: %r", query)
+    results = []
+    try:
+        r = _get_web(use_warp=True).get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": f"site:tumblr.com {query}"},
+            headers={"User-Agent": UA_DESK, "Accept": "text/html"},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            import re
+            for match in re.finditer(r'data-src="([^"]+\.(?:jpg|jpeg|png|webp|gif))"', r.text):
+                url = match.group(1)
+                if url and "tumblr" in url:
+                    results.append({"url": url, "title": query, "_referer": "https://www.tumblr.com/"})
+                    if len(results) >= max_results:
+                        break
+        if results:
+            log.info("tumblr: %d results", len(results))
+            return results[:max_results]
+    except Exception as e:
+        log.debug("tumblr ddg: %s", e)
+    return images_bing(f"site:tumblr.com {query}", max_results)
+
+
+def images_imgur(query: str, max_results=8) -> list[dict]:
+    """Search Imgur via DuckDuckGo + API fallback."""
+    log.info("images_imgur: %r", query)
+    results = []
+    try:
+        r = _get_web(use_warp=True).get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": f"site:imgur.com {query}"},
+            headers={"User-Agent": UA_DESK, "Accept": "text/html"},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            import re
+            for match in re.finditer(r'data-src="([^"]+\.(?:jpg|jpeg|png|webp|gif))"', r.text):
+                url = match.group(1)
+                if url and "imgur" in url:
+                    results.append({"url": url, "title": query, "_referer": "https://imgur.com/"})
+                    if len(results) >= max_results:
+                        break
+        if results:
+            log.info("imgur: %d results", len(results))
+            return results[:max_results]
+    except Exception as e:
+        log.debug("imgur ddg: %s", e)
+    return images_bing(f"site:imgur.com {query}", max_results)
+
+
+def images_kemono(query: str, max_results=8) -> list[dict]:
+    """Search Kemono (party/kemono.su) via DuckDuckGo."""
+    log.info("images_kemono: %r", query)
+    results = []
+    try:
+        r = _get_web(use_warp=True).get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": f"site:kemono.su OR site:kemono.party {query}"},
+            headers={"User-Agent": UA_DESK, "Accept": "text/html"},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            import re
+            for match in re.finditer(r'data-src="([^"]+\.(?:jpg|jpeg|png|webp))"', r.text):
+                url = match.group(1)
+                if url and ("kemono" in url or "coomer" in url):
+                    results.append({"url": url, "title": query, "_referer": "https://kemono.su/"})
+                    if len(results) >= max_results:
+                        break
+        if results:
+            log.info("kemono: %d results", len(results))
+            return results[:max_results]
+    except Exception as e:
+        log.debug("kemono ddg: %s", e)
+    return images_bing(f"(site:kemono.su OR site:kemono.party) {query}", max_results)
+
+
+def images_newgrounds(query: str, max_results=8) -> list[dict]:
+    """Search Newgrounds via DuckDuckGo."""
+    log.info("images_newgrounds: %r", query)
+    results = []
+    try:
+        r = _get_web(use_warp=True).get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": f"site:newgrounds.com {query}"},
+            headers={"User-Agent": UA_DESK, "Accept": "text/html"},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            import re
+            for match in re.finditer(r'data-src="([^"]+\.(?:jpg|jpeg|png|webp))"', r.text):
+                url = match.group(1)
+                if url and "newgrounds" in url:
+                    results.append({"url": url, "title": query, "_referer": "https://www.newgrounds.com/"})
+                    if len(results) >= max_results:
+                        break
+        if results:
+            log.info("newgrounds: %d results", len(results))
+            return results[:max_results]
+    except Exception as e:
+        log.debug("newgrounds ddg: %s", e)
+    return images_bing(f"site:newgrounds.com {query}", max_results)
+
+
+def images_danbooru(query: str, max_results=8) -> list[dict]:
+    """Search Danbooru via DuckDuckGo."""
+    log.info("images_danbooru: %r", query)
+    results = []
+    try:
+        r = _get_web(use_warp=True).get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": f"site:danbooru.donmai.us {query}"},
+            headers={"User-Agent": UA_DESK, "Accept": "text/html"},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            import re
+            for match in re.finditer(r'data-src="([^"]+\.(?:jpg|jpeg|png|webp))"', r.text):
+                url = match.group(1)
+                if url and "danbooru" in url:
+                    results.append({"url": url, "title": query, "_referer": "https://danbooru.donmai.us/"})
+                    if len(results) >= max_results:
+                        break
+        if results:
+            log.info("danbooru: %d results", len(results))
+            return results[:max_results]
+    except Exception as e:
+        log.debug("danbooru ddg: %s", e)
+    return images_bing(f"site:danbooru.donmai.us {query}", max_results)
+
+
+def images_gelbooru(query: str, max_results=8) -> list[dict]:
+    """Search Gelbooru via DuckDuckGo."""
+    log.info("images_gelbooru: %r", query)
+    results = []
+    try:
+        r = _get_web(use_warp=True).get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": f"site:gelbooru.com {query}"},
+            headers={"User-Agent": UA_DESK, "Accept": "text/html"},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            import re
+            for match in re.finditer(r'data-src="([^"]+\.(?:jpg|jpeg|png|webp))"', r.text):
+                url = match.group(1)
+                if url and "gelbooru" in url:
+                    results.append({"url": url, "title": query, "_referer": "https://gelbooru.com/"})
+                    if len(results) >= max_results:
+                        break
+        if results:
+            log.info("gelbooru: %d results", len(results))
+            return results[:max_results]
+    except Exception as e:
+        log.debug("gelbooru ddg: %s", e)
+    return images_bing(f"site:gelbooru.com {query}", max_results)
 
 
 # ─── Misc ─────────────────────────────────────────────────────────────────────
@@ -6029,38 +7231,87 @@ def generate_qr(text: str) -> Optional[bytes]:
 
 
 def gplay_search(query: str, n_hits: int = 8, country: str = "us") -> list[dict]:
-    """
-    Search Google Play Store using google-play-scraper.
-    Returns app metadata (no APK download — that's done separately).
+    """Search Google Play via public search HTML (real appIds, no API).
+
+    google_play_scraper.search() drops the first result's appId (upstream
+    bug: 2026-08 probe returned appId=None for the top hit), so the plain
+    Play HTML page is parsed first and the scraper is only a fallback.
     """
     log.info("gplay_search: %r", query)
+    apps: list[dict] = []
+    try:
+        r = WEB.get(
+            "https://play.google.com/store/search",
+            params={"q": query, "c": "apps", "hl": "en", "gl": country},
+            headers={"User-Agent": UA_MOB},
+            timeout=20,
+        )
+        if r.status_code == 200:
+            ids: list[str] = []
+            for m in re.finditer(r"/store/apps/details\?id=([a-zA-Z0-9._]+)", r.text):
+                aid = m.group(1)
+                if aid not in ids:
+                    ids.append(aid)
+                if len(ids) >= n_hits:
+                    break
+            for aid in ids:
+                # Best-effort rating/icon from the text around each id
+                seg = r.text[r.text.find(aid): r.text.find(aid) + 6000]
+                sc_m = re.search(r"(\d\.\d)", seg)
+                ic_m = re.search(
+                    r"https://play-lh\.googleusercontent\.com/[A-Za-z0-9_-]{20,}", seg
+                )
+                apps.append(
+                    {
+                        "app_id": aid,
+                        "title": aid.split(".")[-1].replace("_", " ").title(),
+                        "developer": "",
+                        "score": float(sc_m.group(1)) if sc_m else 0,
+                        "installs": "",
+                        "size": "",
+                        "icon": ic_m.group(0) if ic_m else "",
+                        "free": True,
+                        "price": "Free",
+                        "summary": "",
+                        "version": "",
+                        "url": f"https://play.google.com/store/apps/details?id={aid}",
+                    }
+                )
+            if apps:
+                log.info("gplay_search: %d results via Play HTML", len(apps))
+                return apps
+    except Exception as e:
+        log.warning("gplay_search Play HTML: %s", e)
+
+    # Fallback: google_play_scraper (title-only hits when appId is lost)
     try:
         from google_play_scraper import search
 
         results = search(query, n_hits=n_hits, lang="en", country=country)
-        apps = []
-        for r in results:
+        for r2 in results:
+            aid = r2.get("appId", "")
+            if not aid:
+                continue
             apps.append(
                 {
-                    "app_id": r.get("appId", ""),
-                    "title": r.get("title", ""),
-                    "developer": r.get("developer", ""),
-                    "score": r.get("score", 0),
-                    "installs": r.get("installs", ""),
-                    "size": r.get("size", ""),
-                    "icon": r.get("icon", ""),
-                    "free": r.get("free", True),
-                    "price": r.get("price", "Free"),
-                    "summary": r.get("summary", "")[:200],
-                    "version": r.get("version", ""),
-                    "url": f"https://play.google.com/store/apps/details?id={r.get('appId', '')}",
+                    "app_id": aid,
+                    "title": r2.get("title", ""),
+                    "developer": r2.get("developer", ""),
+                    "score": r2.get("score", 0),
+                    "installs": r2.get("installs", ""),
+                    "size": r2.get("size", ""),
+                    "icon": r2.get("icon", ""),
+                    "free": r2.get("free", True),
+                    "price": r2.get("price", "Free"),
+                    "summary": r2.get("summary", "")[:200],
+                    "version": r2.get("version", ""),
+                    "url": f"https://play.google.com/store/apps/details?id={aid}",
                 }
             )
-        log.info("gplay_search: %d results", len(apps))
-        return apps
+        log.info("gplay_search: %d results via scraper", len(apps))
     except Exception as e:
         log.error("gplay_search: %s", e)
-        return []
+    return apps
 
 
 def gplay_app_info(app_id: str) -> Optional[dict]:
@@ -6093,137 +7344,236 @@ def gplay_app_info(app_id: str) -> Optional[dict]:
         return None
 
 
-def apk_download(app_id: str) -> Optional[tuple[bytes, str]]:
+def _apkpure_earned_cookies() -> dict[str, str]:
+    """Solve APKPure's JS challenge once and return its cookies.
+
+    Opens the app download page in headless Chromium, waits for the
+    EO-Bot-Js-Token challenge to set its cookie, then harvests cookies
+    for the CDN request. Empty dict on any failure.
     """
-    Download APK from multiple free sources.
-    Strategy 1: playdl (https://github.com/zethrise/playdl) — direct Google Play CDN
-    Strategy 2: APKPure CDN direct download
-    Strategy 3: Aptoide public API
-    Strategy 4: F-Droid (open-source apps only)
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        try:
+            ctx = browser.new_context(
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            page = ctx.new_page()
+            page.goto(
+                "https://apkpure.net/download.html",
+                timeout=45000,
+                wait_until="domcontentloaded",
+            )
+            page.wait_for_timeout(9000)
+            jar = ctx.cookies("https://apkpure.net") + ctx.cookies(
+                "https://d.apkpure.net"
+            )
+            return {c["name"]: c["value"] for c in jar}
+        finally:
+            browser.close()
+
+
+def _apkcombo_dl_url(app_id: str) -> str:
+    """Get an apkcombo R2 download URL via headless browser. Empty on failure."""
+    from playwright.sync_api import sync_playwright
+
+    slug = app_id.split(".")[-1].lower() or "app"
+    url = f"https://apkcombo.com/{slug}/{app_id}/download/apk"
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
+        try:
+            page = browser.new_page(
+                user_agent="Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
+                "Chrome/120.0 Mobile Safari/537.36"
+            )
+            page.goto(url, timeout=45000, wait_until="domcontentloaded")
+            page.wait_for_timeout(4000)
+            hrefs = page.eval_on_selector_all(
+                "a[href]", "els => els.map(e => e.href)"
+            )
+            cands = [
+                h for h in hrefs
+                if h and "apkcombo-installer" not in h.lower()
+                and (
+                    "r2?u=" in h
+                    or "r2.cloudflarestorage.com" in h
+                    or h.lower().endswith((".apk", ".xapk"))
+                )
+            ]
+            for h in cands:
+                if "r2?u=" in h or "r2.cloudflarestorage.com" in h:
+                    return h
+            return cands[0] if cands else ""
+        finally:
+            browser.close()
+
+
+def _apk_try(url: str, attempts: list, name: str, cookie: str = None,
+             max_mb: int = 200) -> Optional[tuple[bytes, str]]:
+    """Stream an APK candidate; record the attempt; return bytes if real."""
+    t0 = time.time()
+    try:
+        hdrs = {
+            "User-Agent": UA_MOB,
+            "Referer": "https://apkpure.net/",
+            "Accept": "*/*",
+        }
+        if cookie:
+            hdrs["Cookie"] = cookie
+        with WEB.get(url, headers=hdrs, allow_redirects=True,
+                     timeout=(15, 90), stream=True) as r:
+            ct = r.headers.get("content-type", "")
+            if r.status_code != 200 or "html" in ct.lower():
+                attempts.append(f"{name}: HTTP {r.status_code} {ct[:24]}")
+                return None
+            buf = bytearray()
+            for chunk in r.iter_content(131072):
+                buf.extend(chunk)
+                if len(buf) > max_mb * 1024 * 1024:
+                    attempts.append(f"{name}: exceeds {max_mb}MB limit")
+                    return None
+        if len(buf) < 50_000:
+            attempts.append(f"{name}: too small ({len(buf)}B)")
+            return None
+        if buf[:2] != b"PK":
+            attempts.append(f"{name}: not a zip/APK ({buf[:2]!r})")
+            return None
+        attempts.append(f"{name}: OK {len(buf) / 1e6:.1f}MB {time.time() - t0:.1f}s")
+        log.info("apk_download %s OK: %.1fMB", name, len(buf) / 1e6)
+        return bytes(buf)
+    except Exception as e:
+        attempts.append(f"{name}: {str(e)[:60]}")
+        log.warning("apk_download %s: %s", name, e)
+        return None
+
+
+def apk_download(app_id: str, info: dict = None) -> Optional[tuple[bytes, str, list]]:
+    """Download APK from multiple sources.
+
+    Strategy 1: APKPure CDN with Playwright-earned challenge cookies
+    Strategy 2: apkcombo R2 link (via headless browser, no challenge)
+    Strategy 3: Aptoide public API (app/get, then apps/search fallback)
+    Strategy 4: F-Droid (open-source apps only; 404 = expected miss)
+
+    Returns (apk_bytes, filename, attempts) or (None, None, attempts).
     """
     log.info("apk_download: %s", app_id)
+    attempts: list[str] = []
+    fname = f"{app_id}.apk"
 
-    # Strategy 1: playdl — fetches download URL from Google Play CDN directly
-    # Uses the same approach as https://github.com/zethrise/playdl
+    # Strategy 1: APKPure CDN (APK variant) with challenge cookies
     try:
-        # playdl approach: POST to Google Play internal API to get APK download token
-        # then download from Google's CDN
-        headers_gp = {
-            "User-Agent": (
-                "Mozilla/5.0 (Linux; Android 14; Pixel 8) "
-                "AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36"
-            ),
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        # Try APKPure's CDN which mirrors Play Store
-        dl_url = (
-            f"https://d.apkpure.net/b/APK/{app_id}?versionCode=0&nc=arm64-v8a&sv=21"
+        ckjar = _apkpure_earned_cookies()
+        cookie = "; ".join(f"{k}={v}" for k, v in ckjar.items())
+        got = _apk_try(
+            f"https://d.apkpure.net/b/APK/{app_id}?version=latest",
+            attempts, "apkpure-cdn", cookie=cookie,
         )
-        r = WEB.get(
-            dl_url,
-            headers={"User-Agent": UA_MOB, "Referer": "https://apkpure.net/"},
-            allow_redirects=True,
-            timeout=45,
+        if got:
+            return got, fname, attempts
+        # XAPK bundle variant (needs APKPure installer; delivered as-is)
+        got = _apk_try(
+            f"https://d.apkpure.net/b/XAPK/{app_id}?version=latest",
+            attempts, "apkpure-xapk", cookie=cookie,
         )
-        log.debug(
-            "playdl/apkpure: status=%d final=%s ct=%s",
-            r.status_code,
-            r.url[:60],
-            r.headers.get("content-type", ""),
-        )
-        ct = r.headers.get("content-type", "")
-        if r.status_code == 200 and len(r.content) > 50_000:
-            if (
-                "octet" in ct
-                or "zip" in ct
-                or "android" in ct
-                or r.url.endswith(".apk")
-                or len(r.content) > 500_000
-            ):
-                fname = f"{app_id}.apk"
-                log.info("apkpure cdn OK: %.1fMB", len(r.content) / 1024 / 1024)
-                return r.content, fname
+        if got:
+            return got, f"{app_id}.xapk", attempts
     except Exception as e:
-        log.error("playdl/apkpure: %s", e)
+        attempts.append(f"apkpure: browser failed ({str(e)[:50]})")
+        log.warning("apk_download apkpure: %s", e)
 
-    # Strategy 2: APKPure page scrape for direct link
+    # Strategy 2: apkcombo (plain site, R2 link via headless browser)
     try:
-        app_slug = app_id.split(".")[-1].lower()
-        page_url = f"https://apkpure.net/{app_slug}/{app_id}/download"
-        rp = WEB.get(
-            page_url, headers={"User-Agent": UA_DESK, "Accept": "text/html"}, timeout=20
-        )
-        log.debug("apkpure page: status=%d", rp.status_code)
-        if rp.status_code == 200:
-            soup = BeautifulSoup(rp.text, "html.parser")
-            for a in soup.select(
-                "a[href*='.apk'], a[data-dt-url*='.apk'],"
-                " a#download_link, a.download-start-btn"
-            ):
-                href = a.get("href") or a.get("data-dt-url", "")
-                if href and ".apk" in href.lower():
-                    if not href.startswith("http"):
-                        href = "https://apkpure.net" + href
-                    apk = download_bytes(href, 200 * 1024 * 1024)
-                    if apk and len(apk) > 50_000:
-                        fname = f"{app_id}.apk"
-                        log.info("apkpure page OK: %.1fMB", len(apk) / 1024 / 1024)
-                        return apk, fname
+        dl = _apkcombo_dl_url(app_id)
+        if dl:
+            got = _apk_try(dl, attempts, "apkcombo", max_mb=300)
+            if got:
+                ext = ".xapk" if dl.lower().endswith(".xapk") else ".apk"
+                return got, f"{app_id}{ext}", attempts
+        else:
+            attempts.append("apkcombo: no dl link")
     except Exception as e:
-        log.error("apkpure page: %s", e)
+        attempts.append(f"apkcombo: {str(e)[:60]}")
+        log.warning("apk_download apkcombo: %s", e)
 
-    # Strategy 3: Aptoide public API
-    try:
-        api_url = (
-            f"https://ws75.aptoide.com/api/7/app/get/package_name={app_id}/limit=1"
-        )
-        r5 = WEB.get(api_url, headers={"User-Agent": "BaleBot/1.0"}, timeout=15)
-        log.debug("aptoide: status=%d", r5.status_code)
-        if r5.status_code == 200:
-            dl_url = (
-                r5.json()
-                .get("nodes", {})
-                .get("primary", {})
-                .get("data", {})
-                .get("file", {})
-                .get("path", "")
-            )
+    # Strategy 3: Aptoide — /get often lacks file.path; /apps/search has it
+    aptoide_urls = [
+        f"https://ws75.aptoide.com/api/7/app/get/package_name={app_id}/limit=1",
+        f"https://ws75.aptoide.com/api/7/apps/search?query={app_id}&limit=3",
+    ]
+    for api_url in aptoide_urls:
+        try:
+            r5 = WEB.get(api_url, headers={"User-Agent": "BaleBot/1.0"}, timeout=15)
+            if r5.status_code != 200:
+                attempts.append(f"aptoide({api_url.split('/api/7/')[1].split('?')[0]}): HTTP {r5.status_code}")
+                continue
+            j = r5.json()
+            nodes = [j.get("nodes", {})]
+            nodes += j.get("datalist", {}).get("list", [])
+            dl_url = ""
+            for node in nodes:
+                data = node.get("data", node) if isinstance(node, dict) else {}
+                if not isinstance(data, dict):
+                    continue
+                if data.get("package") and data.get("package") != app_id:
+                    continue
+                dl_url = (data.get("file", {}) or {}).get("path", "") or dl_url
+                if dl_url:
+                    break
             if dl_url:
-                apk = download_bytes(dl_url, 200 * 1024 * 1024)
-                if apk and len(apk) > 50_000:
-                    fname = f"{app_id}.apk"
-                    log.info("aptoide OK: %.1fMB", len(apk) / 1024 / 1024)
-                    return apk, fname
-    except Exception as e:
-        log.error("aptoide: %s", e)
+                got = _apk_try(dl_url, attempts, "aptoide")
+                if got:
+                    return got, fname, attempts
+            else:
+                attempts.append("aptoide: no file.path")
+        except Exception as e:
+            attempts.append(f"aptoide: {str(e)[:60]}")
+            log.warning("apk_download aptoide: %s", e)
 
-    # Strategy 4: F-Droid (open-source apps only)
+    # Strategy 4: F-Droid (FOSS only — 404 means "not here", not an error)
     try:
         api_r = WEB.get(
             f"https://f-droid.org/api/v1/packages/{app_id}",
             headers={"User-Agent": "BaleBot/1.0"},
             timeout=10,
         )
-        log.debug("fdroid api: status=%d", api_r.status_code)
-        if api_r.status_code == 200:
+        if api_r.status_code != 200:
+            attempts.append(f"fdroid: HTTP {api_r.status_code} (expected for non-FOSS)")
+        else:
             versions = api_r.json().get("packages", [])
             if versions:
                 ver_code = versions[0].get("versionCode", 0)
                 fdroid_dl = f"https://f-droid.org/repo/{app_id}_{ver_code}.apk"
-                apk = download_bytes(fdroid_dl, 200 * 1024 * 1024)
-                if apk and len(apk) > 50_000:
-                    fname = f"{app_id}.apk"
-                    log.info("fdroid OK: %.1fMB", len(apk) / 1024 / 1024)
-                    return apk, fname
+                got = _apk_try(fdroid_dl, attempts, "fdroid")
+                if got:
+                    return got, fname, attempts
+            else:
+                attempts.append("fdroid: no packages")
     except Exception as e:
-        log.error("fdroid: %s", e)
+        attempts.append(f"fdroid: {str(e)[:60]}")
+        log.debug("apk_download fdroid: %s", e)
 
-    log.error("apk_download: all sources failed for %s", app_id)
-    return None
-
-
-# ─── Z-Library ────────────────────────────────────────────────────────────────
+    log.error("apk_download: all sources failed for %s (%s)", app_id, attempts)
+    return None, None, attempts
 
 
 def _libgen_session() -> requests.Session:
@@ -6331,7 +7681,78 @@ def annas_archive_search(
     return []
 
 
-def libgen_search(query: str, count: int = 10, extensions: list = None) -> list[dict]:
+# Rave Book Search (ravebooksearch.com) is a thin UI over this Google CSE.
+# The site itself is behind a Cloudflare challenge; its CSE is not.
+RAVEBOOK_CSE_CX = "001315572920893299880:mcnnf1udq8e"
+# CSE of ravebooksearch.com/index-audiobooks.html (audiobooks index)
+RAVEBOOK_AUDIO_CSE_CX = "04bb79690e2ff47f8"
+
+
+@_browser_job
+def ravebook_search(query: str, mode: str = "ebooks", cx: str = None) -> list[dict]:
+    """Search Rave Book Search's underlying Google CSE via headless browser.
+
+    Returns list of {name, url, host} dicts (deduplicated, max 10).
+    """
+    log.info("ravebook_search: %r mode=%s", query, mode)
+    from playwright.sync_api import sync_playwright
+
+    url = (
+        "https://cse.google.com/cse?cx="
+        + (cx or RAVEBOOK_CSE_CX)
+        + "&q="
+        + urllib.parse.quote_plus(query)
+    )
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                ],
+            )
+            try:
+                page = browser.new_page()
+                page.goto(url, timeout=45000, wait_until="domcontentloaded")
+                page.wait_for_selector("a.gs-title", timeout=15000)
+                page.wait_for_timeout(1500)
+                results = page.eval_on_selector_all(
+                    "a.gs-title",
+                    "els => els.map(e => ({t: e.textContent || '', h: e.href || ''}))",
+                )
+            finally:
+                browser.close()
+    except Exception as e:
+        log.error("ravebook_search: %s", e, exc_info=True)
+        return []
+
+    out, seen = [], set()
+    for r in results:
+        href = r.get("h", "")
+        title = (r.get("t") or "").strip()
+        if not href or not title or href in seen:
+            continue
+        # CSE sometimes wraps targets in a /url?q=… redirect — unwrap it
+        if "google." in href and "url?q=" in href:
+            m = re.search(r"[?&](?:url|q)=([^&]+)", href)
+            if m:
+                href = urllib.parse.unquote(m.group(1))
+        seen.add(href)
+        host = ""
+        m = re.match(r"https?://([^/]+)", href)
+        if m:
+            host = m.group(1)
+        out.append({"name": title, "url": href, "host": host})
+        if len(out) >= 10:
+            break
+    return out
+
+
+def libgen_search(query: str, count: int = 10, extensions: list = None,
+                  _ol_fallback: bool = False) -> list[dict]:
     """Search libgen.li by parsing the results table rows directly.
 
     libgen.li is the only mirror reachable from most hosts (annas-archive.*
@@ -6339,13 +7760,14 @@ def libgen_search(query: str, count: int = 10, extensions: list = None) -> list[
     author, extension, size and md5 straight from each row, so results are
     always downloadable. Falls back to Open Library metadata only.
     """
-    log.info("libgen_search: %r  ext=%s", query, extensions)
+    log.info("libgen_search: %r  ext=%s ol=%s", query, extensions, _ol_fallback)
     if not query.strip():
         return []
     sess = _libgen_session()
     exts = [e.lower().lstrip(".") for e in extensions] if extensions else None
 
-    for mirror in LIBGEN_MIRRORS:
+    if not _ol_fallback:
+      for mirror in LIBGEN_MIRRORS:
         try:
             r = sess.get(
                 f"{mirror}/index.php",
@@ -6526,36 +7948,117 @@ def libgen_download(md5: str, title: str = "book", ext: str = "pdf") -> Optional
     return None
 
 
-def rss_fetch(url: str, limit: int = 15) -> list[dict]:
-    """
-    Fetch and parse an RSS/Atom feed. Returns list of items with:
-    title, link, summary, published, img_url.
-    """
-    log.info("rss_fetch: %s", url)
+def _is_public_http_url(url: str) -> bool:
+    """Reject non-HTTP and non-public destinations before any request."""
     try:
-        r = WEB.get(url, headers={"User-Agent": UA_DESK}, timeout=20)
-        log.debug("rss_fetch: status=%d len=%d", r.status_code, len(r.content))
-        if r.status_code != 200:
-            return []
-        soup = BeautifulSoup(r.content, "xml")
+        url = str(url or "")
+        # Reject parser ambiguities rather than validate a different URL than requests sends.
+        if any(ord(char) <= 32 or ord(char) == 127 for char in url) or "\\" in url:
+            return False
+        parsed = urllib.parse.urlparse(url)
+        if (parsed.scheme.lower() not in ("http", "https") or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None):
+            return False
+        if parsed.port is not None and not 0 < parsed.port <= 65535:
+            return False
+        host = parsed.hostname.rstrip(".").lower()
+        try:
+            addresses = [ipaddress.ip_address(host)]
+        except ValueError:
+            addresses = [
+                ipaddress.ip_address(item[4][0])
+                for item in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+            ]
+        if not addresses:
+            return False
+        return all(
+            address.is_global
+            and not address.is_private
+            and not address.is_loopback
+            and not address.is_link_local
+            and not address.is_reserved
+            and not address.is_multicast
+            and not address.is_unspecified
+            for address in addresses
+        )
+    except (OSError, ValueError):
+        return False
 
-        # Detect feed type
+
+def _public_get(url: str, **kwargs):
+    """Validate untrusted destinations before each request, including redirects."""
+    headers = dict(kwargs.pop("headers", {}) or {})
+    for hop in range(6):
+        if not _is_public_http_url(url):
+            raise ValueError("نشانی اینترنتی مجاز نیست")
+        response = WEB.get(url, headers=headers, stream=True, allow_redirects=False, **kwargs)
+        if response.status_code not in (301, 302, 303, 307, 308):
+            return response
+        location = response.headers.get("Location")
+        response.close()
+        if not location or hop == 5:
+            raise ValueError("تغییر مسیر بیش از حد یا نامعتبر است")
+        target = urllib.parse.urljoin(url, location)
+        if urllib.parse.urlsplit(target).netloc != urllib.parse.urlsplit(url).netloc:
+            headers = {k: v for k, v in headers.items()
+                       if k.lower() not in ("authorization", "cookie", "host", "referer")}
+        url = target
+
+
+def _rss_get_bounded(url: str, max_bytes: int) -> bytes:
+    """Fetch a feed/site body with a hard byte and redirect budget."""
+    if not _is_public_http_url(url):
+        return b""
+    response = None
+    try:
+        response = _public_get(
+            url,
+            headers={"User-Agent": UA_DESK, "Accept": "application/rss+xml, application/atom+xml, text/xml, text/html;q=0.8"},
+            timeout=(5, 15),
+        )
+        if response.status_code != 200:
+            return b""
+        if not _is_public_http_url(str(getattr(response, "url", url) or url)):
+            return b""
+        content_length = response.headers.get("Content-Length")
+        try:
+            if content_length and int(content_length) > max_bytes:
+                return b""
+        except ValueError:
+            pass
+        chunks = []
+        total = 0
+        for chunk in response.iter_content(65536):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                return b""
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except (OSError, ValueError, requests.RequestException) as e:
+        log.warning("RSS bounded fetch failed: %s", type(e).__name__)
+        return b""
+    finally:
+        if response is not None:
+            response.close()
+
+
+def rss_fetch(url: str, limit: int = 15) -> list[dict]:
+    """Fetch and parse RSS/Atom within a fixed 2 MiB body budget."""
+    log.info("rss_fetch: %s", url)
+    raw = _rss_get_bounded(url, 2 * 1024 * 1024)
+    if not raw:
+        return []
+    try:
+        soup = BeautifulSoup(raw, "xml")
         items_sel = soup.select("item") or soup.select("entry")
         items = []
-        for it in items_sel[:limit]:
-            # Title
-            title = (
-                (it.find("title") or {}).get_text(strip=True)
-                if it.find("title")
-                else ""
-            )
-            # Link
+        for it in items_sel[: max(1, min(int(limit), 15))]:
+            title_node = it.find("title")
+            title = title_node.get_text(strip=True) if title_node else ""
             link_tag = it.find("link")
-            if link_tag:
-                link = link_tag.get("href") or link_tag.get_text(strip=True)
-            else:
-                link = ""
-            # Summary / description
+            link = link_tag.get("href") or link_tag.get_text(strip=True) if link_tag else ""
             summary_tag = (
                 it.find("summary")
                 or it.find("description")
@@ -6563,13 +8066,9 @@ def rss_fetch(url: str, limit: int = 15) -> list[dict]:
                 or it.find("content:encoded")
             )
             raw_summary = summary_tag.get_text(strip=True) if summary_tag else ""
-            # Strip HTML from summary
-            summary_soup = BeautifulSoup(raw_summary, "html.parser")
-            summary = summary_soup.get_text(" ", strip=True)[:600]
-            # Published date
+            summary = BeautifulSoup(raw_summary, "html.parser").get_text(" ", strip=True)[:600]
             pub_tag = it.find("pubDate") or it.find("published") or it.find("updated")
             published = pub_tag.get_text(strip=True)[:25] if pub_tag else ""
-            # Image URL — try media:thumbnail, enclosure, og:image
             img_url = ""
             media = it.find("media:thumbnail") or it.find("media:content")
             if media:
@@ -6582,138 +8081,175 @@ def rss_fetch(url: str, limit: int = 15) -> list[dict]:
                 img_tag = BeautifulSoup(str(summary_tag), "html.parser").find("img")
                 if img_tag:
                     img_url = img_tag.get("src", "")
-
-            items.append(
-                {
-                    "title": title,
-                    "link": link,
-                    "summary": summary,
-                    "published": published,
-                    "img_url": img_url,
-                }
-            )
+            if link:
+                link = urllib.parse.urljoin(url, str(link).strip())[:2000]
+            items.append({
+                "title": title[:500],
+                "link": link,
+                "summary": summary,
+                "published": published,
+                "img_url": img_url,
+            })
         log.info("rss_fetch: %d items", len(items))
         return items
     except Exception as e:
-        log.error("rss_fetch: %s", e, exc_info=True)
+        log.error("rss_fetch: %s", type(e).__name__, exc_info=True)
         return []
 
 
 def rss_search_feeds(site_url: str) -> list[str]:
-    """Try to auto-discover RSS feed URLs from a website."""
+    """Discover a small bounded set of feeds from a public website."""
     log.info("rss_search_feeds: %s", site_url)
-    found = []
+    found: list[str] = []
+    raw = _rss_get_bounded(site_url, 512 * 1024)
+    if not raw:
+        return []
     try:
-        r = WEB.get(site_url, headers={"User-Agent": UA_DESK}, timeout=15)
-        soup = BeautifulSoup(r.content, "html.parser")
-        # Look for <link rel="alternate" type="application/rss+xml">
+        soup = BeautifulSoup(raw, "html.parser")
         for link in soup.find_all("link", rel="alternate"):
-            t = link.get("type", "")
-            if "rss" in t or "atom" in t:
-                href = link.get("href", "")
-                if href:
-                    if not href.startswith("http"):
-                        base = urllib.parse.urlparse(site_url)
-                        href = f"{base.scheme}://{base.netloc}{href}"
-                    found.append(href)
-        # Common feed paths
+            href = link.get("href", "")
+            if href and ("rss" in link.get("type", "").lower() or "atom" in link.get("type", "").lower()):
+                candidate = urllib.parse.urljoin(site_url, href)
+                if _is_public_http_url(candidate) and candidate not in found:
+                    found.append(candidate)
         if not found:
             base = site_url.rstrip("/")
-            for path in ["/feed", "/rss", "/feed.xml", "/atom.xml", "/rss.xml"]:
+            for path in ("/feed", "/rss", "/feed.xml", "/atom.xml", "/rss.xml"):
                 candidate = base + path
-                try:
-                    pr = WEB.head(candidate, timeout=8)
-                    ct = pr.headers.get("content-type", "")
-                    if pr.status_code == 200 and (
-                        "xml" in ct or "rss" in ct or "atom" in ct
-                    ):
-                        found.append(candidate)
-                except Exception:
-                    pass
+                if _is_public_http_url(candidate) and candidate not in found:
+                    found.append(candidate)
     except Exception as e:
-        log.error("rss_search_feeds: %s", e)
-    log.info("rss_search_feeds: found %d feeds", len(found))
+        log.error("rss_search_feeds: %s", type(e).__name__)
     return found[:5]
 
 
 def init_user(cid: int):
-    key = _pkey(cid)
-    if key not in user_stats:
-        user_stats[key] = {
-            "requests": 0,
-            "joined": datetime.now().strftime("%Y-%m-%d"),
-            "searches": 0,
-            "downloads": 0,
-            "translations": 0,
-            "ocr": 0,
-        }
+    stats = durable_store.init_user_stats(_platform(), cid)
+    with _stats_lock:
+        user_stats[_pkey(cid)] = stats
+
+
+def _log_history(cid: int, action: str, url: str = "", **details) -> None:
+    """Record bounded download/tool metadata; never store media bytes."""
+    payload = {"url": str(url or "")[:1000]}
+    for key, value in list(details.items())[:10]:
+        payload[str(key)[:40]] = str(value)[:200]
+    try:
+        durable_store.log_usage(_platform(), cid, str(action)[:80], payload)
+    except Exception as e:
+        log.debug("history log failed: %s", e)
 
 
 def bump(cid: int, key="requests"):
-    init_user(cid)
-    pkey = _pkey(cid)
-    with _stats_lock:
-        user_stats[pkey]["requests"] = user_stats[pkey].get("requests", 0) + 1
-        user_stats[pkey][key] = user_stats[pkey].get(key, 0) + 1
+    durable_store.bump_stat(_platform(), cid, key)
 
 
 def get_state(cid: int) -> dict:
-    with _state_lock:
-        return dict(
-            user_state.get(_pkey(cid), {})
-        )  # return a copy — safe to read outside lock
+    return durable_store.get_state(_platform(), cid)
 
 
 def set_state(cid: int, **kw):
-    with _state_lock:
-        user_state[_pkey(cid)] = kw
+    durable_store.set_state(_platform(), cid, **kw)
 
 
 def clear_state(cid: int):
-    with _state_lock:
-        user_state[_pkey(cid)] = {"mode": None}
+    durable_store.clear_state(_platform(), cid)
 
 
 # ══════��════════════════════════════════════════════════════════════════════════
 # STATIC TEXTS
 # ═══════════════════════════════════════════════════════════════════════════════
-HELP_TEXT = """❓ *راهنمای بله قربان*
+HELP_TEXT = """❓ راهنمای بله قربان
 
-🔎 *جستجو در وب* — نتایج قابل کلیک از DuckDuckGo با صفحه‌بندی
-🌐 *مشاهده سایت* — اسکرین‌شات ۱۹۲۰×۱۰۸۰ + دکمه‌های متن / HTML / ZIP / PDF
-📚 *مقاله علمی* — Google Scholar با صفحه‌بندی
-📖 *ویکی‌پدیا* — جستجو + خواندن مقاله کامل
-🎵 *موسیقی* — جستجو در YouTube Music + SoundCloud، لینک Spotify/SoundCloud هم کار می‌کند
-🟢 *Spotify* — دانلود ترک/آلبوم/پلی‌لیست با spotdl
-☁️ *SoundCloud* — دانلود ترک یا پلی‌لیست
-🖼 *دانلود عکس* — Bing / Pinterest / Pixabay / Wikimedia با دانلود بیشتر
-🐙 *GitHub* — جستجوی مخازن / ZIP / دانلود Release
-✈️ *کانال تلگرام* — پیام‌های کانال عمومی یا با MTProto
-🐦 *توییتر/X* — تایم‌لاین کاربر + دانلود ویدیو/عکس خودکار
-📸 *اینستاگرام* — پست‌های پروفایل + دانلود ریل/عکس خودکار
-🎵 *تیک‌تاک* — لیست ویدیوها + دانلود (لینک مستقیم هم کار می‌کند)
-📰 *اخبار RSS* — دریافت فید + کشف خودکار فید سایت
-📚 *دانلود کتاب و مقاله* — Library Genesis & Open Library (PDF، EPUB، MOBI، FB2)
-📱 *دانلود APK* — جستجوی Google Play + دانلود APK (APKPure / APKMirror / F-Droid)
-🌐 *ترجمه* — ۶ زبان، متن طولانی
-🖼 *OCR* — استخراج متن از عکس + PDF
-🌐 *IP/دامنه* — اطلاعات موقعیت و اپراتور
+از کجا شروع کنم؟
+• برای جستجو یا دانلود، ابزار مربوط را انتخاب کنید و سپس متن یا لینک را بفرستید.
+• برای کار با فایل، اول ابزار را انتخاب کنید؛ بعد فایل را ارسال کنید.
+• اگر ابزار دیگری فعال است، با «منوی اصلی» از آن خارج شوید.
 
-💡 *لینک مستقیم* ارسال کنید — ربات خودکار تشخیص می‌دهد:
-یوتیوب / تیک‌تاک / توییتر / اینستاگرام / تلگرام → دانلود
-سایر لینک‌ها → اسکرین‌شات + گزینه‌های بیشتر"""
+موضوع موردنظر را انتخاب کنید؛ هر بخش مثال و دکمهٔ شروع دارد."""
+
+HELP_TOPICS = {
+    "search": ("🔎 جستجو و خواندن", """🔎 جستجو و خواندن
+
+وب: موضوع را بنویسید؛ مثلاً «آموزش پایتون فارسی». روی نتیجه بزنید تا گزینه‌های مشاهدهٔ سایت و متن صفحه را ببینید.
+سایت: لینک کامل مثل https://example.com را بفرستید؛ پس از دریافت تصویر، گزینه‌های دیگر را انتخاب کنید.
+کتاب و مقاله: عنوان، نام نویسنده یا کلیدواژه را وارد کنید؛ مثلاً «یادگیری ماشین».
+اخبار: لینک سایت یا فید را در بخش اخبار وارد کنید.
+
+برای جابه‌جایی میان نتایج از دکمه‌های قبلی، بعدی و برگشت استفاده کنید.""",
+               [("🔎 جستجوی وب", "mode_search"), ("🌐 مشاهده سایت", "mode_open"), ("📚 کتاب و مقاله", "mode_book"), ("📰 اخبار", "mode_rss")]),
+    "download": ("📥 دانلود و موسیقی", """📥 دانلود و موسیقی
+
+شبکه‌های اجتماعی: سرویس را انتخاب کنید و لینک پست یا ویدیو را بفرستید، نه لینک نتیجهٔ جستجو.
+موسیقی: نام آهنگ و خواننده را بنویسید یا لینک پشتیبانی‌شده را طبق پیام ابزار ارسال کنید.
+فیلم، برنامهٔ اندروید و گیت‌هاب از بخش «دانلود و شبکه‌ها» در دسترس‌اند.
+
+محتوای عمومی معمولاً قابل دریافت است؛ محتوای خصوصی، حذف‌شده یا محدودشده ممکن است دریافت نشود. فایل‌های بزرگ ممکن است چندبخشی ارسال شوند؛ پیام نهایی را بررسی کنید.""",
+                 [("📱 شبکه‌های اجتماعی", "mode_social"), ("🎵 موسیقی", "mode_music"), ("📥 سایر دانلودها", "nav_download")]),
+    "files": ("🧰 فایل و متن", """🧰 فایل و متن
+
+۱. ابزار را انتخاب کنید.
+۲. فایل یا متن خواسته‌شده را بفرستید.
+۳. اگر ابزار اطلاعات بیشتری خواست، مطابق نمونهٔ همان پیام پاسخ دهید.
+
+• متن از عکس: عکس واضح با نوشتهٔ خوانا بفرستید.
+• صفحات PDF: فایل PDF و سپس شمارهٔ صفحات درخواستی را ارسال کنید.
+• ادغام PDF: فایل‌ها را به ترتیب دلخواه بفرستید و طبق پیام ابزار پایان دهید.
+• برش ویدیو: ویدیو و بازهٔ زمانی را طبق نمونهٔ ابزار بفرستید.
+• تبدیل قالب: عکس JPG/PNG/WebP به عکس یا PDF؛ صدا به MP3/M4A/OGG/Opus؛ ویدیو به MP4/WebM یا استخراج MP3. دکمهٔ تبدیل زیر فایل یا پاسخ /convert را بزنید. سقف ورودی ۲۰ مگابایت، مدت ۳ دقیقه و دکمه‌ها ۳۰ دقیقه اعتبار دارند.
+• ترجمه: ابتدا زبان را انتخاب کنید و بعد متن را ارسال کنید.
+
+اگر فایل را پیش از انتخاب ابزار فرستاده‌اید، پس از انتخاب ابزار دوباره آن را بفرستید.""",
+              [("🧰 همهٔ ابزارها", "mode_tools"), ("🖼 متن از عکس", "mode_ocr"), ("🌐 ترجمه", "mode_translate")]),
+    "library": ("⭐ ذخیره‌ها و اشتراک‌ها", """⭐ ذخیره‌ها و اشتراک‌ها
+
+کتابخانه: از دکمهٔ ذخیره، هرجا نمایش داده شد، برای نگه‌داشتن لینک استفاده کنید. ذخیرهٔ لینک به معنی نگه‌داری دائمی فایل نیست.
+تاریخچه: درخواست‌های اخیر و گزینهٔ تلاش دوباره را ببینید؛ دسترسی به منبع ممکن است تغییر کرده باشد.
+اخبار: برای دریافت خبرهای تازه، فید را مشترک شوید. برای لغو، «اشتراک‌های من» را باز کنید، فید را انتخاب و لغو را تأیید کنید.
+
+جزئیات نگه‌داری اطلاعات در بخش حریم خصوصی آمده است.""",
+                [("⭐ کتابخانه و تاریخچه", "library"), ("🔔 اشتراک‌های من", "rss_subscriptions"), ("🔒 حریم خصوصی", "privacy")]),
+    "problems": ("🛠 رفع مشکل", """🛠 اگر درخواست انجام نشد
+
+• دکمه منقضی شده: ابزار را دوباره باز کنید و جستجو یا لینک را مجدداً بفرستید؛ این پیام لزوماً به معنی حذف ذخیره‌های شما نیست.
+• لینک دریافت نشد: بررسی کنید لینک کامل، عمومی و همچنان قابل بازشدن باشد؛ سپس دوباره تلاش کنید.
+• فایل پردازش نشد: نوع فایل و اطلاعات درخواستی ابزار را بررسی کنید؛ تصویر واضح‌تر یا فایل کوچک‌تر هم ممکن است کمک کند.
+• ارسال چندبخشی متوقف شد: فایل کامل تحویل نشده است؛ پیام نهایی را بخوانید و دوباره تلاش کنید.
+• محدودیت استفاده: بخش آمار کاربری را ببینید.
+• ابزار اشتباه پاسخ می‌دهد: به منوی اصلی برگردید و ابزار درست را انتخاب کنید.
+
+هنگام پردازش کمی صبر کنید؛ ارسال چندبارهٔ یک درخواست کمکی نمی‌کند. «انصراف» از مرحلهٔ ورودی خارج می‌شود و تضمین توقف کاری که شروع شده نیست.""",
+                 [("📊 آمار کاربری", "stats"), ("⭐ تاریخچه و تلاش دوباره", "library_history")]),
+}
+
+
+def show_help(cid, topic=None):
+    clear_state(cid)
+    page = HELP_TOPICS.get(topic)
+    if page:
+        _, text, actions = page
+        items = actions + [("🔙 موضوع‌های راهنما", "help"), ("🏠 منوی اصلی", "home")]
+    else:
+        text = HELP_TEXT
+        items = [(label, "help_" + key) for key, (label, _, _) in HELP_TOPICS.items()]
+        items.append(("🏠 منوی اصلی", "home"))
+    send_message(cid, text, reply_markup={"inline_keyboard": [
+        [{"text": label, "callback_data": callback}] for label, callback in items
+    ]})
 
 PRIVACY_TEXT = """🔒 *حریم خصوصی بله قربان*
 
-این ربات هیچ پیام، جستجو یا فایلی از شما را *ذخیره نمی‌کند*.
+این ربات فایل یا محتوای کامل پیام‌های شما را به‌صورت دائمی ذخیره نمی‌کند.
 
-📌 *چه چیزی پردازش می‌شود؟*
-• پیام‌های شما فقط برای اجرای همان درخواست استفاده می‌شوند.
-• نتایج جستجو به‌صورت موقت در حافظه نگه داشته می‌شوند تا دکمه‌ها کار کنند؛ پس از مدتی پاک می‌شوند.
-• هیچ پایگاه‌داده‌ای نداریم.
+📌 *چه چیزی نگه‌داری می‌شود؟*
+• پیام‌ها و فایل‌ها فقط برای اجرای همان درخواست پردازش می‌شوند.
+• نتایج و لینک‌های موقت برای کارکرد دکمه‌ها در حافظه نگه‌داری می‌شوند و با راه‌اندازی مجدد پاک می‌شوند.
+• آمار استفاده، تاریخچهٔ کوتاه، لینک‌های ذخیره‌شده در «کتابخانه من» و تنظیمات اشتراک RSS فقط به‌صورت فراداده در پایگاه‌دادهٔ محلی نگه‌داری می‌شوند.
+• محتوای پیام‌ها، متن فایل‌ها و فایل‌های رسانه‌ای در پایگاه‌داده ذخیره نمی‌شوند؛ فایل‌های موقت پس از پردازش پاک می‌شوند.
+• تاریخچه و کتابخانه سقف مشخص دارند و فقط اطلاعات لازم برای تلاش دوباره و مدیریت موارد ذخیره‌شده نگه‌داری می‌شوند.
 
 🌐 *سرویس‌های خارجی*
-ربات برای انجام کارها به سرویس‌هایی مثل DuckDuckGo، Wikipedia، YouTube، GitHub و ... درخواست می‌فرستد. این سرویس‌ها سیاست حریم خصوصی خودشان را دارند.
+ربات برای انجام کارها به سرویس‌هایی مثل DuckDuckGo، Wikipedia، YouTube، GitHub و سرویس ترجمه درخواست می‌فرستد. این سرویس‌ها سیاست حریم خصوصی خودشان را دارند.
 
 🛡 *امنیت*
 • ربات روی سرور اختصاصی اجرا می‌شود.
@@ -6723,20 +8259,333 @@ PRIVACY_TEXT = """🔒 *حریم خصوصی بله قربان*
 با مدیر ربات در تماس باشید."""
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# USER LIBRARY / HISTORY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _library_list(cid: int, watchlist_only: bool = False, page: int = 0) -> None:
+    page_size = 5
+    items = durable_store.list_library_items(
+        _platform(), cid, limit=page_size + 1, watchlist_only=watchlist_only,
+        offset=page * page_size,
+    )
+    has_next = len(items) > page_size
+    items = items[:page_size]
+    if not items:
+        label = "فهرست تماشا" if watchlist_only else "کتابخانه"
+        send_message(cid, f"📭 {label} هنوز خالی است.", reply_markup=library_kb())
+        return
+    title = "👀 فهرست تماشا" if watchlist_only else "⭐️ کتابخانه من"
+    send_message(cid, f"{title} — فقط اطلاعات لینک ذخیره می‌شود:",
+                 reply_markup=_library_items_kb(
+                     items, page=page, has_next=has_next, watchlist_only=watchlist_only
+                 ))
+
+
+def _history_label(entry):
+    names = {"pdf_extract": "جداکردن صفحات PDF", "pdf_merge": "ادغام PDF", "video_trim": "برش ویدیو",
+             "video_compress": "فشرده‌سازی ویدیو", "image_compress": "فشرده‌سازی عکس", "rss_digest": "خلاصه اخبار",
+             "downloads": "دانلود", "searches": "جستجو", "translations": "ترجمه", "ocr": "متن از عکس", "requests": "درخواست"}
+    action = names.get(str(entry.get("action")), "عملیات")
+    details = entry.get("details") or {}
+    title = details.get("title") or details.get("file_name") or urllib.parse.urlparse(str(details.get("url") or "")).netloc
+    stamp = entry.get("created_at") or ""
+    if isinstance(stamp, (int, float)):
+        stamp = datetime.fromtimestamp(stamp).strftime("%m/%d %H:%M")
+    return f"{action} — {str(title).replace(chr(10), ' ')[:36]} {str(stamp)[:16]}".strip(" —")
+
+
+def _library_history(cid: int, page: int = 0) -> None:
+    page_size = 5
+    entries = durable_store.get_usage_history(
+        _platform(), cid, limit=page_size + 1, offset=page * page_size
+    )
+    if not entries:
+        if page > 0:
+            send_message(cid, "📄 صفحهٔ دیگری در تاریخچه وجود ندارد.", reply_markup=library_kb())
+        else:
+            send_message(cid, "📭 تاریخچه‌ای ثبت نشده است.", reply_markup=library_kb())
+        return
+    has_next = len(entries) > page_size
+    entries = entries[:page_size]
+    rows = []
+    for entry in entries:
+        action = _history_label(entry)
+        rows.append([{"text": f"🕘 {action}", "callback_data": f"hist_item_{int(entry['id'])}"}])
+    nav = []
+    if page > 0:
+        nav.append({"text": "◀️ قبلی", "callback_data": f"hist_page_{page - 1}"})
+    if has_next:
+        nav.append({"text": "بعدی ▶️", "callback_data": f"hist_page_{page + 1}"})
+    if nav:
+        rows.append(nav)
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+    send_message(
+        cid, "🕘 آخرین عملیات‌ها — برای تلاش دوباره انتخاب کنید:",
+        reply_markup={"inline_keyboard": rows},
+    )
+
+
+def _library_item(cid: int, item_id: int) -> None:
+    item = durable_store.get_library_item(_platform(), cid, item_id)
+    if not item:
+        _status(cid, "❌ این مورد دیگر در کتابخانه نیست.", final=True)
+        return
+    text = f"📌 {item.get('title') or 'مورد ذخیره‌شده'}"
+    if item.get("details", {}).get("platform"):
+        text += f"\nمنبع: {item['details']['platform']}"
+    rows = [
+        [
+            {"text": "📥 تلاش دوباره", "callback_data": f"lib_retry_{int(item['id'])}"},
+            {"text": "👀 فهرست تماشا", "callback_data": f"lib_watch_{int(item['id'])}"},
+        ]
+    ]
+    if item.get("url"):
+        rows.insert(0, [{"text": "🔗 باز کردن لینک", "url": item["url"]}])
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+    send_message(cid, text, reply_markup={"inline_keyboard": rows})
+
+
+def _history_item(cid: int, entry_id: int) -> None:
+    entry = durable_store.get_usage_entry(_platform(), cid, entry_id)
+    if not entry:
+        _status(cid, "❌ این تاریخچه منقضی شده است.", final=True)
+        return
+    details = entry.get("details") or {}
+    url = str(details.get("url") or "")
+    if not url.startswith("http"):
+        send_message(cid, f"🕘 {_history_label(entry)}", reply_markup=library_kb())
+        return
+    rows = [
+        [{"text": "📥 تلاش دوباره", "callback_data": f"hist_retry_{int(entry['id'])}"}],
+        [{"text": "🏠 منوی اصلی", "callback_data": "home"}],
+    ]
+    send_message(cid, "🔁 می‌خواهید همین لینک را دوباره امتحان کنید؟",
+                 reply_markup={"inline_keyboard": rows})
+
+
+def _retry_url(cid: int, url: str) -> None:
+    if not url.startswith("http"):
+        _status(cid, "❌ لینک قبلی معتبر نیست.", final=True)
+        return
+    set_state(cid, mode=None)
+    # Reuse the existing smart URL router without inventing a second download path.
+    handle_message({"chat": {"id": cid}, "text": url})
+
+
+def _save_library_url(cid: int, platform: str, url_key: str) -> None:
+    url = get_url_for_chat(url_key, cid)
+    if not url:
+        _status(cid, "❔ لینک منقضی شده است.", final=True)
+        return
+    durable_store.add_library_item(
+        _platform(), cid, title=f"{platform} — {url[:80]}", url=url,
+        kind="saved", details={"platform": platform},
+    )
+    _status(cid, "✅ در کتابخانه ذخیره شد (فقط لینک، بدون فایل).", final=True)
+
+
+def _rss_subscriptions(cid: int, page: int = 0) -> None:
+    page_size = 5
+    subs = durable_store.get_subscriptions(
+        _platform(), cid, limit=page_size + 1, offset=page * page_size
+    )
+    has_next = len(subs) > page_size
+    subs = subs[:page_size]
+    if not subs:
+        send_message(cid, "📭 هنوز هیچ فیدی را دنبال نمی‌کنید.", reply_markup=rss_menu_kb())
+        return
+    rows = []
+    for sub in subs:
+        url = str(sub.get("topic") or "")
+        label = url.replace("https://", "")[:46]
+        url_key = store_url(url, chat_id=cid)
+        rows.append([{"text": f"🔔 {label}", "callback_data": f"rss_unsub_{url_key}"}])
+    nav = []
+    if page > 0:
+        nav.append({"text": "◀️ قبلی", "callback_data": f"rss_subs_page_{page - 1}"})
+    if has_next:
+        nav.append({"text": "بعدی ▶️", "callback_data": f"rss_subs_page_{page + 1}"})
+    if nav:
+        rows.append(nav)
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+    send_message(cid, "🔔 اشتراک‌های RSS شما:", reply_markup={"inline_keyboard": rows})
+
+
+def _rss_subscribe(cid: int, url: str) -> None:
+    url = url.strip()
+    if not url.startswith("http"):
+        _status(cid, "❌ آدرس فید باید با http:// یا https:// شروع شود.", final=True)
+        return
+    if not any(token in url.lower() for token in ("rss", "feed", "atom", "xml")):
+        feeds = rss_search_feeds(url)
+        if feeds:
+            url = feeds[0]
+    items = rss_fetch(url, limit=3)
+    if not items:
+        _status(cid, "❌ فید معتبر پیدا نشد؛ آدرس RSS را بررسی کنید.", final=True)
+        return
+    try:
+        durable_store.subscribe(
+            _platform(), cid, url,
+            {"interval_seconds": 900, "next_check_at": int(time.time()) + 900, "seen": []},
+        )
+    except ValueError as e:
+        if str(e) == "RSS_MAX_SUBS_PER_USER":
+            _status(cid, "⚠️ حداکثر ۱۰ فید برای هر کاربر فعال است.", final=True)
+        elif str(e) == "RSS_MAX_SUBS_TOTAL":
+            _status(cid, "⚠️ ظرفیت اشتراک فعلاً تکمیل است؛ کمی بعد دوباره امتحان کنید.", final=True)
+        else:
+            log.warning("RSS subscribe failed: %s", e)
+            _status(cid, "❌ ثبت اشتراک انجام نشد؛ دوباره تلاش کنید.", final=True)
+        return
+    _status(cid, "✅ اشتراک فید ثبت شد؛ خبرهای جدید در خلاصه‌های بعدی ارسال می‌شوند.", final=True)
+
+
+def _rss_digest_text(items: list[dict]) -> str:
+    lines = ["📰 خلاصه اخبار جدید"]
+    for item in items[:5]:
+        title = str(item.get("title") or "خبر بدون عنوان").replace("\n", " ").strip()
+        line = f"• {title[:180]}"
+        link = str(item.get("link") or "").strip()
+        if link:
+            line += f"\n  {link[:500]}"
+        lines.append(line)
+    return "\n".join(lines)[:3900]
+
+
+def _rss_item_key(item: dict) -> str:
+    link = str(item.get("link") or "").strip()
+    if link:
+        return link[:300]
+    return f"{item.get('title', '')}|{item.get('published', '')}"[:300]
+
+
+def _rss_interval(config: dict) -> int:
+    try:
+        return max(300, min(int(config.get("interval_seconds", 900)), 86400))
+    except (TypeError, ValueError):
+        return 900
+
+
+def _process_rss_once(now: Optional[int] = None) -> int:
+    """Process due RSS feeds once, sequentially, without media or a queue."""
+    now = int(time.time() if now is None else now)
+    delivered = 0
+    topic_items = {}
+    for subscription in durable_store.get_due_subscriptions(now=now, limit=20):
+        platform = str(subscription.get("platform") or "")
+        try:
+            cid = int(subscription.get("chat_id"))
+        except (TypeError, ValueError):
+            continue
+        topic = str(subscription.get("topic") or "").strip()
+        config = dict(subscription.get("config") or {})
+        seen = [str(x)[:300] for x in (config.get("seen") or []) if x][-30:]
+        seen_set = set(seen)
+        next_check = now + _rss_interval(config)
+        if platform not in ("bale", "telegram") or not topic:
+            continue
+        claimed = False
+        try:
+            if topic not in topic_items:
+                topic_items[topic] = rss_fetch(topic, limit=10)[:10]
+            items = topic_items[topic]
+            fresh = [item for item in items if _rss_item_key(item) not in seen_set]
+            if not fresh:
+                config["next_check_at"] = next_check
+                durable_store.update_subscription_config(platform, cid, topic, config)
+                continue
+            if not durable_store.claim_subscription_delivery(platform, cid, now):
+                config["next_check_at"] = next_check
+                durable_store.update_subscription_config(platform, cid, topic, config)
+                continue
+            claimed = True
+            _set_platform_ctx(platform)
+            _ctx.chat_id = cid
+            response = send_message(cid, _rss_digest_text(fresh), reply_markup=home_kb())
+            if not (response or {}).get("ok"):
+                durable_store.release_subscription_delivery(platform, cid, now)
+                claimed = False
+                config["next_check_at"] = next_check
+                durable_store.update_subscription_config(platform, cid, topic, config)
+                continue
+            config["seen"] = (seen + [_rss_item_key(item) for item in fresh])[-30:]
+            config["next_check_at"] = next_check
+            durable_store.update_subscription_config(platform, cid, topic, config)
+            _log_history(
+                cid, "rss_digest", topic, items=len(fresh)
+            )
+            delivered += 1
+        except Exception as e:
+            log.warning("RSS digest failed for %s: %s", topic, e)
+            if claimed:
+                try:
+                    durable_store.release_subscription_delivery(platform, cid, now)
+                except Exception:
+                    log.warning("RSS quota release failed for %s", topic, exc_info=True)
+            try:
+                config["next_check_at"] = next_check
+                durable_store.update_subscription_config(platform, cid, topic, config)
+            except Exception:
+                log.warning("RSS next-check update failed for %s", topic, exc_info=True)
+    return delivered
+
+
+_RSS_POLL_SECONDS = max(300, int(os.getenv("RSS_POLL_SECONDS", "900")))
+_rss_stop = threading.Event()
+_rss_thread: Optional[threading.Thread] = None
+
+
+def _rss_scheduler_loop() -> None:
+    while not _rss_stop.is_set():
+        try:
+            _process_rss_once()
+            durable_store.cleanup_expired()
+        except Exception:
+            log.error("RSS scheduler pass failed", exc_info=True)
+        _rss_stop.wait(_RSS_POLL_SECONDS)
+
+
+def _start_rss_scheduler() -> Optional[threading.Thread]:
+    global _rss_thread
+    if _rss_thread is not None and _rss_thread.is_alive():
+        return _rss_thread
+    _rss_stop.clear()
+    _rss_thread = threading.Thread(
+        target=_rss_scheduler_loop, name="rss-scheduler", daemon=True
+    )
+    _rss_thread.start()
+    return _rss_thread
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # URL KEY CACHE  (for site-view button callbacks)
 # ═══════════════════════════════════════════════════════════════════════════════
 url_cache: dict[str, str] = {}  # short_key → full_url
+url_owners: dict[str, tuple[str, int]] = {}  # short_key → (platform, chat_id)
+URL_CACHE_MAX = 2000
+
+
+def _prune_url_cache() -> None:
+    """Bound callback URL memory; caller holds ``_url_lock``."""
+    while len(url_cache) > URL_CACHE_MAX:
+        key = next(iter(url_cache), None)
+        if key is None:
+            break
+        url_cache.pop(key, None)
+        url_owners.pop(key, None)
 
 
 def store_url(url: str, chat_id: int = None) -> str:
-    """Store URL in cache with optional chat_id for callback retrieval."""
-    key = hashlib.md5(url.encode()).hexdigest()[:10]
+    """Store URL in cache with the creating platform+chat owner."""
+    if chat_id is None:
+        chat_id = getattr(_ctx, "chat_id", None)
+    key = secrets.token_hex(6)
     with _url_lock:
-        # Store URL
         url_cache[key] = url
-        # Optionally store chat_id for callback context
         if chat_id is not None:
-            url_cache[f"{key}_chat"] = chat_id
+            url_owners[key] = (_platform(), int(chat_id))
+        _prune_url_cache()
     return key
 
 
@@ -6748,18 +8597,44 @@ def get_url(key: str) -> Optional[str]:
 def get_url_chat(key: str) -> Optional[int]:
     """Get stored chat_id for a URL key."""
     with _url_lock:
-        return url_cache.get(f"{key}_chat")
+        owner = url_owners.get(key)
+        return owner[1] if owner else None
+
+
+def get_url_for_chat(key: str, chat_id: int) -> Optional[str]:
+    """Resolve a callback URL only for the creating platform+chat."""
+    with _url_lock:
+        if url_owners.get(key) != (_platform(), int(chat_id)):
+            return None
+        return url_cache.get(key)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DO_ HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════════
+def _cache_search(cid, kind, query, page, results):
+    key = make_cache_key(kind, f"{_platform()}:{cid}:{query}", page)
+    cache_set_owned(key, [{"kind": kind, "query": query, "page": page, "results": results,
+                           "expires_at": time.time() + durable_store.CACHE_TTL}], _platform(), cid)
+    return key
+
+
+def _search_source(cid, key):
+    source = cache_get_owned(key, _platform(), cid)
+    return source[0] if source and source[0].get("expires_at", 0) > time.time() else None
+
+
+def _show_search_source(cid, source, key):
+    results, page, kind = source["results"], source["page"], source["kind"]
+    send_message(cid, f"🔎 نتایج: {source['query']} — صفحه {page + 1}",
+                 reply_markup=search_results_kb(results, key, page, len(results) >= (10 if kind == "ws" else 8), kind))
+
+
 def do_search(cid: int, query: str, page=0):
     bump(cid, "searches")
     chat_action(cid)
     results = web_search(query, 10, page)
-    key = make_cache_key("ws", query, page)
-    cache_set(key, results)
+    key = _cache_search(cid, "ws", query, page, results)
     set_state(cid, mode="search", last_query=query, page=page, cache_key=key)
     if not results:
         _status(cid, "❌ نتیجه‌ای یافت نشد.", reply_markup=home_kb(), final=True)
@@ -6773,8 +8648,7 @@ def do_scholar(cid: int, query: str, page=0):
     bump(cid, "searches")
     chat_action(cid)
     results = scholar_search(query, page)
-    key = make_cache_key("sc", query, page)
-    cache_set(key, results)
+    key = _cache_search(cid, "sc", query, page, results)
     set_state(cid, mode="scholar", last_query=query, page=page, cache_key=key)
     if not results:
         _status(cid, "❌ مقاله‌ای یافت نشد.", reply_markup=home_kb(), final=True)
@@ -6823,8 +8697,7 @@ def unified_search(cid: int, query: str, page=0):
         combined_results = scholar_results + book_results
 
         # Cache and send results
-        key = make_cache_key("uni", clean_query, page)
-        cache_set(key, combined_results)
+        key = _cache_search(cid, "uni", clean_query, page, combined_results)
 
         if not combined_results:
             _status(cid, "❌ نتیجه‌ای یافت نشد.", reply_markup=home_kb(), final=True)
@@ -6884,6 +8757,7 @@ def _is_youtube(url: str) -> bool:
             "youtube.com/shorts/",
             "youtube.com/live/",
             "m.youtube.com",
+            "music.youtube.com",
         ]
     )
 
@@ -6892,7 +8766,7 @@ def do_open_url(cid: int, url: str):
     bump(cid, "downloads")
     if not url.startswith("http"):
         url = "https://" + url
-    url_key = store_url(url)
+    url_key = store_url(url, chat_id=cid)
     _status(cid, f"⏳ در حال گرفتن اسکرین‌شات از:\n{url}")
     chat_action(cid, "upload_photo")
     ss = screenshot_page(url)
@@ -6902,11 +8776,80 @@ def do_open_url(cid: int, url: str):
             cid, ss, caption=f"🌐 {short_url}", reply_markup=site_view_kb(url_key)
         )
     else:
-        send_message(
+        _status(
             cid,
             "⚠️ اسکرین‌شات ممکن نبود. از دکمه‌های زیر استفاده کنید:",
             reply_markup=site_view_kb(url_key),
+            final=True,
         )
+    clear_state(cid)
+
+
+# Extensions treated as "direct file link" → offer download instead of screenshot
+_DIRECT_FILE_EXTS = {
+    "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "pdf", "doc", "docx", "xls",
+    "xlsx", "ppt", "pptx", "odt", "mp3", "m4a", "wav", "flac", "ogg", "opus",
+    "mp4", "mkv", "avi", "mov", "webm", "apk", "exe", "msi", "iso", "dmg",
+    "deb", "rpm", "appimage", "jar", "txt", "csv", "json", "xml", "yaml", "yml",
+    "jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "psd", "epub", "mobi",
+    "srt", "sub", "ttf", "otf", "woff", "woff2", "ipynb", "py", "js", "ts",
+}
+
+
+def _is_direct_file_url(url: str) -> bool:
+    path = urllib.parse.urlparse(url).path
+    name = path.rstrip("/").split("/")[-1]
+    if "." not in name:
+        return False
+    ext = name.rsplit(".", 1)[-1].lower()
+    return ext in _DIRECT_FILE_EXTS
+
+
+def do_file_link(cid: int, url: str):
+    """Direct file link → offer download-and-send or page screenshot."""
+    url_key = store_url(url, chat_id=cid)
+    kb = {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "📥 دانلود و ارسال فایل",
+                    "callback_data": f"dfile_dl_{url_key}",
+                },
+                {
+                    "text": "🌐 اسکرین‌شات صفحه",
+                    "callback_data": f"dfile_shot_{url_key}",
+                },
+            ],
+            [{"text": "🏠 منوی اصلی", "callback_data": "home"}],
+        ]
+    }
+    send_message(
+        cid,
+        f"📎 لینک فایل شناسایی شد:\n{url[:200]}\n\nچه کاری انجام دهم؟",
+        reply_markup=kb,
+    )
+
+
+def do_direct_file_download(cid: int, url: str):
+    """Download a direct file link and upload it to the user's chat."""
+    bump(cid, "downloads")
+    _status(cid, "⏳ در حال دانلود فایل…")
+    chat_action(cid, "upload_document")
+    data = download_bytes(url, 500 * 1024 * 1024)
+    if not data:
+        _status(
+            cid,
+            "❌ دانلود ناموفق. ممکن است فایل حجیم یا لینک محافظت‌شده باشد.",
+            reply_markup=home_kb(), final=True,
+        )
+        return
+    fname = urllib.parse.unquote(
+        urllib.parse.urlparse(url).path.rstrip("/").split("/")[-1]
+    ) or "file"
+    if smart_send(cid, data, fname, caption=f"📥 {url[:60]}"):
+        _status(cid, "✅ فایل ارسال شد.", reply_markup=home_kb(), final=True)
+    else:
+        _status(cid, "❌ ارسال ناموفق.", reply_markup=home_kb(), final=True)
     clear_state(cid)
 
 
@@ -6925,18 +8868,96 @@ def do_youtube_search_cmd(cid: int, query: str, page=0):
     send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
 
 
+@_heavy_download
+def do_youtube_clip(cid: int, text: str):
+    match = re.match(r"(https?://\S+)\s+(\S+)\s*-\s*(\S+)$", text.strip())
+    if not match or not _is_youtube(match.group(1)):
+        _status(cid, "❌ قالب درست نیست. نمونه: لینک 01:20-03:45", reply_markup=home_kb(), final=True)
+        return
+    clip = _clip_range(match.group(2), match.group(3))
+    if not clip:
+        _status(cid, "❌ بازه معتبر نیست یا بیشتر از ۳۰ دقیقه است.", reply_markup=home_kb(), final=True)
+        return
+    _status(cid, "⏳ در حال دریافت بخش انتخاب‌شده…")
+    chat_action(cid, "upload_video")
+    _finish_video(cid, youtube_download(match.group(1), clip=clip))
+
+
+def _playlist_quality_kb(key: str) -> dict:
+    return {"inline_keyboard": [
+        [{"text": "📹 360p", "callback_data": f"yt_plq_{key}_360"},
+         {"text": "📹 480p", "callback_data": f"yt_plq_{key}_480"},
+         {"text": "📹 720p", "callback_data": f"yt_plq_{key}_720"}],
+        [{"text": "🎵 فقط صدا MP3", "callback_data": f"yt_plq_{key}_a"}],
+        [{"text": "❌ لغو", "callback_data": "home"}],
+    ]}
+
+
+def _playlist_subtitle_kb(key: str, audio_only: bool) -> dict:
+    kind = "a" if audio_only else "v"
+    return {"inline_keyboard": [
+        [{"text": "🇮🇷 فارسی", "callback_data": f"yt_pls_{key}_{kind}_fa"},
+         {"text": "🇬🇧 English", "callback_data": f"yt_pls_{key}_{kind}_en"}],
+        [{"text": "⏭ بدون زیرنویس", "callback_data": f"yt_pls_{key}_{kind}_none"}],
+        [{"text": "❌ لغو", "callback_data": "home"}],
+    ]}
+
+
+def do_youtube_playlist(cid: int, url: str):
+    """List at most ten videos, then collect one shared batch preference."""
+    _status(cid, "⏳ در حال خواندن فهرست پخش…")
+    items = youtube_playlist_items(url)
+    if not items:
+        _status(cid, "❌ فهرست پخش یافت نشد یا در دسترس نیست.", reply_markup=home_kb(), final=True)
+        return
+    key = make_cache_key("ytpl", url, 0)
+    cache_set(key, items)
+    send_message(
+        cid,
+        f"📃 فهرست پخش — {len(items)} ویدیوی اول\nیک کیفیت برای همه ویدیوها انتخاب کنید:",
+        reply_markup=_playlist_quality_kb(key),
+    )
+
+
+def _playlist_download_one(cid: int, item: dict, max_height: int, audio_only: bool, sub_code: str) -> bool:
+    result = youtube_download(item["url"], audio_only=audio_only, sub_code=sub_code, max_height=max_height)
+    if not result:
+        return False
+    data, fname = result
+    return bool(smart_send(cid, data, Path(fname).name, caption=item.get("title", "")[:200], media_type="audio" if audio_only else "video"))
+
+
+@_heavy_download
+def _run_youtube_playlist(cid: int, items: list[dict], max_height: int, audio_only: bool, sub_code: str):
+    """Sequential batch runner; quota is claimed per item immediately before work."""
+    sent = 0
+    platform = _platform()
+    for index, item in enumerate(items, 1):
+        if not durable_store.claim_download(platform, cid):
+            _status(cid, f"⚠️ سهمیه دانلود روزانه پایان یافت. {sent} از {len(items)} ارسال شد.", reply_markup=home_kb(), final=True)
+            return
+        _status(cid, f"⏳ ویدیوی {index}/{len(items)}: در حال دانلود…")
+        if _playlist_download_one(cid, item, max_height, audio_only, sub_code):
+            sent += 1
+    _status(cid, f"✅ فهرست پخش کامل شد. {sent}/{len(items)} ارسال شد.", reply_markup=home_kb(), final=True)
+
+
 def do_youtube_dl(cid: int, url: str):
     """Entry point for direct YouTube URL download — shows quality picker."""
-    bump(cid, "downloads")
     if not ("youtu.be" in url or "youtube.com" in url):
         _status(cid, "❌ لینک یوتیوب معتبر وارد کنید.", reply_markup=home_kb(), final=True)
         return
+    if _is_youtube_playlist(url):
+        do_youtube_playlist(cid, url)
+        return
+    bump(cid, "downloads")
     _youtube_quality_picker(cid, url)
 
 
+@_heavy_download
 def _youtube_quality_picker(cid: int, url: str, audio_only: bool = False):
     """Probe available formats and show quality selection keyboard to user.
-    
+
     First sends thumbnail + description, then quality selector with filesize info.
     """
     _status(cid, "⏳ در حال بررسی کیفیت‌های موجود…")
@@ -6952,7 +8973,7 @@ def _youtube_quality_picker(cid: int, url: str, audio_only: bool = False):
 
     # Cache info so callback can retrieve it.
     # info_key = "yti" + url_key (no underscores between fields in callback_data)
-    url_key = store_url(url)
+    url_key = store_url(url, chat_id=cid)
     info_key = "yti" + url_key  # e.g. "ytibdc4d2d4ad" — no internal _
     cache_set(info_key, [info])  # wrapped in list so cache_get works
 
@@ -7151,10 +9172,8 @@ def _youtube_execute_download(
     sub_code: str,
 ):
     """Final step: perform the actual download and send to user."""
-    url = get_url(url_key) or ""
-    # Try to get chat_id from cache, fallback to callback cid
-    cached_cid = get_url_chat(url_key)
-    target_cid = cached_cid if cached_cid else cid
+    url = get_url_for_chat(url_key, cid) or ""
+    target_cid = cid
     if not url:
         _status(
             target_cid, "❌ لینک منقضی شده. دوباره امتحان کنید.", reply_markup=home_kb(), final=True)
@@ -7180,10 +9199,10 @@ def _youtube_execute_download(
         sub_code=sub_code if sub_code != "NONE" else "",
         yt_client=client,
     )
-    _finish_video(target_cid, result)
+    _finish_video(target_cid, result, audio_only=audio_only)
 
 
-def _finish_video(cid: int, result):
+def _finish_video(cid: int, result, audio_only: bool = False):
     if not result:
         _status(
             cid,
@@ -7197,10 +9216,14 @@ def _finish_video(cid: int, result):
     fname = Path(fname).name
     size_mb = len(data) / 1024 / 1024
     log.info("_finish_video: %s  %.1fMB", fname, size_mb)
-    if smart_send(cid, data, fname, caption="", media_type="video"):
+    if smart_send(cid, data, fname, caption="", media_type="audio" if audio_only else "video"):
         _status(cid, f"✅ ارسال شد.", reply_markup=home_kb(), final=True)
     else:
-        _status(cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb(), final=True)
+        _status(cid,
+                "❌ ارسال فایل ناموفق بود.\n"
+                "• فایل ممکن است از حد حجم مجاز بزرگ‌تر باشد\n"
+                "• کیفیت پایین‌تر را امتحان کنید یا کمی بعد دوباره تلاش کنید",
+                reply_markup=home_kb(), final=True)
     clear_state(cid)
 
 
@@ -7279,16 +9302,17 @@ def _do_audio_download(
     title: str = "",
     artist: str = "",
     track_item: dict = None,
+    audio_format: str = "mp3",
+    audio_quality: str = "320",
 ):
     """دانلود صدا از URL یا جستجو با زنجیره fallback کامل."""
     bump(cid, "downloads")
-    _status(cid, "⏳ در حال دانلود آهنگ…")
     chat_action(cid, "record_voice")
 
-    def _status(text: str):
-        send_message(cid, text)
+    def status_cb(text: str, reply_markup=None, parse_mode=None, final=False):
+        _status(cid, text, reply_markup=reply_markup, parse_mode=parse_mode, final=final)
 
-    result = None
+    status_cb("⏳ در حال دانلود آهنگ…")
     tried_ids: set = set()
 
     # JioSaavn و Deezer نیاز به تابع دانلود اختصاصی دارند
@@ -7300,8 +9324,9 @@ def _do_audio_download(
                 title=title,
                 artist=artist,
                 source_hint=source,
-                status_cb=_status,
+                status_cb=status_cb,
                 _tried_yt_ids=tried_ids,
+                duration=(track_item or {}).get("duration"),
             )
     elif source == "deezer" and track_item:
         result = deezer_download(track_item)
@@ -7311,8 +9336,9 @@ def _do_audio_download(
                 title=title,
                 artist=artist,
                 source_hint=source,
-                status_cb=_status,
+                status_cb=status_cb,
                 _tried_yt_ids=tried_ids,
+                duration=(track_item or {}).get("duration"),
             )
     else:
         # برای YouTube/SoundCloud — یک بار مستقیم امتحان، سپس fallback
@@ -7323,21 +9349,21 @@ def _do_audio_download(
             qs = _up.parse_qs(_up.urlparse(url).query)
             vid = qs.get("v", [""])[0] or url
             tried_ids.add(vid)
-        result = music_download_ytdlp(url, source=source)
+        result = music_download_ytdlp(url, source=source, audio_format=audio_format, audio_quality=audio_quality)
         if not result:
-            _status("⚠️ دانلود مستقیم ناموفق — در حال جستجو در منابع دیگر…")
+            status_cb("⚠️ دانلود مستقیم ناموفق — در حال جستجو در منابع دیگر…")
             result = music_download_with_fallback(
                 url,
                 title=title,
                 artist=artist,
                 source_hint=source,
-                status_cb=_status,
+                status_cb=status_cb,
                 _tried_yt_ids=tried_ids,
+                duration=(track_item or {}).get("duration"),
             )
 
     if not result:
-        _status(
-            cid,
+        status_cb(
             "❌ دانلود آهنگ ناموفق بود.\n"
             "• عبارت دیگری جستجو کنید\n"
             "• ممکن است محتوا در همه منابع محدودیت داشته باشد",
@@ -7348,9 +9374,9 @@ def _do_audio_download(
     fname = Path(fname).name
     caption = f"🎵 {title or fname[:60]}"
     if smart_send(cid, data, fname, caption=caption, media_type="audio"):
-        _status(cid, "✅ ارسال شد!", reply_markup=home_kb(), final=True)
+        _status(cid, "✅ ارسال شد!", final=True)
     else:
-        _status(cid, "❌ ارسال فایل ناموفق بود.", reply_markup=home_kb(), final=True)
+        _status(cid, "❌ ارسال فایل ناموفق بود.", final=True)
     clear_state(cid)
 
 
@@ -7374,13 +9400,13 @@ def do_spotify_dl(cid: int, url: str):
     _status(cid, f"⏳ در حال دانلود {kind} از Spotify…")
     chat_action(cid, "record_voice")
 
-    def _status(text: str):
-        send_message(cid, text)
+    def status_cb(text: str):
+        _status(cid, text)
 
     # For single tracks, use full fallback chain; for albums/playlists only spotdl
     if is_track:
         result = music_download_with_fallback(
-            url, source_hint="spotify", status_cb=_status
+            url, source_hint="spotify", status_cb=status_cb
         )
     else:
         result = spotify_download(url)
@@ -7389,8 +9415,7 @@ def do_spotify_dl(cid: int, url: str):
         _status(
             cid,
             "❌ دانلود از Spotify ناموفق بود.\n\n"
-            "مطمئن شوید `spotdl` نصب است:\n"
-            "`pip install spotdl`",
+            "کمی بعد دوباره امتحان کنید یا نام آهنگ را در بخش موسیقی جستجو کنید.",
             parse_mode="Markdown",
             reply_markup=home_kb(), final=True)
         return
@@ -7413,8 +9438,15 @@ def do_images(cid: int, query: str, source: str, page=0):
         "bing": "🖼 Bing",
         "google": "🔍 Google",
         "pinterest": "📌 پینترست",
-        "pexels": "📷 Pixabay",
+        "pexels": "📷 Pixabay/Pexels",
         "wiki": "🎨 Wikimedia",
+        "deviantart": "🎨 DeviantArt",
+        "pixiv": "🎨 Pixiv",
+        "artstation": "🎨 ArtStation",
+        "flickr": "📷 Flickr",
+        "tumblr": "📝 Tumblr",
+        "imgur": "📷 Imgur",
+        "kemono": "🦊 Kemono",
     }
     _status(
         cid,
@@ -7430,9 +9462,15 @@ def do_images(cid: int, query: str, source: str, page=0):
         "pinterest": images_pinterest,
         "pexels": images_pexels,
         "wiki": images_wikimedia,
+        "deviantart": images_deviantart,
+        "pixiv": images_pixiv,
+        "artstation": images_artstation,
+        "flickr": images_flickr,
+        "tumblr": images_tumblr,
+        "imgur": images_imgur,
+        "kemono": images_kemono,
     }
     fn = fn_map.get(source, images_multi)
-    fn = fn_map.get(source, images_bing)
     results = fn(query, max_results=offset + 8)
     page_results = results[offset : offset + 6]
     key = make_cache_key(f"img_{source}", query, page)
@@ -7448,7 +9486,9 @@ def do_images(cid: int, query: str, source: str, page=0):
     if not page_results:
         _status(cid, "❌ تصویری یافت نشد.", reply_markup=home_kb(), final=True)
         return
-    sent = 0
+
+    # Build media group items
+    media_items = []
     for r in page_results[:6]:
         try:
             hdrs = {"Referer": r["_referer"]} if r.get("_referer") else None
@@ -7462,13 +9502,26 @@ def do_images(cid: int, query: str, source: str, page=0):
                     len(img_bytes) if img_bytes else 0,
                 )
                 continue
-            if send_photo(cid, img_bytes, caption=r.get("title", "")[:80]):
-                sent += 1
-            else:
-                log.warning("do_images: send_photo failed for %s", r.get("url"))
-            time.sleep(0.3)
+            media_items.append({
+                "data": img_bytes,
+                "fname": f"img_{len(media_items)}.jpg",
+                "is_video": False,
+                "caption": r.get("title", "")[:80] if len(media_items) == 0 else "",
+            })
         except Exception as ex:
-            log.error("do_images send: %s", ex, exc_info=True)
+            log.error("do_images prepare: %s", ex, exc_info=True)
+
+    if media_items:
+        if len(media_items) == 1:
+            # Single photo - use send_photo with keyboard
+            send_photo(cid, media_items[0]["data"], caption=media_items[0]["caption"])
+        else:
+            # Multiple photos - send as album
+            send_media_group(cid, media_items)
+        sent = len(media_items)
+    else:
+        sent = 0
+
     kb = images_more_kb(key, page, source)
     _status(cid, f"✅ {sent} عکس ارسال شد.", reply_markup=kb, final=True)
 
@@ -7510,7 +9563,11 @@ def do_github_release(cid: int, repo_full: str, page: int = 0):
     chat_action(cid)
     rel = github_latest_release(repo_full)
     if not rel:
-        _status(cid, "❌ هیچ Release‌ای یافت نشد.", reply_markup=home_kb(), final=True)
+        _status(cid,
+                "❌ هیچ نسخهٔ منتشرشده‌ای (Release) برای این مخزن نیست.\n"
+                "• شاید مخزن فقط سورس‌کد دارد — گزینهٔ «دانلود ZIP» را امتحان کنید\n"
+                "• نام مخزن را بررسی کنید (مثال: owner/repo)",
+                reply_markup=home_kb(), final=True)
         return
 
     tag = rel.get("tag_name", "")
@@ -7693,19 +9750,1038 @@ def do_qr(cid: int, text: str):
     clear_state(cid)
 
 
+def _compress_image_bytes(data: bytes, quality: int = 72) -> tuple[bytes, str]:
+    """Compress one image in memory; never persist a source or output file."""
+    from PIL import Image, ImageOps
+    with Image.open(io.BytesIO(data)) as source:
+        source.load()
+        image = ImageOps.exif_transpose(source)
+        if image.mode not in ("RGB", "L"):
+            image = image.convert("RGB")
+        # Pixel cap prevents decompression-bomb-like RAM spikes.
+        image.thumbnail((4096, 4096), Image.Resampling.LANCZOS)
+        out = io.BytesIO()
+        image.save(out, format="JPEG", quality=max(35, min(85, int(quality))),
+                   optimize=True, progressive=True)
+        return out.getvalue(), "compressed.jpg"
+
+
+FILE_OPS_TTL = 900
+FILE_OPS_MAX_ITEMS = 5
+FILE_OPS_MAX_BYTES = 20 * 1024 * 1024
+FILE_OPS_MAX_TOTAL_BYTES = 100 * 1024 * 1024
+FILE_OPS_MAX_OWNERS = 100
+PDF_MAX_BYTES = 20 * 1024 * 1024
+VIDEO_MAX_INPUT_BYTES = 48 * 1024 * 1024
+VIDEO_MAX_OUTPUT_BYTES = 48 * 1024 * 1024
+_file_ops_cache: dict[tuple[str, int], dict] = {}
+_file_ops_lock = threading.Lock()
+
+
+def _pdf_operation_supported() -> bool:
+    """Return whether the optional local PDF reader is importable."""
+    try:
+        import pypdf  # noqa: F401
+    except (ImportError, ModuleNotFoundError):
+        return False
+    return True
+
+
+def _parse_pdf_pages(spec: str, page_count: int) -> Optional[list[int]]:
+    """Parse a small page selector such as ``1,3-5`` into zero-based indices."""
+    text = str(spec or "").replace("،", ",").replace("٫", ",").strip()
+    if not text or page_count < 1:
+        return None
+    pages: list[int] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        match = re.fullmatch(r"(\d+)(?:\s*[-–]\s*(\d+))?", part)
+        if not match:
+            return None
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        if start < 1 or end < start or start > page_count or end > page_count:
+            return None
+        pages.extend(range(start - 1, end))
+    pages = list(dict.fromkeys(pages))
+    return pages if 1 <= len(pages) <= min(page_count, 100) else None
+
+
+def _pdf_extract_pages_bytes(data: bytes, page_spec: str) -> tuple[bytes, str]:
+    """Extract selected PDF pages in memory with bounded input/output."""
+    if not data or len(data) > PDF_MAX_BYTES or not _pdf_operation_supported():
+        raise ValueError("unsupported_pdf")
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(io.BytesIO(data))
+    selected = _parse_pdf_pages(page_spec, len(reader.pages))
+    if not selected:
+        raise ValueError("invalid_pages")
+    writer = PdfWriter()
+    for index in selected:
+        writer.add_page(reader.pages[index])
+    output = io.BytesIO()
+    writer.write(output)
+    result = output.getvalue()
+    if not result or len(result) > PDF_MAX_BYTES:
+        raise ValueError("pdf_too_large")
+    return result, "selected_pages.pdf"
+
+
+def _pdf_merge_bytes(pdfs: list[bytes]) -> tuple[bytes, str]:
+    """Merge at most five local PDF byte strings in memory."""
+    if not pdfs or len(pdfs) > FILE_OPS_MAX_ITEMS or not _pdf_operation_supported():
+        raise ValueError("unsupported_pdf")
+    if sum(len(item or b"") for item in pdfs) > PDF_MAX_BYTES:
+        raise ValueError("pdf_too_large")
+    from pypdf import PdfReader, PdfWriter
+
+    writer = PdfWriter()
+    for item in pdfs:
+        reader = PdfReader(io.BytesIO(item))
+        if not reader.pages:
+            raise ValueError("empty_pdf")
+        for page in reader.pages:
+            writer.add_page(page)
+    output = io.BytesIO()
+    writer.write(output)
+    result = output.getvalue()
+    if not result or len(result) > PDF_MAX_BYTES:
+        raise ValueError("pdf_too_large")
+    return result, "merged.pdf"
+
+
+def _file_ops_items(platform: str, chat_id: int) -> list[dict]:
+    key = (str(platform), int(chat_id))
+    with _file_ops_lock:
+        entry = _file_ops_cache.get(key)
+        if not entry:
+            return []
+        if entry["expires_at"] <= time.monotonic():
+            _file_ops_cache.pop(key, None)
+            return []
+        return list(entry["items"])
+
+
+def _file_ops_prune(now: Optional[float] = None) -> None:
+    """Evict expired owners and cap both owner count and retained bytes."""
+    now = time.monotonic() if now is None else now
+    with _file_ops_lock:
+        expired = [key for key, entry in _file_ops_cache.items() if entry["expires_at"] <= now]
+        for key in expired:
+            _file_ops_cache.pop(key, None)
+        entries = sorted(
+            _file_ops_cache.items(), key=lambda pair: (pair[1]["expires_at"], pair[0])
+        )
+        overflow = len(entries) - FILE_OPS_MAX_OWNERS
+        for key, _entry in entries[:max(0, overflow)]:
+            _file_ops_cache.pop(key, None)
+        entries = sorted(
+            _file_ops_cache.items(), key=lambda pair: (pair[1]["expires_at"], pair[0])
+        )
+        total = sum(int(entry.get("total_bytes", 0)) for _key, entry in entries)
+        for key, entry in entries:
+            if total <= FILE_OPS_MAX_TOTAL_BYTES:
+                break
+            _file_ops_cache.pop(key, None)
+            total -= int(entry.get("total_bytes", 0))
+
+
+def _file_ops_set(platform: str, chat_id: int, item: dict) -> bool:
+    """Replace one owner's pending file-operation item with a hard byte cap."""
+    data = item.get("data") if isinstance(item, dict) else b""
+    if not isinstance(item, dict) or not isinstance(data, (bytes, bytearray)) or not data:
+        return False
+    if len(data) > PDF_MAX_BYTES and item.get("kind") != "video":
+        return False
+    if len(data) > VIDEO_MAX_INPUT_BYTES:
+        return False
+    now = time.monotonic()
+    _file_ops_prune(now)
+    key = (str(platform), int(chat_id))
+    with _file_ops_lock:
+        if key not in _file_ops_cache:
+            total = sum(int(entry.get("total_bytes", 0)) for entry in _file_ops_cache.values())
+            if total + len(data) > FILE_OPS_MAX_TOTAL_BYTES:
+                return False
+        _file_ops_cache[key] = {
+            "expires_at": now + FILE_OPS_TTL,
+            "items": [dict(item)],
+            "total_bytes": len(data),
+        }
+    return True
+
+
+def _file_ops_add(platform: str, chat_id: int, item: dict) -> bool:
+    """Append a PDF for merge without allowing unbounded retained uploads."""
+    data = item.get("data") if isinstance(item, dict) else b""
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        return False
+    now = time.monotonic()
+    _file_ops_prune(now)
+    key = (str(platform), int(chat_id))
+    with _file_ops_lock:
+        current_entry = _file_ops_cache.get(key)
+        current = list(current_entry["items"]) if current_entry else []
+        if len(current) >= FILE_OPS_MAX_ITEMS:
+            return False
+        if sum(len(x.get("data", b"")) for x in current) + len(data) > PDF_MAX_BYTES:
+            return False
+        if key not in _file_ops_cache:
+            total = sum(int(entry.get("total_bytes", 0)) for entry in _file_ops_cache.values())
+            if total + len(data) > FILE_OPS_MAX_TOTAL_BYTES:
+                return False
+        _file_ops_cache[key] = {
+            "expires_at": now + FILE_OPS_TTL,
+            "items": current + [dict(item)],
+            "total_bytes": sum(len(x.get("data", b"")) for x in current) + len(data),
+        }
+    return True
+
+
+def _file_ops_get(platform: str, chat_id: int):
+    items = _file_ops_items(platform, chat_id)
+    if not items:
+        return None
+    return items[0] if len(items) == 1 else items
+
+
+def _file_ops_clear(platform: str, chat_id: int) -> None:
+    with _file_ops_lock:
+        _file_ops_cache.pop((str(platform), int(chat_id)), None)
+
+
+def _uploaded_file_name(info: dict, fallback: str) -> str:
+    """Return a safe local filename from either platform's upload shape."""
+    raw = str(
+        (info or {}).get("file_name")
+        or (info or {}).get("filename")
+        or (info or {}).get("name")
+        or fallback
+    ).strip()
+    name = Path(raw).name or fallback
+    return name[:120]
+
+
+def _download_uploaded_file(info: dict, max_bytes: int) -> tuple[bytes, str] | None:
+    """Download one platform upload with a hard transfer budget."""
+    file_id = str((info or {}).get("file_id") or (info or {}).get("id") or "")
+    if not file_id:
+        return None
+    try:
+        url = get_file_url(file_id)
+    except Exception as exc:
+        log.debug("file upload getFile failed: %s", type(exc).__name__)
+        return None
+    if not url:
+        return None
+    data = download_bytes(url, max_bytes)
+    if not data or len(data) > max_bytes:
+        return None
+    return data, url
+
+
+# Conversion references are short-lived metadata only; media lives in the worker tempdir.
+CONVERT_MAX_BYTES = 20 * 1024 * 1024
+CONVERT_MAX_PIXELS = 16_000_000
+CONVERT_TTL = 1800
+CONVERT_MAX_SOURCES = 512
+_CONVERT_TARGETS = {"image": ("jpg", "png", "webp", "pdf"),
+                    "audio": ("mp3", "m4a", "ogg", "opus"),
+                    "video": ("mp4", "webm", "mp3")}
+_convert_sources = {}
+_convert_lock = threading.Lock()
+_convert_jobs = set()
+
+
+def _conversion_info(msg):
+    if not isinstance(msg, dict):
+        return None
+    for kind in ("document", "video", "audio", "voice", "video_note"):
+        if isinstance(msg.get(kind), dict):
+            info = dict(msg[kind])
+            if kind != "document":
+                info.setdefault("file_name", {"video": "video.mp4", "video_note": "video.mp4",
+                                              "audio": "audio.mp3", "voice": "voice.ogg"}[kind])
+            return info
+    photos = msg.get("photo")
+    if isinstance(photos, list) and photos:
+        info = dict(max(photos, key=lambda x: x.get("file_size", 0)))
+        info.setdefault("file_name", "image.jpg")
+        return info
+    return None
+
+
+def _conversion_kind(info):
+    name = _uploaded_file_name(info, "file").lower()
+    if re.search(r"\.part\d+(?:of\d+)?(?:\.|$)", name):
+        return None  # Raw binary fragments are not independently convertible.
+    ext = name.rsplit(".", 1)[-1]
+    mime = str(info.get("mime_type", ""))
+    if ext in ("jpg", "jpeg", "png", "webp") or mime.startswith("image/") or info.get("width") and not info.get("duration"):
+        return "image"
+    if ext in ("mp4", "webm", "mkv", "mov", "avi", "m4v") or mime.startswith("video/") or info.get("width"):
+        return "video"
+    if ext in ("mp3", "m4a", "ogg", "opus", "wav", "flac", "aac") or mime.startswith("audio/") or info.get("duration"):
+        return "audio"
+    return None
+
+
+def _conversion_register(cid, uid, info):
+    import secrets
+    if not uid or not info or not info.get("file_id"):
+        return None
+    if int(info.get("file_size") or 0) > CONVERT_MAX_BYTES:
+        return None
+    kind = _conversion_kind(info)
+    if not kind:
+        return None
+    now = time.monotonic()
+    with _convert_lock:
+        for token, source in list(_convert_sources.items()):
+            if source["expires"] <= now:
+                del _convert_sources[token]
+        while len(_convert_sources) >= CONVERT_MAX_SOURCES:
+            del _convert_sources[next(iter(_convert_sources))]
+        token = secrets.token_hex(8)
+        # No captions, URLs, bytes, or mutable last-upload state.
+        _convert_sources[token] = {"platform": _platform(), "cid": cid, "uid": uid,
+                                   "info": {k: info[k] for k in ("file_id", "file_name", "file_size", "mime_type") if k in info},
+                                   "kind": kind, "expires": now + CONVERT_TTL}
+    return token
+
+
+def _conversion_source(cid, uid, token):
+    with _convert_lock:
+        source = _convert_sources.get(token)
+        if not source or source["expires"] <= time.monotonic():
+            _convert_sources.pop(token, None)
+            return None
+        if (source["platform"], source["cid"], source["uid"]) != (_platform(), cid, uid):
+            return None
+        return source
+
+
+def _conversion_offer(cid, uid, info):
+    token = _conversion_register(cid, uid, info)
+    if token:
+        send_message(cid, "🔄 تبدیل همین فایل (تا ۳۰ دقیقه):", reply_markup={"inline_keyboard": [[
+            {"text": "🔄 انتخاب قالب", "callback_data": "cv_menu:" + token}]]})
+    return token
+
+
+def _conversion_capture(cid, result, filename="", size=0):
+    """Observe successful API results without changing the sender's boolean contract."""
+    try:
+        if re.search(r"\.part\d+(?:of\d+)?(?:\.|$)", filename.lower()):
+            return
+        uid = getattr(_ctx, "requester", None) or (getattr(_ctx, "operation", None) or {}).get("requester")
+        # Do not guess a group requester from its chat ID.
+        if not uid:
+            uid = int(cid) if int(cid) > 0 else None
+        for message in result if isinstance(result, list) else [result]:
+            info = _conversion_info(message)
+            if info:
+                info.setdefault("file_name", filename or "image.jpg")
+                info.setdefault("file_size", size)
+                _conversion_offer(int(cid), uid, info)
+    except Exception:
+        log.debug("conversion source capture failed", exc_info=True)
+
+
+def _conversion_menu(cid, uid, token):
+    source = _conversion_source(cid, uid, token)
+    if not source:
+        _status(cid, "❌ این دکمه منقضی شده یا متعلق به شما نیست؛ فایل را دوباره بفرستید.", final=True)
+        return
+    rows = [[{"text": target.upper(), "callback_data": f"cv_do:{token}:{target}"}
+             for target in _CONVERT_TARGETS[source["kind"]]]]
+    send_message(cid, "🔄 قالب خروجی را انتخاب کنید. تبدیل ممکن است کیفیت را کاهش دهد؛ در JPG و PDF شفافیت روی زمینهٔ سفید قرار می‌گیرد. عکس متحرک پشتیبانی نمی‌شود. سقف ورودی ۲۰ مگابایت و مدت صدا/ویدیو ۳ دقیقه است.",
+                 reply_markup={"inline_keyboard": rows})
+
+
+def _conversion_probe(path, include_duration=False):
+    import subprocess
+    result = subprocess.run(["ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe",
+                             "-format_whitelist", "mov,matroska,webm,mp3,ogg,wav,flac,aac",
+                             "-show_streams", "-show_format", "-of", "json", str(path)],
+                            capture_output=True, timeout=10, check=True)
+    info = json.loads(result.stdout)
+    streams = info.get("streams", [])
+    videos = [s for s in streams if s.get("codec_type") == "video" and not s.get("disposition", {}).get("attached_pic")]
+    audio = [s for s in streams if s.get("codec_type") == "audio"]
+    duration = float(info.get("format", {}).get("duration", 0))
+    if not 0 < duration <= 180 or not (videos or audio):
+        raise ValueError("مدت یا محتوای فایل مجاز نیست؛ حداکثر سه دقیقه.")
+    if videos and (int(videos[0].get("width", 0)) * int(videos[0].get("height", 0)) > 8_294_400):
+        raise ValueError("ابعاد ویدیو بیشتر از حد مجاز است.")
+    result = ("video" if videos else "audio", bool(audio))
+    return result + (duration,) if include_duration else result
+
+
+def _convert_local(source, target, directory, output_limit):
+    """Decode content, not the claimed suffix. All subprocess switches are fixed."""
+    import subprocess
+    import warnings
+    from PIL import Image, UnidentifiedImageError
+    output = Path(directory) / ("converted." + target)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            image = Image.open(source)
+            with image:
+                if image.format not in ("JPEG", "PNG", "WEBP") or getattr(image, "n_frames", 1) != 1:
+                    raise ValueError("قالب تصویر یا عکس متحرک پشتیبانی نمی‌شود.")
+                if image.width * image.height > CONVERT_MAX_PIXELS:
+                    raise ValueError("ابعاد عکس بیشتر از حد مجاز است.")
+                if target not in _CONVERT_TARGETS["image"]:
+                    raise ValueError("قالب خروجی برای این تصویر مجاز نیست.")
+                image.load()
+                if target in ("jpg", "pdf"):
+                    rgba = image.convert("RGBA")
+                    flat = Image.new("RGB", image.size, "white")
+                    flat.paste(rgba, mask=rgba.getchannel("A"))
+                    flat.save(output, format="JPEG" if target == "jpg" else "PDF")
+                else:
+                    image.save(output, format=target.upper())
+    except UnidentifiedImageError:
+        kind, has_audio, duration = _conversion_probe(source, include_duration=True)
+        if target not in _CONVERT_TARGETS[kind] or target == "mp3" and not has_audio:
+            raise ValueError("قالب خروجی با محتوای فایل سازگار نیست یا فایل صدا ندارد.")
+        codecs = {"mp3": ["-vn", "-c:a", "libmp3lame", "-b:a", "128k"],
+                  "m4a": ["-vn", "-c:a", "aac", "-b:a", "128k"],
+                  "ogg": ["-vn", "-c:a", "libvorbis", "-q:a", "4"],
+                  "opus": ["-vn", "-c:a", "libopus", "-b:a", "96k"],
+                  "mp4": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart"],
+                  "webm": ["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", "-crf", "36", "-b:v", "0", "-c:a", "libopus"]}
+        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-threads", "2",
+               "-filter_threads", "1", "-protocol_whitelist", "file,pipe",
+               "-format_whitelist", "mov,matroska,webm,mp3,ogg,wav,flac,aac", "-i", str(source),
+               "-map", "0:v:0?" if target in ("mp4", "webm") else "0:a:0"]
+        if target in ("mp4", "webm"):
+            cmd += ["-map", "0:a:0?", "-vf", "scale=trunc(min(1280\\,iw)/2)*2:trunc(ih*min(1280\\,iw)/iw/2)*2"]
+        cmd += ["-map_metadata", "-1", "-map_chapters", "-1"] + codecs[target] + ["-threads", "2", "-fs", str(output_limit + 1), str(output)]
+        subprocess.run(cmd, capture_output=True, timeout=120, check=True)
+        if _conversion_probe(output, include_duration=True)[2] < duration - 0.2:
+            raise ValueError("خروجی کامل نیست؛ فایل کوچک‌تری بفرستید.")
+    if not output.exists() or not 0 < output.stat().st_size < output_limit:
+        raise ValueError("خروجی بیشتر از سقف ارسال یکپارچه است؛ فایل کوچک‌تری بفرستید.")
+    return output
+
+
+@_heavy_download
+def _conversion_worker(cid, source, target):
+    try:
+        _status(cid, "⏳ در حال دریافت و تبدیل فایل…")
+        downloaded = _download_uploaded_file(source["info"], CONVERT_MAX_BYTES)
+        if not downloaded:
+            raise ValueError("دریافت فایل ناموفق بود؛ فایل کوچک‌تر یا دوباره ارسال شود.")
+        data = downloaded[0]
+        if len(data) > CONVERT_MAX_BYTES:
+            raise ValueError("حجم فایل بیشتر از حد مجاز است.")
+        limit = min(CONVERT_MAX_BYTES, _chunk_size())
+        _ensure_disk_space(CONVERT_MAX_BYTES * 3)
+        with tempfile.TemporaryDirectory(prefix="convert_") as directory:
+            path = Path(directory) / "source"
+            path.write_bytes(data)
+            del data, downloaded
+            output = _convert_local(path, target, directory, limit)
+            # No splitting: format-sensitive output must remain a whole document.
+            ok = send_document(cid, output.read_bytes(), output.name, caption="🔄 فایل تبدیل‌شده")
+        _status(cid, "✅ تبدیل و ارسال انجام شد." if ok else "❌ تبدیل انجام شد ولی ارسال ناموفق بود؛ دوباره تلاش کنید.", final=True)
+    except Exception as exc:
+        log.warning("conversion failed: %s", type(exc).__name__)
+        _status(cid, "❌ تبدیل انجام نشد؛ فایل خراب، ناسازگار یا بیشتر از محدودیت حجم، زمان یا ابعاد است. فایل کوچک‌تر بفرستید.", final=True)
+
+
+def _conversion_start(cid, uid, token, target):
+    source = _conversion_source(cid, uid, token)
+    if not source or target not in _CONVERT_TARGETS[source["kind"]]:
+        _status(cid, "❌ درخواست نامعتبر یا منقضی شده است؛ فایل را دوباره بفرستید.", final=True)
+        return None
+    key = (source["platform"], cid, uid, source["info"]["file_id"])
+    with _convert_lock:
+        if key in _convert_jobs:
+            _status(cid, "⏳ تبدیل همین فایل در حال انجام است؛ صبر کنید.", final=True)
+            return None
+        _convert_jobs.add(key)
+    try:
+        future = _conversion_worker(cid, source, target)
+    except BaseException:
+        with _convert_lock:
+            _convert_jobs.discard(key)
+        raise
+    def finished(_):
+        with _convert_lock:
+            _convert_jobs.discard(key)
+    future.add_done_callback(finished)
+    return future
+
+
+def _file_upload_is_pdf(info: dict, data: bytes) -> bool:
+    name = _uploaded_file_name(info, "upload.pdf").lower()
+    mime = str((info or {}).get("mime_type") or (info or {}).get("content_type") or "").lower()
+    return name.endswith(".pdf") or mime == "application/pdf" or data[:4] == b"%PDF"
+
+
+def _file_upload_is_video(info: dict) -> bool:
+    name = _uploaded_file_name(info, "upload.mp4").lower()
+    mime = str((info or {}).get("mime_type") or (info or {}).get("content_type") or "").lower()
+    return name.endswith((".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v")) or mime.startswith("video/")
+
+
+def _start_file_worker(fn, *args) -> None:
+    """Schedule a bounded local operation on the existing heavy executor."""
+    fn(*args)
+
+
+def _parse_video_range(text: str) -> tuple[int, int] | None:
+    numbers = [int(value) for value in re.findall(r"\d+", str(text or ""))]
+    if len(numbers) < 2:
+        return None
+    start, end = numbers[0], numbers[1]
+    if start < 0 or end <= start or end - start > 1800:
+        return None
+    return start, end
+
+
+def _handle_pdf_upload(cid: int, info: dict, mode: str) -> None:
+    limit = PDF_MAX_BYTES
+    size = int((info or {}).get("file_size") or 0)
+    if size > limit:
+        _status(cid, "❌ حجم PDF بیشتر از حد مجاز است.", final=True)
+        return
+    downloaded = _download_uploaded_file(info, limit)
+    if not downloaded:
+        _status(cid, "❌ دریافت فایل PDF ناموفق بود.", final=True)
+        return
+    data, _url = downloaded
+    if not _file_upload_is_pdf(info, data):
+        _status(cid, "❌ فایل ارسالی PDF معتبر نیست.", final=True)
+        return
+    if mode == "pdf_extract":
+        if not _file_ops_set(_platform(), cid, {
+            "kind": "pdf", "data": data, "name": _uploaded_file_name(info, "document.pdf"),
+        }):
+            _status(cid, "❌ فایل PDF قابل پردازش نیست یا بیش از حد مجاز است.", final=True)
+            return
+        set_state(cid, mode="pdf_extract", file_op_name=_uploaded_file_name(info, "document.pdf"))
+        _status(cid, "📄 شمارهٔ صفحه‌ها را بفرستید؛ مثال: `1,3-5`.", final=True)
+        return
+    if not _file_ops_add(_platform(), cid, {
+        "kind": "pdf", "data": data, "name": _uploaded_file_name(info, "document.pdf"),
+    }):
+        _status(cid, "⚠️ حداکثر ۵ فایل PDF یا حجم کلی مجاز نیست؛ فایل‌های قبلی پاک شدند.", final=True)
+        _file_ops_clear(_platform(), cid)
+        return
+    count = len(_file_ops_items(_platform(), cid))
+    set_state(cid, mode="pdf_merge", file_op_count=count)
+    _status(
+        cid,
+        f"📚 فایل PDF {count} ثبت شد. برای پایان `ادغام` را بفرستید.",
+        final=True,
+    )
+
+
+def _handle_video_upload(cid: int, info: dict, mode: str) -> None:
+    size = int((info or {}).get("file_size") or 0)
+    if size > VIDEO_MAX_INPUT_BYTES:
+        _status(cid, "❌ حجم ویدیو بیشتر از ۴۸ مگابایت است.", final=True)
+        return
+    if not _file_upload_is_video(info):
+        _status(cid, "❔ فایل ارسالی ویدیو معتبر نیست.", final=True)
+        return
+    downloaded = _download_uploaded_file(info, VIDEO_MAX_INPUT_BYTES)
+    if not downloaded:
+        _status(cid, "❌ دریافت ویدیو ناموفق بود.", final=True)
+        return
+    data, _url = downloaded
+    name = _uploaded_file_name(info, "video.mp4")
+    if mode == "video_trim":
+        if not _file_ops_set(_platform(), cid, {"kind": "video", "data": data, "name": name}):
+            _status(cid, "❌ ویدیوی دریافتی قابل پردازش نیست.", final=True)
+            return
+        set_state(cid, mode="video_trim", file_op_name=name)
+        _status(cid, "✂️ بازهٔ شروع و پایان را به ثانیه بفرستید؛ مثال: `5 30`.", final=True)
+        return
+    _start_file_worker(_process_video_compress, cid, data, name)
+
+
+@_heavy_download
+def _process_pdf_extract(cid: int, data: bytes, name: str, page_spec: str) -> None:
+    try:
+        result, filename = _pdf_extract_pages_bytes(data, page_spec)
+    except Exception as exc:
+        log.warning("PDF extract failed: %s", type(exc).__name__)
+        _status(cid, "❌ انتخاب صفحه‌ها معتبر نیست یا فایل قابل خواندن نیست.", final=True)
+        return
+    ok = send_document(cid, result, filename, caption="📄 صفحات انتخاب‌شدهٔ PDF")
+    _file_ops_clear(_platform(), cid)
+    if ok:
+        _log_history(cid, "pdf_extract", file_name=name, pages=page_spec)
+    _status(cid, "✅ PDF ارسال شد." if ok else "❌ ارسال PDF ناموفق بود.", final=True)
+    clear_state(cid)
+
+
+@_heavy_download
+def _process_pdf_merge(cid: int) -> None:
+    items = _file_ops_items(_platform(), cid)
+    if len(items) < 2:
+        _status(cid, "📚 برای ادغام حداقل دو فایل PDF بفرستید.", final=True)
+        return
+    try:
+        result, filename = _pdf_merge_bytes([item["data"] for item in items])
+    except Exception as exc:
+        log.warning("PDF merge failed: %s", type(exc).__name__)
+        _file_ops_clear(_platform(), cid)
+        _status(cid, "❌ ادغام PDF ممکن نبود؛ فایل‌های ناسازگار را بررسی کنید.", final=True)
+        return
+    ok = send_document(cid, result, filename, caption="📚 PDF ادغام‌شده")
+    _file_ops_clear(_platform(), cid)
+    if ok:
+        _log_history(cid, "pdf_merge", files=len(items))
+    _status(cid, "✅ PDF ادغام و ارسال شد." if ok else "❌ ارسال PDF ناموفق بود.", final=True)
+    clear_state(cid)
+
+
+@_heavy_download
+def _process_video_trim(cid: int, data: bytes, name: str, start: int, end: int) -> None:
+    result = _trim_video_to_bytes(data, name, start, end)
+    _file_ops_clear(_platform(), cid)
+    if not result:
+        _status(cid, "❌ برش ویدیو ممکن نبود؛ فایل یا بازهٔ زمانی را بررسی کنید.", final=True)
+        return
+    output, output_name = result
+    ok = send_video(cid, output, output_name, caption="✂️ بخش ویدیو")
+    if ok:
+        _log_history(cid, "video_trim", file_name=name, start=start, end=end)
+    _status(cid, "✅ بخش ویدیو ارسال شد." if ok else "❌ ارسال ویدیو ناموفق بود.", final=True)
+    clear_state(cid)
+
+
+@_heavy_download
+def _process_video_compress(cid: int, data: bytes, name: str) -> None:
+    result = _compress_video_to_bytes(data, name)
+    if not result:
+        _status(cid, "❌ فشرده‌سازی ویدیو ممکن نبود.", final=True)
+        return
+    output, output_name = result
+    ok = send_video(cid, output, output_name, caption="🎞 ویدیوی فشرده")
+    if ok:
+        _log_history(cid, "video_compress", file_name=name, bytes_in=len(data), bytes_out=len(output))
+    _status(cid, "✅ ویدیوی فشرده ارسال شد." if ok else "❌ ارسال ویدیو ناموفق بود.", final=True)
+    clear_state(cid)
+
+
+def _handle_pdf_text(cid: int, text: str) -> None:
+    item = _file_ops_get(_platform(), cid)
+    if not isinstance(item, dict) or item.get("kind") != "pdf":
+        _status(cid, "📄 ابتدا یک فایل PDF بفرستید.", final=True)
+        return
+    if not _parse_pdf_pages(text, 10_000):
+        _status(cid, "❌ قالب صفحه معتبر نیست؛ مثال: `1,3-5`.", final=True)
+        return
+    _start_file_worker(_process_pdf_extract, cid, item["data"], item.get("name", "document.pdf"), text.strip())
+
+
+def _handle_pdf_merge_text(cid: int, text: str) -> None:
+    if str(text or "").strip().lower() not in {"ادغام", "merge", "done", "تمام"}:
+        _status(cid, "📚 برای پایان، کلمهٔ «ادغام» را بفرستید.", final=True)
+        return
+    items = _file_ops_items(_platform(), cid)
+    if len(items) < 2:
+        _status(cid, "📚 حداقل دو فایل PDF لازم است.", final=True)
+        return
+    _start_file_worker(_process_pdf_merge, cid)
+
+
+def _handle_video_range_text(cid: int, text: str) -> None:
+    item = _file_ops_get(_platform(), cid)
+    if not isinstance(item, dict) or item.get("kind") != "video":
+        _status(cid, "✂️ ابتدا یک ویدیو بفرستید.", final=True)
+        return
+    parsed = _parse_video_range(text)
+    if not parsed:
+        _status(cid, "❌ بازهٔ زمانی معتبر نیست؛ مثال: `5 30`.", final=True)
+        return
+    start, end = parsed
+    _start_file_worker(_process_video_trim, cid, item["data"], item.get("name", "video.mp4"), start, end)
+
+
+def _handle_file_upload(cid: int, info: dict, mode: str) -> None:
+    if mode in ("pdf_extract", "pdf_merge"):
+        _handle_pdf_upload(cid, info, mode)
+        return
+    if mode in ("video_trim", "video_compress"):
+        _handle_video_upload(cid, info, mode)
+        return
+    _status(cid, "⚠️ این فایل برای عملیات فعلی مناسب نیست.", final=True)
+
+
+def _trim_video_to_bytes(
+    data: bytes, filename: str, start_seconds: int, end_seconds: int,
+    test_output: Optional[Path] = None,
+) -> Optional[tuple[bytes, str]]:
+    """Trim a local video with a bounded ffmpeg subprocess and cleanup."""
+    _ensure_disk_space(len(data) * 2)
+    try:
+        start = int(start_seconds)
+        end = int(end_seconds)
+    except (TypeError, ValueError):
+        return None
+    if not data or len(data) > VIDEO_MAX_INPUT_BYTES or start < 0 or end <= start or end - start > 1800:
+        return None
+    import shutil as _sh
+    ffmpeg = _sh.which("ffmpeg") or "/usr/bin/ffmpeg"
+    with tempfile.TemporaryDirectory(prefix="balebot-video-") as temp:
+        temp_dir = Path(temp)
+        source = temp_dir / "source.mp4"
+        output = test_output or temp_dir / "trimmed.mp4"
+        source.write_bytes(data)
+        cmd = [
+            ffmpeg, "-y", "-ss", str(start), "-i", str(source), "-t", str(end - start),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(output),
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=300)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0 or not output.exists() or output.stat().st_size < 1:
+            return None
+        if output.stat().st_size > VIDEO_MAX_OUTPUT_BYTES:
+            return None
+        return output.read_bytes(), output.name
+
+
+def _compress_video_to_bytes(data: bytes, filename: str) -> Optional[tuple[bytes, str]]:
+    """Re-encode a local video with a bounded output budget."""
+    _ensure_disk_space(len(data) * 2)
+    if not data or len(data) > VIDEO_MAX_INPUT_BYTES:
+        return None
+    import shutil as _sh
+    ffmpeg = _sh.which("ffmpeg") or "/usr/bin/ffmpeg"
+    with tempfile.TemporaryDirectory(prefix="balebot-video-") as temp:
+        temp_dir = Path(temp)
+        source = temp_dir / "source.mp4"
+        output = temp_dir / "compressed.mp4"
+        source.write_bytes(data)
+        try:
+            result = subprocess.run(
+                [
+                    ffmpeg, "-y", "-i", str(source), "-c:v", "libx264",
+                    "-preset", "veryfast", "-crf", "30", "-c:a", "aac",
+                    "-b:a", "128k", "-movflags", "+faststart", str(output),
+                ],
+                capture_output=True,
+                timeout=300,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0 or not output.exists() or output.stat().st_size < 1:
+            return None
+        if output.stat().st_size > VIDEO_MAX_OUTPUT_BYTES:
+            return None
+        return output.read_bytes(), output.name
+
+
+def do_image_compress(cid: int, data: bytes) -> None:
+    if not data or len(data) > MAX_IMAGE_SIZE:
+        _status(cid, "❌ حجم عکس بیشتر از حد مجاز است.", final=True)
+        return
+    _status(cid, "🖼 در حال فشرده‌سازی عکس…")
+    try:
+        result, filename = _compress_image_bytes(data)
+    except Exception as e:
+        log.warning("image compression failed: %s", e)
+        _status(cid, "❌ این فایل تصویر پشتیبانی نمی‌شود؛ لطفاً عکس دیگری بفرستید.", final=True)
+        return
+    ok = smart_send(cid, result, filename, caption="🖼 تصویر فشرده", media_type="photo")
+    if ok:
+        _log_history(cid, "image_compress", bytes_in=len(data), bytes_out=len(result))
+    _status(cid, "✅ تصویر فشرده ارسال شد." if ok else "❌ ارسال تصویر فشرده ناموفق بود.", final=True)
+    clear_state(cid)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SOCIAL MEDIA HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def audiobook_results_kb(results: list, cache_key: str) -> dict:
+    """نتایج جستجوی کتاب صوتی به‌صورت دکمه."""
+    rows = []
+    for i, r in enumerate(results):
+        name = (r.get("name") or f"نتیجه {i + 1}")[:50]
+        src = r.get("_source", "")
+        icon = "🎧" if src == "librivox" else "📚"
+        rows.append([{"text": f"{icon} {name}", "callback_data": f"abk_item_{cache_key}_{i}"}])
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+    return {"inline_keyboard": rows}
+
+
+def librivox_search(query: str) -> list[dict]:
+    """Search LibriVox (public-domain audiobooks) via archive.org; real files."""
+    try:
+        r = requests.get(
+            "https://archive.org/advancedsearch.php",
+            params={
+                "q": f'title:("{query}") AND collection:librivoxaudio',
+                "fl[]": ["identifier", "title", "creator"],
+                "rows": 8,
+                "output": "json",
+            },
+            headers={"User-Agent": UA_DESK},
+            timeout=20,
+        )
+        docs = r.json().get("response", {}).get("docs", []) if r.status_code == 200 else []
+    except Exception as e:
+        log.warning("librivox_search: %s", e)
+        return []
+    out = []
+    for d in docs:
+        ident, title = d.get("identifier", ""), d.get("title", "").strip()
+        if not ident or not title:
+            continue
+        creator = d.get("creator")
+        if isinstance(creator, list):
+            creator = ", ".join(creator[:2])
+        out.append({
+            "name": title,
+            "authors": [creator] if creator else [],
+            "url": f"https://archive.org/details/{ident}",
+            "_source": "librivox",
+        })
+    return out
+
+
+def archive_org_search(query: str, count: int = 10) -> list[dict]:
+    """Search Internet Archive texts — free, and many titles are lending-enabled.
+
+    Results are metadata-only and carry ``ia_url`` (the details page). The real
+    file is resolved lazily at download time, so a search costs exactly one
+    HTTP request instead of one per result.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    log.info("archive_org_search: %r", q)
+    count = max(1, min(int(count), 10))
+    try:
+        r = requests.get(
+            "https://archive.org/advancedsearch.php",
+            params={
+                "q": f'title:("{q}") AND mediatype:texts',
+                "fl[]": ["identifier", "title", "creator", "year"],
+                "rows": count,
+                "page": 1,
+                "output": "json",
+            },
+            headers={"User-Agent": UA_DESK},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            log.debug("archive_org_search: HTTP %d", r.status_code)
+            return []
+        docs = r.json().get("response", {}).get("docs", [])
+    except Exception as e:
+        log.warning("archive_org_search: %s", e)
+        return []
+
+    out, seen = [], set()
+    for d in docs:
+        ident = str(d.get("identifier") or "").strip()
+        title = str(d.get("title") or "").strip()
+        if not ident or not title or ident in seen:
+            continue
+        seen.add(ident)
+        creator = d.get("creator")
+        if isinstance(creator, list):
+            creator = ", ".join(str(c) for c in creator[:2])
+        out.append({
+            "name": title,
+            "authors": [str(creator)] if creator else [],
+            "year": str(d.get("year") or ""),
+            "ia_url": f"https://archive.org/details/{ident}",
+        })
+        if len(out) >= count:
+            break
+    return out
+
+
+def _archive_org_best_file(identifier: str) -> Optional[tuple[str, str]]:
+    """Resolve an Archive.org identifier to its best free full-text file.
+
+    Returns ``(download_url, filename)`` or None. One bounded metadata call;
+    lending-only items expose no direct file and correctly return None.
+    """
+    ident = (identifier or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._\-]{1,120}", ident):
+        return None
+    try:
+        r = requests.get(
+            f"https://archive.org/metadata/{ident}",
+            headers={"User-Agent": UA_DESK},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return None
+        files = r.json().get("files", [])
+    except Exception as e:
+        log.warning("_archive_org_best_file: %s", e)
+        return None
+
+    def _rank(f):
+        name = str(f.get("name") or "")
+        if f.get("private"):
+            return 0
+        low = name.lower()
+        # Lending/DRM wrappers are not real files: they download fine but
+        # cannot be opened, so never offer them.
+        if low.endswith(("_encrypted.pdf", "_lcp.epub", "_lcp.pdf", "_bw.pdf")):
+            return 0
+        if low.endswith("_text.pdf"):
+            return 4
+        if low.endswith(".pdf"):
+            return 3
+        if low.endswith(".epub"):
+            return 2
+        if low.endswith(".mobi") or low.endswith(".azw3"):
+            return 1
+        if low.endswith("_djvu.txt"):
+            return 1
+        return 0
+
+    best, best_rank = None, 0
+    for f in files or []:
+        if not f.get("size"):
+            continue
+        rank = _rank(f)
+        if rank > best_rank:
+            best, best_rank = f, rank
+    if not best or not best_rank:
+        return None
+    name = str(best["name"])
+    return (f"https://archive.org/download/{ident}/{urllib.parse.quote(name)}", name)
+
+
+def do_audiobook_search(cid: int, query: str):
+    """کتاب صوتی: LibriVox (دانلود مستقیم) + Rave audiobook CSE (لینک‌ها)."""
+    bump(cid, "searches")
+    _status(cid, f"⏳ در حال جستجوی کتاب صوتی: _{query}_…", parse_mode="Markdown")
+    chat_action(cid)
+
+    results = librivox_search(query)
+    if results:
+        key = make_cache_key("abk", query, 0)
+        cache_set(key, results)
+        set_state(cid, mode="audiobook", last_query=query, cache_key=key)
+        _status(
+            cid,
+            f"🎧 *نتایج LibriVox:* _{query}_\nروی کتاب کلیک کنید:",
+            parse_mode="Markdown",
+            reply_markup=audiobook_results_kb(results, key), final=True,
+        )
+        return
+
+    rave = ravebook_search(query, cx=RAVEBOOK_AUDIO_CSE_CX)
+    if rave:
+        key = make_cache_key("rvbk", query, 0)
+        cache_set(key, rave)
+        set_state(cid, mode="ravebook", last_query=query, cache_key=key,
+                  ravebook_mode="audiobooks")
+        _status(
+            cid,
+            f"🎧 *نتایج کتاب صوتی:* _{query}_\n(لینک دانلود در سایت منبع است)",
+            parse_mode="Markdown",
+            reply_markup=ravebook_results_kb(rave, key), final=True,
+        )
+        return
+
+    _status(
+        cid,
+        "❌ کتاب صوتی یافت نشد. عنوان انگلیسی را امتحان کنید.",
+        reply_markup=home_kb(), final=True,
+    )
+
+
+def ravebook_results_kb(results: list, cache_key: str) -> dict:
+    """نتایج جستجوی Rave Book Search به‌صورت دکمه."""
+    rows = []
+    for i, r in enumerate(results):
+        name = r.get("name", f"نتیجه {i + 1}")[:52]
+        host = r.get("host", "")
+        label = f"📚 {name}"
+        if host:
+            label += f"  ({host})"
+        rows.append([{"text": label[:64], "callback_data": f"rvbk_item_{cache_key}_{i}"}])
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+    return {"inline_keyboard": rows}
+
+
+def do_ravebook_search(cid: int, query: str, mode: str = "ebooks"):
+    """Search Rave Book Search (Google CSE over verified book sites)."""
+    bump(cid, "searches")
+    _status(cid, f"⏳ در حال جستجو در Rave Book Search: _{query}_…", parse_mode="Markdown")
+    results = ravebook_search(query, mode)
+    if not results:
+        _status(
+            cid,
+            "❌ نتیجه‌ای یافت نشد. عنوان + نام نویسنده را دقیق‌تر امتحان کنید.",
+            reply_markup=home_kb(), final=True,
+        )
+        return
+    key = make_cache_key("rvbk", query, 0)
+    cache_set(key, results)
+    set_state(cid, mode="ravebook", last_query=query, cache_key=key)
+    send_message(
+        cid,
+        f"📚 *Rave Book Search:* _{query}_\nنتیجه را انتخاب کنید (لینک دانلود در سایت منبع):",
+        parse_mode="Markdown",
+        reply_markup=ravebook_results_kb(results, key),
+    )
+
+
 def do_book_search(cid: int, query: str, extensions: list = None):
-    """Search Library Genesis and show results as buttons."""
+    """Search Library Genesis → Anna's Archive → Rave Book Search chain."""
     bump(cid, "searches")
     _status(
-        cid, f"⏳ در حال جستجو در Library Genesis: _{query}_…", parse_mode="Markdown"
+        cid, f"⏳ در حال جستجوی کتاب: _{query}_…", parse_mode="Markdown"
     )
     chat_action(cid)
+
     results = libgen_search(query, count=10, extensions=extensions)
+    source_label = "Library Genesis"
+    if not results:
+        results = annas_archive_search(query, count=10, extensions=extensions)
+        if results:
+            source_label = "Anna's Archive"
+    if not results:
+        # Internet Archive: free + lending-enabled titles (no paid API)
+        results = archive_org_search(query, count=10)
+        if results:
+            source_label = "Internet Archive"
+    if not results:
+        # Rave CSE: link-based results over dozens of verified book sites
+        rave = ravebook_search(query)
+        if rave:
+            key = make_cache_key("rvbk", query, 0)
+            cache_set(key, rave)
+            set_state(cid, mode="ravebook", last_query=query, cache_key=key,
+                      ravebook_mode="ebooks")
+            _status(
+                cid,
+                f"📚 *نتایج Rave Book Search:* _{query}_\n"
+                "(لینک دانلود در سایت منبع است)",
+                parse_mode="Markdown",
+                reply_markup=ravebook_results_kb(rave, key), final=True,
+            )
+            return
+        results = libgen_search(query, count=10, extensions=None, _ol_fallback=True)
+        if results:
+            source_label = "Open Library"
 
     if not results:
         log.warning("do_book_search: no results for %r", query)
@@ -7717,10 +10793,75 @@ def do_book_search(cid: int, query: str, extensions: list = None):
     cache_set(key, results)
     set_state(cid, mode="book", last_query=query, cache_key=key, zlib_ext=extensions)
 
-    ext_str = f" [{', '.join(extensions)}]" if extensions else ""
-    text = f"📚 *نتایج Library Genesis{ext_str}:* _{query}_\nروی کتاب کلیک کنید:"
+    text = f"📚 *نتایج {source_label}:* _{query}_\nروی کتاب کلیک کنید:"
     kb = book_results_kb(results, key)
     send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
+
+
+def _librivox_files(identifier: str) -> list[dict]:
+    """List audio files of a LibriVox item via archive.org metadata API."""
+    try:
+        r = requests.get(
+            f"https://archive.org/metadata/{identifier}",
+            headers={"User-Agent": UA_DESK}, timeout=20,
+        )
+        if r.status_code != 200:
+            return []
+        files = r.json().get("files", [])
+    except Exception as e:
+        log.warning("_librivox_files: %s", e)
+        return []
+    out = []
+    for f in files:
+        name = f.get("name", "")
+        if not name.lower().endswith((".mp3", ".m4b", ".ogg")):
+            continue
+        out.append({
+            "name": name,
+            "url": f"https://archive.org/download/{identifier}/{urllib.parse.quote(name)}",
+            "size": int(f.get("size") or 0),
+        })
+    out.sort(key=lambda f: f["name"])
+    return out
+
+
+def do_librivox_show(cid: int, item: dict, key: str, idx: int):
+    """کارن کتاب صوتی LibriVox: اطلاعات + لیست فایل‌های صوتی."""
+    ident = urllib.parse.urlparse(item["url"]).path.rstrip("/").split("/")[-1]
+    _status(cid, "⏳ در حال دریافت فهرست فایل‌های صوتی…")
+    files = _librivox_files(ident)
+    fname = (files[0]["name"] if files else "audiobook.mp3")
+    fkey = store_url(item["url"], chat_id=cid)
+    lines = [f"🎧 *{item['name'][:150]}*"]
+    if item.get("authors"):
+        lines.append(f"✍️ {', '.join(map(str, item['authors'][:2]))}")
+    lines.append(f"🌐 منبع: LibriVox (ملک عمومی)")
+    if files:
+        total_mb = sum(f["size"] for f in files) / 1e6
+        lines.append(f"🎵 {len(files)} فایل — مجموع {total_mb:.0f}MB")
+    else:
+        lines.append("⚠️ فایل صوتی یافت نشد.")
+    rows = []
+    if files:
+        # Store the file list so abk_dl can grab the chosen part
+        cache_set(f"abkf_{fkey}", files)
+        rows.append([{"text": "📥 دانلود کل کتاب (تکه اول)", "callback_data": f"abk_dl_{fkey}_0"}])
+        if len(files) > 1:
+            for j, f in enumerate(files[:8]):
+                short = f["name"].rsplit(".", 1)[0][-32:]
+                rows.append([{ "text": f"🎵 {short}",
+                               "callback_data": f"abk_dl_{fkey}_{j}"}])
+    rows.append([
+        {"text": "🌐 مشاهده در Archive.org", "url": item["url"]},
+        {"text": "🔙 نتایج", "callback_data": "abk_back"},
+    ])
+    rows.append([{"text": "🏠 خانه", "callback_data": "home"}])
+    send_message(
+        cid,
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup={"inline_keyboard": rows},
+    )
 
 
 def do_book_show_book(cid: int, book: dict):
@@ -7781,13 +10922,17 @@ def do_book_show_book(cid: int, book: dict):
         book_key = store_url(f"libgen:{md5}:{ext}", chat_id=cid)
         rows.append([{"text": "📥 دانلود", "callback_data": f"book_dl_{book_key}"}])
     elif ia_url:
+        ident = ia_url.rstrip("/").split("/")[-1]
         rows.append(
             [
                 {
                     "text": "📖 دانلود از Internet Archive",
-                    "callback_data": f"book_ia_{store_url(ia_url, chat_id=cid)}",
+                    "callback_data": f"book_iadl_{store_url(ident, chat_id=cid)}",
                 }
             ]
+        )
+        rows.append(
+            [{"text": "🌐 مشاهده در Internet Archive", "url": ia_url}]
         )
     else:
         lines.append("\n⚠️ فایل مستقیم در دسترس نیست.")
@@ -7950,10 +11095,14 @@ def _scholar_search(query: str, sess: requests.Session) -> list[dict]:
                         "url": it.get("URL", ""),
                     }
                 )
-            if results:
-                return results
+            for item in results:
+                item["sources"] = ["Crossref"]
+            crossref_results = results
+        else:
+            crossref_results = []
     except Exception as e:
         log.warning("_scholar_search CrossRef: %s", e)
+        crossref_results = []
 
     # Strategy 2: OpenAlex (new API, requires no auth)
     try:
@@ -7991,13 +11140,18 @@ def _scholar_search(query: str, sess: requests.Session) -> list[dict]:
                         "doi": doi,
                         "oa_url": oa_url,
                         "url": raw_doi or "",
+                        "sources": ["OpenAlex"],
                     }
                 )
-            return results
+            openalex_results = results
+        else:
+            openalex_results = []
     except Exception as e:
         log.warning("_scholar_search OpenAlex: %s", e)
+        openalex_results = []
 
-    # Strategy 3: Semantic Scholar (last resort — rate-limits aggressively at 429)
+    # Strategy 3: Semantic Scholar (best-effort — rate-limits aggressively at 429)
+    s2_results = []
     for attempt in range(2):
         try:
             r = sess.get(
@@ -8014,7 +11168,10 @@ def _scholar_search(query: str, sess: requests.Session) -> list[dict]:
                 "_scholar_search S2 attempt %d: HTTP %d", attempt + 1, r.status_code
             )
             if r.status_code == 200:
-                return _parse_s2(r.json().get("data", []))
+                s2_results = _parse_s2(r.json().get("data", []))
+                for item in s2_results:
+                    item["sources"] = ["Semantic Scholar"]
+                break
             if r.status_code == 429:
                 time.sleep(2)
                 continue
@@ -8023,7 +11180,23 @@ def _scholar_search(query: str, sess: requests.Session) -> list[dict]:
             log.warning("_scholar_search S2: %s", e)
             break
 
-    return []
+    merged = {}
+    for item in crossref_results + openalex_results + s2_results:
+        doi = _extract_doi(item.get("doi", "")).lower()
+        key = doi or re.sub(r"\W+", "", item.get("title", "").lower())
+        if not key:
+            continue
+        old = merged.get(key)
+        if old is None:
+            merged[key] = item
+            continue
+        old["sources"] = list(dict.fromkeys(old.get("sources", []) + item.get("sources", [])))
+        for field in ("title", "authors", "year", "oa_url", "url"):
+            if not old.get(field) and item.get(field):
+                old[field] = item[field]
+        if item.get("oa_url"):
+            old["oa_url"] = item["oa_url"]
+    return list(merged.values())[:16]
 
 
 def _scihub_download(
@@ -8390,6 +11563,21 @@ def _oa_pdf(doi: str, sess, on_step=None) -> Optional[tuple[bytes, str]]:
     return None
 
 
+def _paper_apa(paper: dict) -> str:
+    authors = ", ".join(paper.get("authors") or []) or "نویسنده نامشخص"
+    year = paper.get("year") or "بی‌تاریخ"
+    title = paper.get("title") or "عنوان نامشخص"
+    doi = paper.get("doi") or ""
+    return f"{authors} ({year}). {title}." + (f" https://doi.org/{doi}" if doi else "")
+
+
+def _paper_bibtex(paper: dict) -> str:
+    doi = paper.get("doi") or "paper"
+    key = re.sub(r"[^A-Za-z0-9]", "", doi)[-24:] or "paper"
+    fields = {"title": paper.get("title", ""), "author": " and ".join(paper.get("authors") or []), "year": paper.get("year", ""), "doi": doi}
+    return "@article{" + key + ",\n" + ",\n".join(f"  {name} = {{{value}}}" for name, value in fields.items() if value) + "\n}"
+
+
 def _do_paper_dl_doi(cid: int, doi: str, title: str = "", sess=None):
     """Download a paper by DOI with a LIVE progress message.
     Order: Open-Access sources -> Anna's SciDB -> Sci-Hub -> LibGen scimag."""
@@ -8507,6 +11695,593 @@ def do_apk_search(cid: int, query: str):
         reply_markup=kb, final=True)
 
 
+def do_movie_search(cid: int, query: str, page: int = 1):
+    """Search TMDb for movies/TV shows and show results with pagination."""
+    bump(cid, "searches")
+    _status(
+        cid, f"🔍 در حال جستجوی فیلم/سریال: _{query}_…", parse_mode="Markdown"
+    )
+    chat_action(cid)
+
+    import requests
+    tmdb_key = TMDB_API_KEY or os.getenv('TMDB_API_KEY', '')
+    if not tmdb_key:
+        _status(
+            cid,
+            "❌ کلید TMDb تنظیم نشده. در .env یا config.py مقدار `TMDB_API_KEY` را ست کنید.",
+            reply_markup=home_kb(), final=True)
+        return
+
+    try:
+        url = "https://api.themoviedb.org/3/search/multi"
+        params = {
+            "api_key": tmdb_key,
+            "query": query,
+            "language": "en-US",
+            "include_adult": "false",
+            "page": page
+        }
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        results = data.get("results", [])
+        total_pages = data.get("total_pages", 1)
+
+        filtered = [r for r in results if r.get("media_type") in ("movie", "tv")][:10]
+
+        if not filtered:
+            _status(
+                cid, "❌ نتیجه‌ای یافت نشد. عبارت دیگری امتحان کنید.",
+                reply_markup=home_kb(), final=True)
+            return
+
+        key = make_cache_key("movie", query, page)
+        cache_set(key, filtered)
+        set_state(cid, mode="movie", last_query=query, cache_key=key, page=page)
+
+        rows = []
+        for i, item in enumerate(filtered):
+            title = item.get("title") or item.get("name", "بدون نام")
+            media_type = "🎬" if item.get("media_type") == "movie" else "📺"
+            year = (item.get("release_date") or item.get("first_air_date") or "")[:4]
+            label = f"{media_type} {title}"
+            if year:
+                label += f" ({year})"
+            rows.append([{"text": label[:60], "callback_data": f"movie_item_{key}_{i}"}])
+
+        # Pagination buttons
+        if total_pages > 1:
+            nav = []
+            if page > 1:
+                nav.append({"text": "◀️ قبلی", "callback_data": f"movie_page_{key}_{page-1}"})
+            nav.append({"text": f"📄 {page}/{total_pages}", "callback_data": "noop"})
+            if page < total_pages:
+                nav.append({"text": "بعدی ▶️", "callback_data": f"movie_page_{key}_{page+1}"})
+            rows.append(nav)
+
+        rows.append([{"text": "🏠 خانه", "callback_data": "home"}])
+        kb = {"inline_keyboard": rows}
+
+        _status(
+            cid,
+            f"🎬 *نتایج جستجو:* _{query}_\nروی هر مورد کلیک کنید:",
+            parse_mode="Markdown",
+            reply_markup=kb, final=True)
+
+    except Exception as e:
+        log.error("do_movie_search: %s", e)
+        _status(cid, "❌ خطا در جستجو.", reply_markup=home_kb(), final=True)
+
+
+def tmdb_search(query: str, max_results: int = 8) -> list[dict]:
+    """Search TMDb for movies + TV. Returns list of dicts with id, type, name, year, poster, overview."""
+    if not TMDB_API_KEY:
+        return []
+    try:
+        r = requests.get("https://api.themoviedb.org/3/search/multi",
+                    params={"api_key": TMDB_API_KEY, "query": query, "include_adult": "false", "language": "fa-IR"},
+                    timeout=15)
+        if r.status_code != 200:
+            return []
+        out = []
+        for it in r.json().get("results", []):
+            mt = it.get("media_type")
+            if mt not in ("movie", "tv"):
+                continue
+            name = it.get("title") or it.get("name") or ""
+            date = it.get("release_date") or it.get("first_air_date") or ""
+            out.append({"id": it.get("id"), "type": mt, "name": name,
+                        "year": (date or "")[:4],
+                        "poster": f"https://image.tmdb.org/t/p/w500{it.get('poster_path')}" if it.get("poster_path") else "",
+                        "overview": it.get("overview", ""), "_source": "tmdb"})
+            if len(out) >= max_results:
+                break
+        return out
+    except Exception as e:
+        log.error("tmdb_search: %s", e)
+        return []
+
+
+def tmdb_details(item: dict) -> dict:
+    """Full details incl. cast, director/creator, genres, rating, runtime, imdb_id."""
+    if item.get("_source") != "tmdb" or not TMDB_API_KEY:
+        return item
+    kind = item.get("type", "movie")
+    try:
+        r = requests.get(f"https://api.themoviedb.org/3/{kind}/{item['id']}",
+                    params={"api_key": TMDB_API_KEY, "language": "fa-IR", "append_to_response": "credits,external_ids"},
+                    timeout=15)
+        if r.status_code != 200:
+            return item
+        j = r.json()
+        credits = j.get("credits", {})
+        cast = [c.get("name", "") for c in credits.get("cast", [])[:6] if c.get("name")]
+        crew = credits.get("crew", [])
+        if kind == "movie":
+            directors = [c["name"] for c in crew if c.get("job") == "Director"]
+        else:
+            directors = [c.get("name", "") for c in j.get("created_by", [])]
+        item.update({
+            "overview": j.get("overview", item.get("overview", "")),
+            "genres": [g["name"] for g in j.get("genres", [])],
+            "rating": j.get("vote_average", ""),
+            "runtime": j.get("runtime") or (j.get("episode_run_time") or [None])[0],
+            "seasons": j.get("number_of_seasons"),
+            "episodes": j.get("number_of_episodes"),
+            "cast": cast, "directors": [d for d in directors if d],
+            "tagline": j.get("tagline", ""),
+            "imdb_id": j.get("imdb_id") or j.get("external_ids", {}).get("imdb_id", ""),
+        })
+    except Exception as e:
+        log.debug("tmdb_details: %s", e)
+    return item
+
+
+def tmdb_season(tv_id: int, season_number: int) -> list[dict]:
+    """Episodes of one TV season (name, number, air_date, rating)."""
+    if not TMDB_API_KEY:
+        return []
+    try:
+        r = requests.get(f"https://api.themoviedb.org/3/tv/{tv_id}/season/{season_number}",
+                    params={"api_key": TMDB_API_KEY, "language": "fa-IR"}, timeout=15)
+        if r.status_code != 200:
+            return []
+        out = []
+        for ep in r.json().get("episodes", []):
+            out.append({"n": ep.get("episode_number"), "name": ep.get("name", ""),
+                        "air_date": ep.get("air_date", ""),
+                        "rating": ep.get("vote_average", "")})
+        return out
+    except Exception as e:
+        log.error("tmdb_season: %s", e)
+        return []
+
+
+def tmdb_watch_providers(kind: str, tmdb_id: int, region: str = "IR") -> dict:
+    """Streaming/rent/buy availability for a region via TMDb (JustWatch data)."""
+    if not TMDB_API_KEY:
+        return {}
+    try:
+        r = requests.get(f"https://api.themoviedb.org/3/{kind}/{tmdb_id}/watch/providers",
+                    params={"api_key": TMDB_API_KEY}, timeout=15)
+        if r.status_code != 200:
+            return {}
+        data = r.json().get("results", {}).get(region, {}) or {}
+        out = {"link": data.get("link", "")}
+        for k in ("flatrate", "rent", "buy"):
+            out[k] = [p.get("provider_name", "") for p in data.get(k, [])]
+        return out
+    except Exception as e:
+        log.error("tmdb_watch_providers: %s", e)
+        return {}
+
+
+def omdb_search(query: str, max_results: int = 8) -> list[dict]:
+    """OMDb fallback search (unofficial IMDb data). Requires OMDB_API_KEY."""
+    if not OMDB_API_KEY:
+        return []
+    try:
+        r = requests.get("https://www.omdbapi.com/",
+                    params={"apikey": OMDB_API_KEY, "s": query}, timeout=15)
+        out = []
+        for it in (r.json().get("Search", []) if r.status_code == 200 else []):
+            out.append({"id": it.get("imdbID"), "type": it.get("Type", "movie"),
+                        "name": it.get("Title", ""), "year": it.get("Year", ""),
+                        "poster": it.get("Poster", "") if it.get("Poster") != "N/A" else "",
+                        "overview": "", "_source": "omdb"})
+            if len(out) >= max_results:
+                break
+        return out
+    except Exception as e:
+        log.error("omdb_search: %s", e)
+        return []
+
+
+def omdb_details(item: dict) -> dict:
+    if item.get("_source") != "omdb" or not OMDB_API_KEY:
+        return item
+    try:
+        r = requests.get("https://www.omdbapi.com/",
+                    params={"apikey": OMDB_API_KEY, "i": item["id"], "plot": "full"}, timeout=15)
+        if r.status_code == 200:
+            j = r.json()
+            item.update({"overview": j.get("Plot", ""),
+                         "genres": [g.strip() for g in j.get("Genre", "").split(",") if g.strip()],
+                         "rating": j.get("imdbRating", ""),
+                         "cast": [c.strip() for c in j.get("Actors", "").split(",") if c.strip()],
+                         "directors": [d.strip() for d in j.get("Director", "").split(",") if d.strip() and d != "N/A"],
+                         "runtime": j.get("Runtime", "")})
+    except Exception as e:
+        log.debug("omdb_details: %s", e)
+    return item
+
+
+# DDL mirrors
+DDL_MOVIE_HOSTS = [h for h in os.getenv("DDL_MOVIE_HOSTS", "https://berlin.saymyname.website").split(",") if h]
+DDL_SERIES_HOSTS = [h for h in os.getenv("DDL_SERIES_HOSTS", "https://rio.ggusers.com,https://nairobi.saymyname.website").split(",") if h]
+VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".m4v")
+_Q_ORDER = {"2160p": 0, "1080p": 1, "720p": 2, "480p": 3, "": 9}
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def _guess_quality(s: str) -> str:
+    for q in ("2160p", "1080p", "720p", "480p"):
+        if q in (s or ""):
+            return q
+    return ""
+
+
+def _ep_match(nm: str, season: int, episode: int) -> bool:
+    nm2 = (nm or "").upper()
+    return bool(re.search(rf"S0*{int(season)}E0*{int(episode)}(?!\d)", nm2)
+                or re.search(rf"(?<![A-Z0-9])E0*{int(episode)}(?!\d)", nm2))
+
+
+def _ddl_list(url: str) -> list[dict]:
+    """Parse an open-directory (nginx/apache autoindex) page into entries."""
+    try:
+        r = WEB.get(url, headers={"User-Agent": UA_DESK}, timeout=20)
+        if r.status_code != 200:
+            return []
+        soup = BeautifulSoup(r.text, "html.parser")
+        base = url if url.endswith("/") else url + "/"
+        out = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("?") or href in ("../", "./", "/"):
+                continue
+            if href.startswith("http") and not href.startswith(base):
+                continue
+            full = urllib.parse.urljoin(base, href)
+            name = urllib.parse.unquote(href.rstrip("/")).split("/")[-1]
+            out.append({"name": name, "url": full, "is_dir": href.endswith("/")})
+        return out
+    except Exception as e:
+        log.debug("_ddl_list %s: %s", url, e)
+        return []
+
+
+def ddl_movie_links(name: str, year: str, imdb_id: str = "") -> list[dict]:
+    """Return direct download directory links for user to open with Iran IP."""
+    imdbnum = imdb_id.replace("tt", "") if imdb_id else ""
+    if not (year and imdbnum):
+        return []
+    out = []
+    for host in DDL_MOVIE_HOSTS:
+        base = f"{host}/Movies/{year}/{imdbnum}/"
+        out.append({"quality": "Direct", "name": f"{name} ({year})", "url": base})
+    return out
+
+
+def ddl_series_links(name: str, season: int, episode: int) -> list[dict]:
+    """Return direct download directory links for user to open with Iran IP."""
+    base_name = re.sub(r"^(the|a|an)\s+", "", (name or "").strip(), flags=re.I)
+    letter = (base_name[:1] or name[:1] or "0").upper()
+    ss = f"S{int(season):02d}"
+    out = []
+    for host in DDL_SERIES_HOSTS:
+        show_dir = f"{host}/Series/{letter}/{name}/"
+        season_dir = f"{show_dir}{ss}/"
+        out.append({"quality": "Direct", "name": f"{name} S{int(season):02d}E{int(episode):02d}", "url": season_dir})
+    return out
+
+
+def yts_torrents(query: str, imdb_id: str = "") -> list[dict]:
+    """Public YTS torrents for a movie (quality/size/seeds + magnet). Movies only."""
+    try:
+        r = requests.get("https://yts.mx/api/v2/list_movies.json",
+                    params={"query_term": imdb_id or query, "limit": 1}, timeout=15)
+        if r.status_code != 200:
+            return []
+        movies = r.json().get("data", {}).get("movies", []) or []
+        if not movies:
+            return []
+        m0 = movies[0]
+        trackers = ("&tr=udp://tracker.opentrackr.org:1337/announce"
+                    "&tr=udp://open.demonii.com:1337/announce"
+                    "&tr=udp://tracker.openbittorrent.com:80")
+        out = []
+        for t in m0.get("torrents", []):
+            magnet = (f"magnet:?xt=urn:btih:{t.get('hash')}"
+                      f"&dn={urllib.parse.quote(m0.get('title', ''))}" + trackers)
+            out.append({"quality": t.get("quality", ""), "type": t.get("type", ""),
+                        "size": t.get("size", ""), "seeds": t.get("seeds", 0),
+                        "magnet": magnet})
+        return out
+    except Exception as e:
+        log.error("yts_torrents: %s", e)
+        return []
+
+
+def subtitles_fa(imdb_id: str = "", query: str = "", season: int = None, episode: int = None) -> list[dict]:
+    """Search Persian subtitles. OpenSubtitles API (with key) -> subf2m scrape."""
+    out = []
+    if OPENSUBTITLES_API_KEY:
+        try:
+            params = {"languages": "fa"}
+            if imdb_id:
+                params["imdb_id"] = imdb_id.replace("tt", "")
+            elif query:
+                params["query"] = query
+            if season is not None:
+                params["season_number"] = season
+            if episode is not None:
+                params["episode_number"] = episode
+            r = requests.get("https://api.opensubtitles.com/api/v1/subtitles", params=params,
+                        headers={"Api-Key": OPENSUBTITLES_API_KEY,
+                                 "User-Agent": "BaleBot v3.0", "Accept": "application/json"},
+                        timeout=15)
+            if r.status_code == 200:
+                data = sorted(r.json().get("data", []),
+                              key=lambda d: d.get("attributes", {}).get("download_count", 0),
+                              reverse=True)
+                for d in data[:8]:
+                    at = d.get("attributes", {})
+                    files = at.get("files", [])
+                    if not files:
+                        continue
+                    out.append({"name": at.get("release") or query or "subtitle",
+                                "file_id": files[0].get("file_id"),
+                                "downloads": at.get("download_count", 0),
+                                "_source": "opensubtitles"})
+                if out:
+                    return out
+        except Exception as e:
+            log.error("subtitles_fa opensubtitles: %s", e)
+    # subf2m.co fallback
+    if query:
+        try:
+            s = WEB.get("https://subf2m.co/subtitles/searchbytitle",
+                        params={"query": query}, headers={"User-Agent": UA_DESK}, timeout=20)
+            m = re.search(r'href="(/subtitles/[^"]+)"', s.text)
+            if m:
+                fa_url = f"https://subf2m.co{m.group(1)}/farsi_persian"
+                lp = WEB.get(fa_url, headers={"User-Agent": UA_DESK}, timeout=20)
+                for mm in re.finditer(r'href="(/subtitles/[^"]+?)"', lp.text):
+                    href = mm.group(1)
+                    if href.count("/") < 3:
+                        continue
+                    out.append({"name": href.split("/")[-1][:60],
+                                "page": f"https://subf2m.co{href}", "_source": "subf2m"})
+                    if len(out) >= 8:
+                        break
+        except Exception as e:
+            log.error("subtitles_fa subf2m: %s", e)
+    return out
+
+
+def subtitle_download(entry: dict):
+    """Fetch the actual .srt/.zip for a subtitle search entry. Returns (bytes, filename) or None."""
+    src = entry.get("_source")
+    try:
+        if src == "opensubtitles" and OPENSUBTITLES_API_KEY:
+            r = requests.post("https://api.opensubtitles.com/api/v1/download",
+                         json={"file_id": entry["file_id"]},
+                         headers={"Api-Key": OPENSUBTITLES_API_KEY, "User-Agent": "BaleBot v3.0",
+                                  "Content-Type": "application/json", "Accept": "application/json"},
+                         timeout=20)
+            if r.status_code == 200:
+                j = r.json()
+                link, fn = j.get("link", ""), j.get("file_name", "subtitle.srt")
+                if link:
+                    sr = WEB.get(link, timeout=60)
+                    if sr.status_code == 200 and len(sr.content) > 50:
+                        if not fn.lower().endswith((".srt", ".ass", ".vtt")):
+                            fn += ".srt"
+                        return sr.content, fn
+        elif src == "subf2m":
+            pg = WEB.get(entry["page"], headers={"User-Agent": UA_DESK}, timeout=20)
+            dm = (re.search(r'href="([^"]*/download[^"]*)"', pg.text)
+                  or re.search(r'href="([^"]+?\.zip)"', pg.text))
+            if dm:
+                durl = dm.group(1)
+                if not durl.startswith("http"):
+                    durl = f"https://subf2m.co{durl}"
+                dr = WEB.get(durl, headers={"User-Agent": UA_DESK, "Referer": entry["page"]}, timeout=60)
+                if dr.status_code == 200 and len(dr.content) > 100:
+                    if dr.content[:2] == b"PK":
+                        try:
+                            zf = zipfile.ZipFile(io.BytesIO(dr.content))
+                            for nm in zf.namelist():
+                                if nm.lower().endswith((".srt", ".ass")):
+                                    return zf.read(nm), nm.split("/")[-1]
+                        except Exception:
+                            pass
+                    return dr.content, "subtitle_fa.srt"
+    except Exception as e:
+        log.error("subtitle_download: %s", e)
+    return None
+
+
+def _send_ddl_links(cid: int, title: str, links: list[dict]):
+    """Send direct links as plain text (URL-safe) + url inline buttons."""
+    if not links:
+        send_message(cid, "❌ لینک مستقیم یافت نشد.")
+        return
+    lines = [f"⬇️ لینک مستقیم: {title}", ""]
+    btns = []
+    for l in links[:8]:
+        q = l.get("quality") or "?"
+        lines.append(f"• {q} — {l['name']}")
+        lines.append(l["url"])
+        lines.append("")
+        btns.append([{"text": f"⬇️ {q}", "url": l["url"]}])
+    send_message(cid, "\n".join(lines)[:4096],
+                 reply_markup={"inline_keyboard": btns} if btns else None)
+
+
+def movie_detail_kb(item: dict, cache_key: str, idx: int) -> dict:
+    rows = []
+    if item.get("type") == "tv" and item.get("seasons"):
+        srow = []
+        for s in range(1, int(item["seasons"]) + 1):
+            srow.append({"text": f"فصل {s}", "callback_data": f"movie_season_{cache_key}_{idx}_{s}"})
+            if len(srow) == 4:
+                rows.append(srow); srow = []
+            if s >= 20:
+                break
+        if srow:
+            rows.append(srow)
+    rows.append([{"text": "📝 زیرنویس فارسی", "callback_data": f"movie_subs_{cache_key}_{idx}"},
+                 {"text": "🎟 پخش/دانلود", "callback_data": f"movie_watch_{cache_key}_{idx}"}])
+    rows.append([{"text": "🏠 خانه", "callback_data": "home"}])
+    return {"inline_keyboard": rows}
+
+
+def do_movie_show(cid: int, item: dict, cache_key: str = "", idx: int = 0):
+    """Show detailed info for a movie/TV show from TMDb/OMDb."""
+    item = tmdb_details(item) if item.get("_source") == "tmdb" else omdb_details(item)
+    if item.get("poster"):
+        try:
+            img = download_bytes(item["poster"], MAX_IMAGE_SIZE)
+            if img and len(img) > 500:
+                send_photo(cid, img, caption=item.get("name", "")[:80])
+        except Exception as e:
+            log.debug("movie poster: %s", e)
+    icon = "🎬" if item.get("type") == "movie" else "📺"
+    lines = [f"{icon} *{item.get('name','')}* ({item.get('year','')})"]
+    if item.get("tagline"):
+        lines.append(f"_{item['tagline']}_")
+    if item.get("genres"):
+        lines.append(f"🏷 {', '.join(item['genres'])}")
+    if item.get("rating"):
+        lines.append(f"⭐ {item['rating']}")
+    if item.get("runtime"):
+        lines.append(f"⏱ {item['runtime']} min")
+    if item.get("seasons"):
+        lines.append(f"📺 {item['seasons']} فصل / {item.get('episodes','?')} قسمت")
+    if item.get("directors"):
+        lbl = "🎥 کارگردان" if item.get("type") == "movie" else "🎥 سازنده"
+        lines.append(f"{lbl}: {', '.join(item['directors'])}")
+    if item.get("cast"):
+        lines.append(f"👤 بازیگران: {', '.join(item['cast'])}")
+    if item.get("overview"):
+        lines.append(f"\n📝 {item['overview'][:600]}")
+    send_message(cid, "\n".join(lines), parse_mode="Markdown",
+                 reply_markup=movie_detail_kb(item, cache_key, idx))
+
+
+def do_movie_season(cid: int, item: dict, season: int, cache_key: str = "", idx: int = 0):
+    eps = tmdb_season(item.get("id"), season)
+    if not eps:
+        send_message(cid, "❌ اطلاعات فصل در دسترس نیست.", reply_markup=home_kb())
+        return
+    lines = [f"📺 {item.get('name','')} — فصل {season}", ""]
+    for ep in eps:
+        star = f" ⭐{ep['rating']}" if ep.get("rating") else ""
+        ad = f" ({ep['air_date']})" if ep.get("air_date") else ""
+        lines.append(f"{ep['n']}. {ep['name']}{ad}{star}")
+    rows, srow = [], []
+    for ep in eps:
+        srow.append({"text": str(ep["n"]),
+                     "callback_data": f"movie_ep_{cache_key}_{idx}_{season}_{ep['n']}"})
+        if len(srow) == 5:
+            rows.append(srow); srow = []
+    if srow:
+        rows.append(srow)
+    rows.append([{"text": "📝 زیرنویس فارسی فصل", "callback_data": f"movie_subsn_{cache_key}_{idx}_{season}"}])
+    rows.append([{"text": "🔙 برگشت", "callback_data": f"movie_item_{cache_key}_{idx}"},
+                 {"text": "🏠 خانه", "callback_data": "home"}])
+    send_message(cid, "\n".join(lines)[:4096], reply_markup={"inline_keyboard": rows})
+
+
+def do_movie_episode(cid: int, item: dict, season: int, episode: int,
+                     cache_key: str = "", idx: int = 0):
+    item = tmdb_details(item) if item.get("_source") == "tmdb" else omdb_details(item)
+    send_message(cid, f"⏳ یافتن لینک S{int(season):02d}E{int(episode):02d}…")
+    chat_action(cid)
+    links = ddl_series_links(item.get("name", ""), season, episode)
+    _send_ddl_links(cid, f"{item.get('name','')} S{int(season):02d}E{int(episode):02d}", links)
+    rows = [[{"text": "📝 زیرنویس فارسی این قسمت",
+              "callback_data": f"movie_subse_{cache_key}_{idx}_{season}_{episode}"}],
+            [{"text": "🔙 برگشت", "callback_data": f"movie_season_{cache_key}_{idx}_{season}"},
+             {"text": "🏠 خانه", "callback_data": "home"}]]
+    send_message(cid, "⚙️ گزینه‌ها:", reply_markup={"inline_keyboard": rows})
+
+
+def do_movie_watch(cid: int, item: dict):
+    item = tmdb_details(item) if item.get("_source") == "tmdb" else omdb_details(item)
+    kind = "tv" if item.get("type") == "tv" else "movie"
+    lines = [f"🎟 {item.get('name','')}"]
+    prov = {}
+    if item.get("_source") == "tmdb":
+        prov = tmdb_watch_providers(kind, item.get("id"), region="IR")
+        if not (prov.get("flatrate") or prov.get("rent") or prov.get("buy")):
+            prov = tmdb_watch_providers(kind, item.get("id"), region="US")
+    if prov.get("flatrate"):
+        lines.append(f"📡 استریم: {', '.join(prov['flatrate'])}")
+    if prov.get("rent"):
+        lines.append(f"💵 اجاره: {', '.join(prov['rent'])}")
+    if prov.get("buy"):
+        lines.append(f"🛒 خرید: {', '.join(prov['buy'])}")
+    if prov.get("link"):
+        lines.append(f"🔗 {prov['link']}")
+    send_message(cid, "\n".join(lines)[:4096], reply_markup=home_kb())
+
+    if kind == "movie":
+        # Direct download mirrors
+        links = ddl_movie_links(item.get("name", ""), item.get("year", ""), item.get("imdb_id", ""))
+        _send_ddl_links(cid, f"{item.get('name','')} ({item.get('year','')})", links)
+
+        # YTS Torrents
+        yts = yts_torrents(item.get("name", ""), item.get("imdb_id", ""))
+        if yts:
+            yts_lines = [f"🧲 *تورنت‌ها (YTS):*"]
+            for t in yts[:5]:
+                yts_lines.append(f"• {t['quality']} {t['type']} — {t['size']} — {t['seeds']} seeders")
+            send_message(cid, "\n".join(yts_lines), parse_mode="Markdown")
+            # Send magnet links as buttons
+            rows = [[{"text": f"🧲 {t['quality']} {t['size']}", "url": t['magnet']}] for t in yts[:5]]
+            send_message(cid, "مگنت لینک‌ها:", reply_markup={"inline_keyboard": rows})
+
+
+def do_movie_subs(cid: int, item: dict, season=None, episode=None):
+    item = tmdb_details(item) if item.get("_source") == "tmdb" else omdb_details(item)
+    send_message(cid, "⏳ در حال جستجوی زیرنویس فارسی…")
+    chat_action(cid, "upload_document")
+    subs = subtitles_fa(imdb_id=item.get("imdb_id", ""), query=item.get("name", ""),
+                        season=season, episode=episode)
+    if not subs:
+            send_message(cid, "❌ زیرنویس فارسی یافت نشد.", reply_markup=home_kb())
+            return
+    # Show subtitle options as buttons
+    rows = []
+    for i, entry in enumerate(subs[:8]):
+        src = entry.get("_source", "?")
+        name = entry.get("name", "subtitle")[:50]
+        dl = entry.get("downloads", 0)
+        rows.append([{"text": f"{src}: {name} ({dl}↓)", "callback_data": f"sub_dl_{i}"}])
+    rows.append([{"text": "🏠 خانه", "callback_data": "home"}])
+    # Cache subs for callback
+    key = make_cache_key("subs", item.get("imdb_id", "") or item.get("name", ""), 0)
+    cache_set(key, subs)
+    set_state(cid, subtitle_cache_key=key)
+    send_message(cid, "زیرنویس‌های یافت شده (روی یکی کلیک کنید):", reply_markup={"inline_keyboard": rows})
+
+
 def do_apk_show(cid: int, app: dict):
     """Show full app info with icon, then download button."""
     app_id = app.get("app_id", "")
@@ -8565,40 +12340,55 @@ def do_apk_download(cid: int, app_id: str):
     info = gplay_app_info(app_id)
     name = info.get("title", app_id) if info else app_id
     size = info.get("size", "") if info else ""
-    size_hint = f" (~{size})" if size else ""
+    size_hint = f" (~{size})" if info and size else ""
+
+    # Paid-app early exit — free mirrors never have paid apps
+    if info and info.get("free") is False:
+        _status(
+            cid,
+            f"💰 *{name}* اپ پولی است.\n"
+            "منابع رایگان (APKPure/Aptoide/F-Droid) اپ‌های پولی را ارائه نمی‌دهند.",
+            parse_mode="Markdown",
+            reply_markup=home_kb(), final=True,
+        )
+        clear_state(cid)
+        return
 
     _status(
         cid,
         f"⏳ در حال دانلود APK: *{name}*{size_hint}\n"
         f"`{app_id}`\n\n"
-        "در حال امتحان منابع مختلف (APKPure → APKMirror → F-Droid)…",
+        "در حال امتحان منابع: APKPure ← apkcombo ← Aptoide ← F-Droid…",
         parse_mode="Markdown",
     )
     chat_action(cid, "upload_document")
 
-    result = apk_download(app_id)
-    if not result:
+    data, fname, attempts = apk_download(app_id, info=info)
+    if not data:
+        # Plain text (no parse_mode): raw source-attempt strings contain
+        # chars that break Markdown entity parsing → editMessageText 400 →
+        # the status bubble spins forever (the "hang" report, 2026-09-13).
+        tries = translate_apk_attempts(attempts)
         _status(
             cid,
             "❌ دانلود APK ناموفق بود.\n\n"
-            "دلایل احتمالی:\n"
-            "• اپ در میرورهای رایگان موجود نیست\n"
-            "• اپ نیاز به دستگاه یا منطقه خاص دارد\n"
-            "• اپ پولی است (فقط اپ‌های رایگان پشتیبانی می‌شوند)\n\n"
-            f"دانلود دستی: https://apkpure.com/{app_id}/{app_id}",
-            parse_mode="Markdown",
+            f"نتایج منابع:\n{tries}\n\n"
+            "دلایل احتمالی: اپ منطقه‌قفل است یا در میرورهای رایگان نیست.\n"
+            f"دانلود دستی: https://apkpure.net/search?q={urllib.parse.quote(app_id)}",
             reply_markup=home_kb(), final=True)
         return
 
-    data, fname = result
     size_mb = len(data) / 1024 / 1024
     log.info("APK: sending %s %.1fMB", fname, size_mb)
-
+    note = (
+        "\n\n⚠️ *نکته:* این فایل XAPK است — با اپ APKPure Installer نصب شود."
+        if fname.endswith(".xapk")
+        else "\n\n⚠️ *نکته:* گزینه «نصب از منابع ناشناس» را در تنظیمات اندروید فعال کنید."
+    )
     if smart_send(cid, data, fname, caption=f"📱 {name} — {fname}"):
         _status(
             cid,
-            f"✅ APK ارسال شد! ({size_mb:.1f}MB)\n\n"
-            "⚠️ *نکته:* گزینه «نصب از منابع ناشناس» را در تنظیمات اندروید فعال کنید.",
+            f"✅ APK ارسال شد! ({size_mb:.1f}MB){note}",
             parse_mode="Markdown",
             reply_markup=home_kb(), final=True)
     else:
@@ -8624,7 +12414,7 @@ def do_rss(cid: int, query: str):
                     [
                         {
                             "text": f"📰 {f[:50]}",
-                            "callback_data": f"rss_url_{store_url(f)}",
+                            "callback_data": f"rss_url_{store_url(f, chat_id=cid)}",
                         }
                     ]
                     for f in feeds[:5]
@@ -8648,9 +12438,9 @@ def do_rss(cid: int, query: str):
                 "آدرس فید RSS را مستقیم وارد کنید (مثال: https://example.com/rss)",
                 reply_markup=home_kb(), final=True)
             return
-        key = make_cache_key("rss", query, 0)
-        cache_set(key, items)
-        store_url(query)
+        key = _rss_cache_key(cid, query, 0)
+        cache_set_owned(key, items, _platform(), cid)
+        store_url(query, chat_id=cid)
         set_state(cid, mode="rss", last_query=query, cache_key=key)
         _display_rss_list(cid, items, key)
     else:
@@ -8667,19 +12457,32 @@ def do_rss(cid: int, query: str):
         )
 
 
-def _display_rss_list(cid: int, items: list, key: str):
-    """Show RSS items as clickable buttons."""
+def _display_rss_list(cid: int, items: list, key: str, page: int = 0, send: bool = True):
+    """Show a bounded RSS page; no more than seven rows are sent."""
+    page_size = 5
+    page = max(0, min(int(page), max(0, (len(items) - 1) // page_size)))
+    start = page * page_size
+    visible = items[start:start + page_size]
     rows = []
-    for i, item in enumerate(items[:15]):
-        title = item.get("title", f"خبر {i + 1}")[:45]
-        rows.append([{"text": f"📰 {title}", "callback_data": f"rss_item_{key}_{i}"}])
+    for offset, item in enumerate(visible):
+        title = str(item.get("title") or f"خبر {start + offset + 1}").replace("\n", " ")[:45]
+        rows.append([{"text": f"📰 {title}", "callback_data": f"rss_item_{key}_{start + offset}"}])
+    nav = []
+    if page > 0:
+        nav.append({"text": "◀️ قبلی", "callback_data": f"rss_page_{key}_{page - 1}"})
+    if start + page_size < len(items):
+        nav.append({"text": "بعدی ▶️", "callback_data": f"rss_page_{key}_{page + 1}"})
+    if nav:
+        rows.append(nav)
     rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
-    send_message(
-        cid,
-        f"📰 *{len(items)} خبر دریافت شد:*\nروی هر خبر کلیک کنید:",
-        parse_mode="Markdown",
-        reply_markup={"inline_keyboard": rows},
-    )
+    keyboard = {"inline_keyboard": rows}
+    if send:
+        send_message(
+            cid,
+            f"📰 *صفحه {page + 1} از {max(1, (len(items) + page_size - 1) // page_size)} خبر:*\nروی هر خبر کلیک کنید:",
+            parse_mode="Markdown", reply_markup=keyboard,
+        )
+    return keyboard
 
 
 def _show_rss_item(cid: int, item: dict):
@@ -8708,7 +12511,7 @@ def _show_rss_item(cid: int, item: dict):
             log.warning("rss img: %s", e)
 
     text = "\n".join(l for l in lines if l)
-    url_key = store_url(link) if link else ""
+    url_key = store_url(link, chat_id=cid) if link else ""
     kb = site_view_kb(url_key) if url_key else home_kb()
     send_message(
         cid, text or "_(خبر بدون متن)_", parse_mode="Markdown", reply_markup=kb
@@ -8884,10 +12687,154 @@ def do_twitter_show(cid: int, tweet: dict):
 
     # Show video download button if has video
     kb = social_post_kb(url, "tw", has_vid) if url else home_kb()
+    if url:
+        tw_kb = {"inline_keyboard": [[{"text": "🧵 خواندن رشته", "callback_data": f"tw_unroll_{url[:50]}"}]]}
+        tw_kb["inline_keyboard"] += kb["inline_keyboard"]
+        kb = tw_kb
     if has_vid or not img_urls:
         send_message(cid, "📥 دانلود ویدیو؟", reply_markup=kb)
     else:
         _status(cid, "✅", reply_markup=home_kb(), final=True)
+
+
+def twitter_thread_fetch(tweet_url: str, max_posts: int = 60) -> Optional[list[dict]]:
+    """Fetch a Twitter/X self-thread as an ordered list of posts.
+
+    Primary: FxTwitter /2/thread/{id} — one call returns the unrolled thread
+    (works from any member tweet, self-replies only, public accounts).
+    Fallback: backward walk of replying_to_status via /i/status/.
+    Returns [{id, author, text, created_at, likes, retweets, views, url}] or None.
+    """
+    tweet_url = tweet_url.replace("x.com/", "twitter.com/").split("?")[0]
+    m = re.search(r"twitter\.com/([^/]+)/status/(\d+)", tweet_url)
+    if not m:
+        return None
+    username, tweet_id = m.group(1), m.group(2)
+    headers = {"User-Agent": UA_DESK}
+    log.info("twitter_thread_fetch: %s/%s", username, tweet_id)
+
+    posts: list[dict] = []
+    try:
+        r = WEB.get(
+            f"https://api.fxtwitter.com/2/thread/{tweet_id}",
+            headers=headers, timeout=20,
+        )
+        if r.status_code == 200:
+            thread = r.json().get("thread") or []
+            for tw in thread:
+                posts.append({
+                    "id": tw.get("id") or "",
+                    "author": (tw.get("author") or {}).get("screen_name") or username,
+                    "text": (tw.get("text") or tw.get("raw_text") or "").strip(),
+                    "created_at": tw.get("created_at") or "",
+                    "likes": tw.get("likes") or 0,
+                    "retweets": tw.get("retweets") or 0,
+                    "views": tw.get("views") or 0,
+                    "url": tw.get("url") or f"https://x.com/{username}/status/{tw.get('id', '')}",
+                })
+        elif r.status_code == 404:
+            log.warning("twitter_thread_fetch: fxtwitter 404 for %s", tweet_id)
+    except Exception as e:
+        log.warning("twitter_thread_fetch fxtwitter: %s", e)
+
+    if not posts:
+        # Backward walk (child → parent) via /i/status/
+        chain: list[dict] = []
+        cur = tweet_id
+        for _ in range(max_posts):
+            try:
+                rr = WEB.get(
+                    f"https://api.fxtwitter.com/i/status/{cur}",
+                    headers=headers, timeout=15,
+                )
+            except Exception as e:
+                log.warning("twitter_thread_fetch walk: %s", e)
+                break
+            if rr.status_code != 200:
+                break
+            tw = rr.json().get("tweet") or {}
+            chain.append({
+                "id": tw.get("id") or cur,
+                "author": (tw.get("author") or {}).get("screen_name") or username,
+                "text": (tw.get("text") or tw.get("raw_text") or "").strip(),
+                "created_at": tw.get("created_at") or "",
+                "likes": tw.get("likes") or 0,
+                "retweets": tw.get("retweets") or 0,
+                "views": tw.get("views") or 0,
+                "url": tw.get("url") or f"https://x.com/{username}/status/{cur}",
+            })
+            nxt = tw.get("replying_to_status")
+            if not nxt:
+                break
+            cur = str(nxt)
+            time.sleep(1.5)  # be polite to fxtwitter
+        posts = list(reversed(chain))
+
+    if not posts:
+        return None
+    return posts[:max_posts]
+
+
+def twitter_thread_render(posts: list[dict]) -> str:
+    """Render a thread as one continuous numbered text (twitter-thread.com style)."""
+    author = posts[0].get("author") or "unknown"
+    total = len(posts)
+    views = sum(p.get("views") or 0 for p in posts)
+    parts = [
+        f"🧵 رشته‌توییت @{author} — {total} پست"
+        + (f" · {views:,} بازدید" if views else "")
+    ]
+    for i, post in enumerate(posts, 1):
+        num = f"{i}/{total}"
+        body = (post.get("text") or "").strip()
+        stats = []
+        if post.get("likes"):
+            stats.append(f"❤️ {post['likes']:,}")
+        if post.get("retweets"):
+            stats.append(f"🔁 {post['retweets']:,}")
+        stat_line = ("\n" + " · ".join(stats)) if stats else ""
+        parts.append(f"{num} — {body}{stat_line}")
+    return "\n\n".join(parts)
+
+
+def do_twitter_thread(cid: int, url: str):
+    """دانلود ترید توییتر به صورت یک متن پیوسته."""
+    bump(cid, "searches")
+    _status(cid, "⏳ در حال دریافت رشته‌توییت…")
+    chat_action(cid)
+    posts = twitter_thread_fetch(url)
+    if not posts:
+        _status(
+            cid,
+            "❌ رشته‌توییت دریافت نشد.\n"
+            "• توییت باید عمومی باشد — حساب خصوصی پشتیبانی نمی‌شود\n"
+            "• توییت‌های قدیمی‌تر از چند ماه از سمت ایکس در دسترس نیستند\n"
+            "• لینک هر پست از رشته (اول، وسط یا آخر) کافی است",
+            reply_markup=home_kb(), final=True)
+        return
+    set_state(cid, mode="twitter", last_query=url)  # keep cancel flow consistent
+    author = posts[0].get("author") or "unknown"
+    rendered = twitter_thread_render(posts)
+    # Chunk at 4096 chars, break on paragraph boundary where possible
+    chunks = []
+    while rendered:
+        if len(rendered) <= 4096:
+            chunks.append(rendered)
+            break
+        cut = rendered.rfind("\n\n", 1000, 4090)
+        if cut < 0:
+            cut = rendered.rfind("\n", 1000, 4090)
+        if cut < 0:
+            cut = 4000
+        chunks.append(rendered[:cut])
+        rendered = rendered[cut:].lstrip("\n")
+    for i, chunk in enumerate(chunks):
+        final = (i == len(chunks) - 1)
+        send_message(
+            cid, chunk,
+            reply_markup=home_kb() if final else None,
+        )
+    log.info("do_twitter_thread: %s — %d posts in %d messages", author, len(posts), len(chunks))
 
 
 def _fetch_tweet_data(tweet_url: str) -> dict:
@@ -9316,7 +13263,10 @@ def do_twitter_dl(cid: int, url: str, _tw_data_override: dict = None):
         if not card_bytes:
             _status(
                 cid,
-                "❌ این توییت رسانه‌ای ندارد یا دانلود ناموفق بود.",
+                "❌ رسانه‌ای از این توییت دریافت نشد.\n"
+                "• توییت ممکن است رسانه نداشته باشد یا حذف شده باشد\n"
+                "• حساب ممکن است خصوصی باشد\n"
+                "• برای متن کامل توییت، دکمهٔ «🧵 خواندن رشته» را امتحان کنید",
                 reply_markup=home_kb(), final=True)
         else:
             if caption:
@@ -9361,6 +13311,142 @@ def do_twitter_dl(cid: int, url: str, _tw_data_override: dict = None):
         send_message(cid, caption[:4096])
 
     _status(cid, "✅ ارسال شد.", reply_markup=home_kb(), final=True)
+    clear_state(cid)
+
+
+def instagram_story_download(username: str) -> list[dict]:
+    """Download a public Instagram profile's active stories (no login).
+
+    Anonymous Instagram API endpoints are 429-walled for datacenter IPs, so
+    this uses the storiesig.info viewer through headless Chromium: submit the
+    username, harvest media proxy URLs from the rendered page, fetch them via
+    the browser context (the proxy validates session cookies).
+    Returns list of {data, fname, is_video}.
+    """
+    log.info("instagram_story_download: @%s", username)
+    from playwright.sync_api import sync_playwright
+
+    username = username.strip().lstrip("@").split("/")[0]
+    items: list[dict] = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        try:
+            ctx = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            page = ctx.new_page()
+            page.goto("https://storiesig.info/", timeout=45000,
+                      wait_until="domcontentloaded")
+            page.wait_for_timeout(4000)
+            inp = page.query_selector(
+                "input[type='text'], input[name='q'], input[placeholder]"
+            )
+            if not inp:
+                log.warning("instagram_story_download: no input on storiesig")
+                return []
+            inp.fill(username)
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(12000)
+            html_text = page.content()
+            urls = [
+                u.replace("&amp;", "&")
+                for u in re.findall(
+                    r"https://media\.storiesig\.info/get\?[^\"']+", html_text
+                )
+            ]
+            # Dedupe by the proxied target (uri param) — the same media can
+            # appear with different proxy signatures; drop avatar-size noise.
+            seen: set[str] = set()
+            media_urls: list[str] = []
+            for u in urls:
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(u).query)
+                target = (qs.get("uri") or [u])[0]
+                if target in seen:
+                    continue
+                seen.add(target)
+                media_urls.append(u)
+            log.info("instagram_story_download: %d media urls", len(media_urls))
+            for u in media_urls:
+                try:
+                    r = page.request.get(u, timeout=45000, fail_on_status_code=False)
+                    if r.status != 200:
+                        continue
+                    body = r.body()
+                    if body[:2] == b"\xff\xd8" or body[:4] in (b"\x89PNG", b"RIFF"):
+                        if len(body) < 20000:  # avatar/thumb noise
+                            continue
+                        items.append({
+                            "data": body,
+                            "fname": f"{username}_story_{len(items) + 1}.jpg",
+                            "is_video": False,
+                        })
+                    elif body[4:8] in (b"ftyp", b"moov"):
+                        if len(body) < 50000:
+                            continue
+                        items.append({
+                            "data": body,
+                            "fname": f"{username}_story_{len(items) + 1}.mp4",
+                            "is_video": True,
+                        })
+                except Exception as e:
+                    log.warning("instagram_story_download item: %s", e)
+                if len(items) >= 15:
+                    break
+        finally:
+            browser.close()
+    log.info("instagram_story_download: %d items", len(items))
+    return items
+
+
+def do_instagram_story(cid: int, username: str):
+    """دانلود استوری‌های عمومی اینستاگرام."""
+    bump(cid, "downloads")
+    username = username.strip().lstrip("@").split("/")[0]
+    if not username:
+        _status(cid, "❌ نام کاربری نامعتبر است.", reply_markup=home_kb(), final=True)
+        return
+    _status(cid, f"⏳ در حال دریافت استوری‌های @{username}… (حدود ۳۰ ثانیه)")
+    chat_action(cid)
+    items = instagram_story_download(username)
+    if not items:
+        _status(
+            cid,
+            f"❌ استوری‌ای برای @{username} یافت نشد.\n"
+            "• اکانت باید عمومی باشد\n"
+            "• استوری فعال (۲۴ ساعت اخیر) باید موجود باشد",
+            reply_markup=home_kb(), final=True,
+        )
+        return
+    ok = 0
+    if len(items) > 1:
+        group = [
+            {"data": it["data"], "fname": it["fname"],
+             "is_video": it["is_video"], "caption": f"📸 استوری @{username}" if i == 0 else ""}
+            for i, it in enumerate(items[:10])
+        ]
+        if send_media_group(cid, group):
+            ok += len(group)
+        for it in items[10:]:
+            if smart_send(cid, it["data"], it["fname"], caption="",
+                          media_type="video" if it["is_video"] else "photo"):
+                ok += 1
+    else:
+        it = items[0]
+        if smart_send(cid, it["data"], it["fname"],
+                      caption=f"📸 استوری @{username}",
+                      media_type="video" if it["is_video"] else "photo"):
+            ok += 1
+    _status(cid, f"✅ {ok} استوری ارسال شد.", reply_markup=home_kb(), final=True)
     clear_state(cid)
 
 
@@ -9441,9 +13527,11 @@ def do_instagram_dl(cid: int, url: str):
     if not items:
         _status(
             cid,
-            "❌ دانلود ناموفق بود.\n"
-            "• پست باید عمومی باشد\n"
-            "• برای پست‌های خصوصی INSTAGRAM_USER/PASS را تنظیم کنید",
+            "❌ دانلود از اینستاگرام ناموفق بود.\n"
+            "• مطمئن شوید پست عمومی است (حساب خصوصی پشتیبانی نمی‌شود)\n"
+            "• پست‌های محدود سنی فقط با حساب تأییدشده قابل دریافت‌اند\n"
+            "• چند دقیقه بعد دوباره تلاش کنید — گاهی اینستاگرام موقتاً محدود می‌کند\n"
+            "• می‌توانید لینک پست دیگر را امتحان کنید",
             reply_markup=home_kb(), final=True)
         return
 
@@ -9463,6 +13551,7 @@ def do_instagram_dl(cid: int, url: str):
 
     BALE_CAPTION_LIMIT = 1024
 
+    all_ok = True
     if total == 1:
         # Single item — send with caption inline if it fits
         item = items[0]
@@ -9470,11 +13559,11 @@ def do_instagram_dl(cid: int, url: str):
         inline_cap = (
             caption[:BALE_CAPTION_LIMIT] if len(caption) <= BALE_CAPTION_LIMIT else ""
         )
-        smart_send(
+        all_ok = smart_send(
             cid, item["data"], item["fname"], caption=inline_cap, media_type=mtype
         )
         if caption and not inline_cap:
-            send_message(cid, caption[:4096])
+            all_ok = bool(send_message(cid, caption[:4096]).get("ok")) and all_ok
     else:
         # Multiple items — send as media group (album)
         # Caption on first item only, but only if short enough; otherwise separate msg
@@ -9493,19 +13582,21 @@ def do_instagram_dl(cid: int, url: str):
                     "caption": inline_cap,
                 }
             )
-        send_media_group(cid, group_items)
+        all_ok = send_media_group(cid, group_items)
 
         # If more than 10 items, send the rest individually
         for item in items[10:]:
             mtype = "video" if item.get("is_video") else "photo"
-            smart_send(cid, item["data"], item["fname"], caption="", media_type=mtype)
+            ok = smart_send(cid, item["data"], item["fname"], caption="", media_type=mtype)
+            all_ok = bool(ok) and all_ok
 
         # Send long caption as separate message
         if caption and len(caption) > BALE_CAPTION_LIMIT:
-            send_message(cid, caption[:4096])
+            all_ok = bool(send_message(cid, caption[:4096]).get("ok")) and all_ok
 
-    _status(cid, f"✅ {total} مورد ارسال شد.", reply_markup=home_kb(), final=True)
-    clear_state(cid)
+    _status(cid, f"✅ {total} مورد ارسال شد." if all_ok else "⚠️ ارسال کامل نشد. بعضی رسانه‌ها ارسال نشده‌اند.", reply_markup=home_kb(), final=True)
+    if all_ok:
+        clear_state(cid)
 
 
 def do_tiktok_user(cid: int, username: str):
@@ -9530,8 +13621,10 @@ def do_tiktok_user(cid: int, username: str):
     send_message(cid, f"🎵 @{username} — {len(videos)} ویدیو اخیر:", reply_markup=kb)
 
 
-def _fetch_tiktok_caption(url: str) -> str:
-    """Fetch TikTok video title/description via yt-dlp --dump-json."""
+def _fetch_tiktok_caption(url: str, tikwm_data=None) -> str:
+    """Reuse this operation's title, otherwise fetch via yt-dlp."""
+    if tikwm_data and tikwm_data.get("title"):
+        return str(tikwm_data["title"]).strip()[:2000]
     try:
         r = subprocess.run(
             [
@@ -9557,40 +13650,378 @@ def _fetch_tiktok_caption(url: str) -> str:
     return ""
 
 
+def _tiktok_music_dl(url: str) -> Optional[tuple[bytes, str]]:
+    """Fetch a TikTok post's sound (music) via the tikwm API.
+
+    Works for videos and photo posts alike — returns (mp3/m4a bytes, fname).
+    """
+    log.info("_tiktok_music_dl: %s", url)
+    try:
+        r = WEB.post(
+            "https://www.tikwm.com/api/",
+            data={"url": url, "hd": "1"},
+            headers={"User-Agent": UA_DESK},
+            timeout=30,
+        )
+        j = r.json()
+        d = j.get("data", {}) if j.get("code") == 0 else {}
+        music_url = d.get("music") or (d.get("music_info", {}) or {}).get("play", "")
+        if not music_url:
+            log.warning("_tiktok_music_dl: no music in tikwm response")
+            return None
+        title = (d.get("music_info", {}) or {}).get("title") or d.get("title") or "tiktok_sound"
+        title = re.sub(r"[^\w\s-]", "", title)[:48].strip() or "tiktok_sound"
+        mr = WEB.get(
+            music_url,
+            headers={"User-Agent": UA_DESK, "Referer": "https://www.tikwm.com/"},
+            timeout=60,
+        )
+        if mr.status_code == 200 and len(mr.content) > 5000:
+            ext = ".mp4" if mr.content[4:8] in (b"ftyp", b"moov") else ".mp3"
+            log.info("_tiktok_music_dl OK: %.0fKB", len(mr.content) / 1024)
+            return mr.content, f"{title}{ext}"
+        log.warning("_tiktok_music_dl: music fetch HTTP %s", mr.status_code)
+    except Exception as e:
+        log.warning("_tiktok_music_dl: %s", e)
+    return None
+
+
+def _photo_slideshow_video(image: bytes, audio: bytes, out_name: str) -> Optional[bytes]:
+    """Build a vertical slideshow MP4 (static image + music) via ffmpeg."""
+    import shutil as _sh
+
+    ffmpeg = _sh.which("ffmpeg") or "/usr/bin/ffmpeg"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            img = Path(tmp) / "img.jpg"
+            aud = Path(tmp) / "aud.m4a"
+            out = Path(tmp) / out_name
+            img.write_bytes(image)
+            aud.write_bytes(audio)
+            # -loop 1: repeat the still; -shortest: end with the music.
+            # 720x1280 @ 12fps: a still frame needs no more — keeps encode ~10s.
+            proc = subprocess.run(
+                [
+                    ffmpeg, "-y",
+                    "-loop", "1", "-framerate", "12", "-i", str(img),
+                    "-i", str(aud),
+                    "-c:v", "libx264", "-preset", "ultrafast",
+                    "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+                    "-r", "12",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-shortest", "-t", "180", "-movflags", "+faststart",
+                    str(out),
+                ],
+                capture_output=True,
+                timeout=180,
+            )
+            if proc.returncode == 0 and out.exists() and out.stat().st_size > 50000:
+                return out.read_bytes()
+            log.error("_photo_slideshow_video: rc=%d %s",
+                      proc.returncode, proc.stderr.decode(errors="replace")[-250:])
+    except Exception as e:
+        log.error("_photo_slideshow_video: %s", e)
+    return None
+
+
 @_heavy_download
 def do_tiktok_dl(cid: int, url: str):
-    """دانلود ویدیوی TikTok با کپشن کامل."""
+    """دانلود TikTok — ویدیو، پست عکس (با موزیک) یا صدا بر اساس نوع پست."""
     bump(cid, "downloads")
     _status(cid, "⏳ در حال دانلود از TikTok…")
     chat_action(cid, "upload_video")
-    result = tiktok_download(url)
+
+    # Keep metadata local: no negative cache, stale URLs, or cross-user reuse.
+    tikwm_data = _fetch_tikwm_data(url)
+    photo_data = _tiktok_is_photo_post(url, tikwm_data) if tikwm_data is not None else None
+
+    if photo_data:
+        images = photo_data["images"]
+        music_url = photo_data.get("music") or ""
+        caption = (photo_data.get("title") or "")[:1024]
+
+        music_bytes = download_bytes(music_url, headers={"Referer": "https://www.tikwm.com/"}) if music_url else None
+        all_ok = not music_url or bool(music_bytes)
+        music_in_video = False
+        if len(images) == 1:
+            image = download_bytes(images[0])
+            delivered = False
+            if image and music_bytes:
+                _status(cid, "🎬 در حال ساخت ویدیو از عکس و موزیک…")
+                vid = _photo_slideshow_video(image, music_bytes, "tiktok_photo.mp4")
+                if vid:
+                    delivered = smart_send(cid, vid, "tiktok_photo.mp4", caption=caption)
+                    music_in_video = bool(delivered)
+            if image and not delivered:
+                delivered = smart_send(cid, image, "tiktok_photo_1.jpg", caption=caption, media_type="photo")
+            all_ok = bool(delivered) and all_ok
+        else:
+            # Download and release one album at a time; never discard slides 11+.
+            for start in range(0, len(images), 10):
+                group_items = []
+                for i, img_url in enumerate(images[start:start + 10], start):
+                    image = download_bytes(img_url)
+                    if not image:
+                        all_ok = False
+                        continue
+                    group_items.append({"data": image, "fname": f"tiktok_photo_{i + 1}.jpg",
+                                        "is_video": False, "caption": caption if i == 0 else ""})
+                if len(group_items) == 1:
+                    item = group_items[0]
+                    ok = smart_send(cid, item["data"], item["fname"], caption=item["caption"], media_type="photo")
+                elif group_items:
+                    ok = send_media_group(cid, group_items)
+                else:
+                    ok = False
+                all_ok = bool(ok) and all_ok
+                group_items.clear()
+
+        if music_bytes and not music_in_video:
+            mname = re.sub(r"[^\w\s-]", "", photo_data.get("title") or "")[:48].strip() or "tiktok_sound"
+            ok = smart_send(cid, music_bytes, f"{mname}.mp3",
+                            caption="🎵 موزیک این پست", media_type="audio")
+            all_ok = bool(ok) and all_ok
+        _status(cid, "✅ ارسال شد." if all_ok else "⚠️ دریافت یا ارسال بعضی رسانه‌ها ناموفق بود. می‌توانید دوباره تلاش کنید.",
+                reply_markup=home_kb(), final=True)
+        if all_ok:
+            clear_state(cid)
+        return
+
+    # ── Normal video flow (audio-verified chain) ─────────────────────────
+    result = tiktok_download(url, tikwm_data) if tikwm_data is not None else tiktok_download(url)
     if not result:
-        _status(cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb(), final=True)
+        _status(cid,
+                "❌ دانلود از تیک‌تاک ناموفق بود.\n"
+                "• ویدیو ممکن است خصوصی یا حذف شده باشد\n"
+                "• سرویس موقتاً شلوغ است — کمی بعد تلاش کنید",
+                reply_markup=home_kb(), final=True)
         return
     data, fname = result
 
+    # Audio-only payload masquerading as a video = photo/sound post that
+    # slipped through; retry once via the photo-post path.
+    if _tiktok_has_audio_video_mismatch(data, fname):
+        api_photo = _tiktok_is_photo_post(url)
+        if api_photo:
+            images = api_photo.get("images") or []
+            music_url = api_photo.get("music") or ""
+            caption = (api_photo.get("title") or "")[:1024]
+            music_bytes = download_bytes(music_url, headers={"Referer": "https://www.tikwm.com/"}) if music_url else None
+            delivered = False
+            if len(images) == 1 and music_bytes:
+                image = download_bytes(images[0])
+                if image:
+                    _status(cid, "🎬 در حال ساخت ویدیو از عکس و موزیک…")
+                    vid = _photo_slideshow_video(image, music_bytes, "tiktok_photo.mp4")
+                    if vid:
+                        delivered = smart_send(cid, vid, "tiktok_photo.mp4", caption=caption)
+            elif len(images) == 1:
+                image = download_bytes(images[0])
+                if image:
+                    delivered = smart_send(cid, image, "tiktok_photo_1.jpg", caption=caption, media_type="photo")
+            if music_bytes and not delivered:
+                mname = re.sub(r"[^\w\s-]", "", api_photo.get("title") or "")[:48].strip() or "tiktok_sound"
+                delivered = smart_send(cid, music_bytes, f"{mname}.mp3",
+                                       caption="🎵 موزیک این پست", media_type="audio")
+            _status(cid, "✅ ارسال شد." if delivered else "⚠️ دریافت یا ارسال بعضی رسانه‌ها ناموفق بود.",
+                    reply_markup=home_kb(), final=True)
+            if delivered:
+                clear_state(cid)
+            return
+        log.warning("tiktok: mp3-in-mp4 payload but no photo data; sending as-is")
+
     # Caption: state (from timeline browse) → yt-dlp metadata fetch
-    caption = get_state(cid).get("last_caption", "") or _fetch_tiktok_caption(url)
+    caption = get_state(cid).get("last_caption", "") or (
+        _fetch_tiktok_caption(url, tikwm_data) if tikwm_data is not None else _fetch_tiktok_caption(url)
+    )
 
     BALE_CAPTION_LIMIT = 1024
     inline_cap = (
         caption[:BALE_CAPTION_LIMIT] if len(caption) <= BALE_CAPTION_LIMIT else ""
     )
-    smart_send(cid, data, fname, caption=inline_cap)
+    all_ok = smart_send(cid, data, fname, caption=inline_cap)
     if caption and not inline_cap:
-        send_message(cid, caption[:4096])
+        all_ok = bool(send_message(cid, caption[:4096]).get("ok")) and all_ok
+    _status(cid, "✅ ارسال شد." if all_ok else "⚠️ ارسال کامل نشد. لطفاً دوباره تلاش کنید.", reply_markup=home_kb(), final=True)
+    if all_ok:
+        clear_state(cid)
+
+
+# --- TikTok photo-post detection (short links / API-based) ---
+# NOTE: deliberately NOT @_heavy_download — it runs synchronously inside
+# do_tiktok_dl (itself heavy-wrapped); a nested submit returns a Future
+# and would deadlock the HEAVY_DOWNLOAD_SEMAPHORE.
+def _tiktok_is_photo_post(url: str, tikwm_data=None) -> Optional[dict]:
+    """Return tikwm data dict if the post is a photo (image) post, else None.
+
+    Short share links (/t/...) and music-bearing photo posts can't be
+    detected from the URL string alone, so we ask the API: photo posts
+    carry an images[] array.
+    """
+    d = tikwm_data if tikwm_data is not None else _fetch_tikwm_data(url)
+    return d if d and d.get("images") else None
+
+
+def _tiktok_has_audio_video_mismatch(data: bytes, filename: str) -> bool:
+    """True if bytes decode as audio-only (mp3) but the filename says mp4.
+
+    Prevents TikTok photo posts whose 'play' URL is actually the music file
+    from being shipped to the user as a silent .mp4 video.
+    """
+    if not filename.lower().endswith((".mp4", ".mov", ".mkv", ".webm")):
+        return False
+    if data[:3] == b"ID3" or data[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        log.warning("tiktok: mp3 payload in %s filename - treating as photo/sound post", filename)
+        return True
+    return False
+
+
+def do_tiktok_sound(cid: int, url: str):
+    """دانلود صدای (موزیک) یک پست TikTok."""
+    bump(cid, "downloads")
+    _status(cid, "⏳ در حال دریافت صدای TikTok…")
+    chat_action(cid)
+    got = _tiktok_music_dl(url)
+    if not got:
+        _status(
+            cid,
+            "❌ دریافت صدا ناموفق بود.\nلینک باید پست TikTok باشد (ویدیو یا عکس).",
+            reply_markup=home_kb(), final=True,
+        )
+        return
+    data, fname = got
+    ok = smart_send(cid, data, fname, caption="🎵 صدای تیک‌تاک", media_type="audio")
+    _status(cid, "✅ صدا ارسال شد." if ok else "❌ ارسال صدا ناموفق بود.", reply_markup=home_kb(), final=True)
+    if ok:
+        clear_state(cid)
+
+
+# ─── Reddit Download Handler ─────────────────────────────────────────────
+@_heavy_download
+def do_reddit_dl(cid: int, url: str, audio_only=False, format_id=None):
+    """Download Reddit post media."""
+    bump(cid, "downloads")
+    _status(cid, "⏳ در حال دانلود از رددیت…")
+    chat_action(cid, "upload_video" if not audio_only else "upload_audio")
+    result = reddit_download(url, audio_only=audio_only, format_id=format_id)
+    if not result:
+        _status(cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb(), final=True)
+        return
+    for data, fname in result:
+        smart_send(cid, data, fname)
+    _status(cid, "✅ ارسال شد.", reply_markup=home_kb(), final=True)
+    clear_state(cid)
+
+
+def do_reddit_profile(cid: int, username: str):
+    """Show Reddit user posts."""
+    bump(cid, "searches")
+    _status(cid, f"⏳ دریافت پست‌های u/{username}…")
+    posts = reddit_user_posts(username)
+    if not posts:
+        _status(cid, "❌ پستی یافت نشد.", reply_markup=home_kb(), final=True)
+        return
+    key = make_cache_key("reddit", f"{_platform()}:{cid}:u/{username}", 0)
+    cache_set_owned(key, posts, _platform(), cid)
+    rows = []
+    for i, p in enumerate(posts[:10]):
+        label = f"📝 {p['title'][:50]}"
+        rows.append([{"text": label, "callback_data": f"reddit_item_{key}_{i}"}])
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+    send_message(cid, f"📱 پست‌های u/{username}:", reply_markup={"inline_keyboard": rows})
+    clear_state(cid)
+
+
+# ─── Twitch Download Handler ─────────────────────────────────────────────
+@_heavy_download
+def do_twitch_dl(cid: int, url: str, audio_only=False, format_id=None):
+    """Download Twitch VOD/Clip."""
+    bump(cid, "downloads")
+    _status(cid, "⏳ در حال دانلود از تویچ…")
+    chat_action(cid, "upload_video" if not audio_only else "upload_audio")
+    result = twitch_download(url, audio_only=audio_only, format_id=format_id)
+    if not result:
+        _status(cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb(), final=True)
+        return
+    for data, fname in result:
+        smart_send(cid, data, fname)
+    _status(cid, "✅ ارسال شد.", reply_markup=home_kb(), final=True)
+    clear_state(cid)
+
+
+def do_twitch_user(cid: int, username: str):
+    """Show Twitch user videos."""
+    bump(cid, "searches")
+    _status(cid, f"⏳ دریافت ویدیوهای {username}…")
+    vids = twitch_user_videos(username)
+    if not vids:
+        _status(cid, "❌ ویدیویی یافت نشد.", reply_markup=home_kb(), final=True)
+        return
+    key = make_cache_key("twitch", f"{_platform()}:{cid}:{username}", 0)
+    cache_set_owned(key, vids, _platform(), cid)
+    rows = []
+    for i, v in enumerate(vids[:10]):
+        dur = f" ⏱{v['duration']}" if v.get('duration') else ""
+        label = f"🎮 {v['title'][:45]}{dur}"
+        rows.append([{"text": label, "callback_data": f"twitch_item_{key}_{i}"}])
+    rows.append([{"text": "🏠 منوی اصلی", "callback_data": "home"}])
+    send_message(cid, f"🎮 ویدیوهای {username}:", reply_markup={"inline_keyboard": rows})
+    clear_state(cid)
+
+
+# ─── Vimeo Download Handler ──────────────────────────────────────────────
+@_heavy_download
+def do_vimeo_dl(cid: int, url: str, audio_only=False, format_id=None):
+    """Download Vimeo video."""
+    bump(cid, "downloads")
+    _status(cid, "⏳ در حال دانلود از ویمئو…")
+    chat_action(cid, "upload_video" if not audio_only else "upload_audio")
+    result = vimeo_download(url, audio_only=audio_only, format_id=format_id)
+    if not result:
+        _status(cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb(), final=True)
+        return
+    for data, fname in result:
+        smart_send(cid, data, fname)
+    _status(cid, "✅ ارسال شد.", reply_markup=home_kb(), final=True)
+    clear_state(cid)
+
+
+# ─── Pinterest Video Download Handler ─────────────────────────────────────
+@_heavy_download
+def do_pinterest_video_dl(cid: int, url: str, audio_only=False, format_id=None):
+    """Download Pinterest video."""
+    bump(cid, "downloads")
+    _status(cid, "⏳ در حال دانلود از پینترست…")
+    chat_action(cid, "upload_video" if not audio_only else "upload_audio")
+    result = pinterest_video_download(url, audio_only=audio_only, format_id=format_id)
+    if not result:
+        _status(cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb(), final=True)
+        return
+    for data, fname in result:
+        smart_send(cid, data, fname)
+    _status(cid, "✅ ارسال شد.", reply_markup=home_kb(), final=True)
+    clear_state(cid)
+
+
+# ─── Direct HLS Download Handler ─────────────────────────────────────────
+@_heavy_download
+def do_hls_dl(cid: int, url: str, audio_only=False, format_id=None):
+    """Download direct HLS/m3u8 stream."""
+    bump(cid, "downloads")
+    _status(cid, "⏳ در حال دانلود استریم HLS…")
+    chat_action(cid, "upload_video" if not audio_only else "upload_audio")
+    result = hls_download(url, audio_only=audio_only, format_id=format_id)
+    if not result:
+        _status(cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb(), final=True)
+        return
+    data, fname = result
+    smart_send(cid, data, fname)
     _status(cid, "✅ ارسال شد.", reply_markup=home_kb(), final=True)
     clear_state(cid)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # VIRUS SCAN  (VirusTotal free API — 4 req/min, 500 req/day, 32MB max)
-# Set VIRUSTOTAL_API_KEY env var. Get key: https://www.virustotal.com/gui/join-us
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# VIRUS SCAN  (VirusTotal via vt-py — 4 req/min, 500 req/day, 32MB max)
-# pip install vt-py --break-system-packages
 # Set VIRUSTOTAL_API_KEY in .env
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -9729,7 +14160,7 @@ def virustotal_scan_url(url: str) -> Optional[dict]:
 def _format_vt_result(result: dict, name: str) -> str:
     """Format VirusTotal result as a readable Persian message."""
     if result.get("error"):
-        return f"⚠️ خطا: {result['error']}"
+        return f"⚠️ {result['error']}"
 
     verdict = result.get("verdict", "unknown")
     malicious = result.get("malicious", 0)
@@ -10661,6 +15092,9 @@ def rkey_from_url(url: str) -> str:
 def handle_message(msg: dict):
     cid = msg["chat"]["id"]
     text = msg.get("text", "")
+    _ctx.requester = (msg.get("from") or {}).get("id")
+    if getattr(_ctx, "operation", None):
+        _ctx.operation["requester"] = _ctx.requester
     photos = msg.get("photo")
     init_user(cid)
     log.info("MSG cid=%d text=%r has_photo=%s", cid, text[:60], bool(photos))
@@ -10670,13 +15104,19 @@ def handle_message(msg: dict):
         clear_state(cid)
         send_message(
             cid,
-            "👋 سلام! به *بله قربان* خوش آمدید.\nیکی از گزینه‌های زیر را انتخاب کنید:",
+            "👋 سلام! به *بله قربان* خوش آمدید.\n\n"
+            "🔎 جستجو و خواندن وب، دانلود ویدیو و موسیقی، کتاب و مقاله، ترجمه و ابزارهای فایل؛ همه در همین گفتگو.\n\n"
+            "*همین حالا بفرستید:*\n"
+            "• موضوع یا سؤال برای جستجوی وب؛ مثلاً «آموزش پایتون فارسی»\n"
+            "• لینک ویدیو یا پست عمومی برای دانلود\n"
+            "• لینک سایت برای مشاهده، یا لینک مستقیم فایل برای دریافت\n\n"
+            "برای ترجمه، کار با PDF و سایر ابزارها، ابتدا گزینهٔ مربوط را انتخاب کنید و سپس متن یا فایل را بفرستید. راهنمای بیشتر در «❓ راهنما»:",
             parse_mode="Markdown",
             reply_markup=main_menu_kb(),
         )
         return
     if text.startswith("/help"):
-        send_message(cid, HELP_TEXT, parse_mode="Markdown")
+        show_help(cid)
         return
     if text.startswith("/cancel"):
         clear_state(cid)
@@ -10691,16 +15131,55 @@ def handle_message(msg: dict):
         send_message(cid, "🖼 عکس حاوی متن ارسال کنید:", reply_markup=cancel_kb())
         return
 
+    if text.split(" ", 1)[0].split("@")[0] == "/convert":
+        info = _conversion_info(msg.get("reply_to_message"))
+        if info:
+            token = _conversion_register(cid, _ctx.requester, info)
+            if token:
+                _conversion_menu(cid, _ctx.requester, token)
+                return
+        set_state(cid, mode="convert")
+        send_message(cid, "🔄 عکس، صدا یا ویدیو را بفرستید؛ یا روی پیام فایل با /convert پاسخ دهید.", reply_markup=cancel_kb())
+        return
+    conversion_upload = _conversion_info(msg)
+    if conversion_upload and get_state(cid).get("mode") == "convert":
+        token = _conversion_register(cid, _ctx.requester, conversion_upload)
+        if token:
+            _conversion_menu(cid, _ctx.requester, token)
+        else:
+            _status(cid, "❌ فایل قابل تبدیل نیست یا بیشتر از ۲۰ مگابایت است.", final=True)
+        return
+
     # Photo
     if photos:
         st = get_state(cid)
+        if st.get("mode") == "image_compress":
+            photo = sorted(photos, key=lambda p: p.get("file_size", 0))[-1]
+            if photo.get("file_size", 0) > MAX_IMAGE_SIZE:
+                _status(cid, "❌ حجم عکس بیشتر از حد مجاز است.", final=True)
+            else:
+                file_url = get_file_url(photo["file_id"])
+                file_data = download_bytes(file_url, MAX_IMAGE_SIZE) if file_url else None
+                if file_data:
+                    do_image_compress(cid, file_data)
+                else:
+                    _status(cid, "❌ دریافت عکس ناموفق بود؛ دوباره تلاش کنید.", final=True)
+            return
         if st.get("mode") == "ocr" or not st.get("mode"):
+            _conversion_offer(cid, _ctx.requester, _conversion_info(msg))
             do_ocr_photo(cid, photos, msg["message_id"])
             return
 
     # Document / file upload
+    upload = msg.get("document") or msg.get("video") or msg.get("video_note") or msg.get("audio") or msg.get("voice")
+    if upload and isinstance(upload, dict):
+        st = get_state(cid)
+        if st.get("mode") in ("pdf_extract", "pdf_merge", "video_trim", "video_compress"):
+            _handle_file_upload(cid, upload, st.get("mode"))
+            return
+
     doc = msg.get("document")
-    if doc:
+    if doc and isinstance(doc, dict):
         st = get_state(cid)
         if st.get("mode") == "virusscan":
             # Bale's getFile API only works for files ≤ ~20MB
@@ -10740,15 +15219,32 @@ def handle_message(msg: dict):
             # Capture platform BEFORE spawning thread — _ctx is thread-local,
             # the new thread would otherwise have no context and send to the wrong API
             captured_platform = _platform()
+            operation = getattr(_ctx, "operation", None)
+            callback_operation = getattr(_ctx, "callback_operation", False)
 
             def _scan_thread(
                 cid=cid, data=file_data, name=fname, plat=captured_platform
             ):
-                _set_platform_ctx(plat)
+                _set_platform_ctx(plat, chat_id=cid, operation=operation,
+                                  callback_operation=callback_operation)
                 do_virusscan(cid, data, name)
 
             threading.Thread(target=_scan_thread, daemon=True).start()
             return
+
+    if upload and isinstance(upload, dict):
+        name = str(upload.get("file_name") or "").lower()
+        mime = str(upload.get("mime_type") or "").lower()
+        _conversion_offer(cid, _ctx.requester, upload)
+        choices = []
+        if mime == "application/pdf" or name.endswith(".pdf"):
+            choices += [("📄 جداکردن صفحات", "mode_pdf_extract"), ("📚 ادغام PDF", "mode_pdf_merge")]
+        elif msg.get("video") or msg.get("video_note") or mime.startswith("video/") or name.endswith((".mp4", ".mkv", ".webm", ".mov", ".avi")):
+            choices += [("✂️ برش ویدیو", "mode_video_trim"), ("🎞 فشرده‌سازی ویدیو", "mode_video_compress")]
+        choices += [("🛡 بررسی ویروس", "mode_virusscan"), ("🧰 ابزارها", "mode_tools"), ("🏠 منوی اصلی", "home")]
+        send_message(cid, "📎 فایل دریافت شد؛ ابزاری را انتخاب کنید و سپس فایل را دوباره بفرستید.",
+                     reply_markup={"inline_keyboard": [[{"text": t, "callback_data": d}] for t, d in choices]})
+        return
 
     if not text:
         return
@@ -10763,6 +15259,8 @@ def handle_message(msg: dict):
         "wiki_article": lambda: do_wiki_article(cid, text, st.get("wiki_lang", "fa")),
         "open": lambda: do_open_url(cid, text),
         "yt_dl": lambda: do_youtube_dl(cid, text),
+        "yt_playlist": lambda: do_youtube_playlist(cid, text),
+        "yt_clip": lambda: do_youtube_clip(cid, text),
         "yt_search": lambda: do_youtube_search_cmd(cid, text),
         "music": lambda: do_music(cid, text),
         "gh_search": lambda: do_github_search(cid, text),
@@ -10804,18 +15302,36 @@ def handle_message(msg: dict):
         "twitter_dl_translate": lambda: do_twitter_dl_translate(cid, text),
         "ig_profile": lambda: do_instagram_profile(cid, text),
         "ig_dl": lambda: do_instagram_dl(cid, text),
+        "ig_story": lambda: do_instagram_story(cid, text),
         "ig_mosaic": lambda: do_instagram_mosaic(cid, text),
         "ig_profile_pic": lambda: do_instagram_profile_pic(cid, text),
         "ig_profile_shot": lambda: do_instagram_profile_screenshot(cid, text),
         "tt_user": lambda: do_tiktok_user(cid, text),
         "tt_dl": lambda: do_tiktok_dl(cid, text),
+        "tt_sound": lambda: do_tiktok_sound(cid, text),
         "bluesky": lambda: do_bluesky_dl(cid, text),
         "yt_thumb": lambda: do_youtube_thumbnail(cid, text),
         "yt_stats": lambda: do_youtube_stats(cid, text),
         "rss": lambda: do_rss(cid, text),
+        "rss_subscribe": lambda: _rss_subscribe(cid, text),
+        "image_compress": lambda: send_message(cid, "🖼 لطفاً عکس را ارسال کنید.", reply_markup=cancel_kb()),
+        "pdf_extract": lambda: _handle_pdf_text(cid, text),
+        "pdf_merge": lambda: _handle_pdf_merge_text(cid, text),
+        "video_trim": lambda: _handle_video_range_text(cid, text),
+        "video_compress": lambda: send_message(cid, "🎞 لطفاً ویدیو را ارسال کنید.", reply_markup=cancel_kb()),
         "book": lambda: do_book_search(cid, text, st.get("zlib_ext")),
+        "audiobook": lambda: do_audiobook_search(cid, text),
+        "ravebook": lambda: do_ravebook_search(cid, text, st.get("ravebook_mode", "ebooks")),
         "book_art": lambda: do_paper_search(cid, text),
         "apk": lambda: do_apk_search(cid, text),
+        "movie": lambda: do_movie_search(cid, text),
+        "reddit_dl": lambda: do_reddit_dl(cid, text),
+        "reddit_profile": lambda: do_reddit_profile(cid, text),
+        "twitch_dl": lambda: do_twitch_dl(cid, text),
+        "twitch_user": lambda: do_twitch_user(cid, text),
+        "vimeo_dl": lambda: do_vimeo_dl(cid, text),
+        "pin_dl": lambda: do_pinterest_video_dl(cid, text),
+        "hls_dl": lambda: do_hls_dl(cid, text),
     }
 
     if mode and mode in dispatch:
@@ -10826,20 +15342,73 @@ def handle_message(msg: dict):
         # Smart URL detection
         if _is_youtube(text):
             do_youtube_dl(cid, text)
+        elif "github.com" in text:
+            # Repo link → same action menu as after search-result selection.
+            # Anchored: exactly owner/repo (optionally .git / trailing slash) at
+            # string end — blob/raw/tree/issues etc. fall through to file link.
+            m = re.match(
+                r"https?://github\.com/([^/]+/[^/]+?)(?:\.git)?/?$", text.rstrip("/")
+            )
+            if m:
+                repo_full = m.group(1)
+                info = github_repo_info(repo_full)
+                if info:
+                    desc = (info.get("description") or "")[:300]
+                    txt = (
+                        f"🐙 *{info.get('full_name', repo_full)}*\n"
+                        f"⭐ {info.get('stargazers_count', 0)} | "
+                        f"🍴 {info.get('forks_count', 0)} | "
+                        f"📝 {info.get('language', '—')}\n\n"
+                        f"{desc}\n\n"
+                        f"🔗 {info.get('html_url', text)}"
+                    )
+                    send_message(
+                        cid,
+                        txt,
+                        parse_mode="Markdown",
+                        reply_markup=gh_repo_action_kb(info.get("full_name", repo_full)),
+                    )
+                    clear_state(cid)
+                else:
+                    do_github_zip(cid, text)
+            else:
+                # github.com blob/raw/tree link → treat as file
+                do_file_link(cid, text)
+        elif _is_direct_file_url(text):
+            do_file_link(cid, text)
         elif "spotify.com" in text:
-            do_music(cid, text)
+            do_spotify_dl(cid, text)
         elif "soundcloud.com" in text or "on.soundcloud.com" in text:
             do_soundcloud_info(cid, text)
         elif "tiktok.com" in text:
-            do_tiktok_dl(cid, text)
+            if "/music/" in text or "/sound/" in text:
+                do_tiktok_sound(cid, text)
+            else:
+                do_tiktok_dl(cid, text)
         elif "twitter.com" in text or "x.com" in text:
-            do_twitter_dl(cid, text)
+            if st.get("mode") == "twitter_thread" or "/threads/" in text:
+                do_twitter_thread(cid, text)
+            else:
+                do_twitter_dl(cid, text)
         elif "instagram.com" in text:
-            do_instagram_dl(cid, text)
+            if "/stories/" in text:
+                do_instagram_story(cid, text.split("/stories/")[-1].strip("/"))
+            else:
+                do_instagram_dl(cid, text)
         elif "bsky.app" in text:
             do_bluesky_dl(cid, text)
         elif "t.me/" in text:
             do_tg_dl_media(cid, text)
+        elif "reddit.com" in text:
+            do_reddit_dl(cid, text)
+        elif "twitch.tv" in text or "clips.twitch.tv" in text:
+            do_twitch_dl(cid, text)
+        elif "vimeo.com" in text:
+            do_vimeo_dl(cid, text)
+        elif "pinterest.com" in text and ("/pin/" in text or "video" in text.lower()):
+            do_pinterest_video_dl(cid, text)
+        elif ".m3u8" in text or ".m3u" in text:
+            do_hls_dl(cid, text)
         else:
             do_open_url(cid, text)
     else:
@@ -10852,13 +15421,13 @@ def handle_message(msg: dict):
 def handle_callback(cb: dict):
     msg = cb.get("message") or {}
     cid = (msg.get("chat") or {}).get("id")
-    
+
     # Fallback: extract chat_id from callback query's 'from' field if message.chat is missing
     # This handles cases where the callback comes from an inline query or edited message
     if not cid:
         from_user = cb.get("from") or {}
         cid = from_user.get("id")
-    
+
     # Additional fallback: try to get chat_id from callback data prefix if stored
     # Some platforms may not include full message object in callbacks
     if not cid:
@@ -10871,7 +15440,7 @@ def handle_callback(cb: dict):
                     cid = (val.get("chat") or {}).get("id")
                     if cid:
                         break
-        
+
     # Critical fallback for SoundCloud and other downloads: check if we have cached URL with chat_id
     if not cid:
         # Try to extract from callback data pattern - some callbacks store chat info
@@ -10881,14 +15450,33 @@ def handle_callback(cb: dict):
         else:
             log.error("handle_callback: CRITICAL - cannot determine chat_id, skipping callback. Full cb: %r", cb)
         return
-    
+
     if not cid:
         log.error("handle_callback: CRITICAL - cannot determine chat_id, skipping callback. Full cb: %r", cb)
         return
     data = cb.get("data", "")
+    _ctx.requester = (cb.get("from") or {}).get("id")
     answer_cb(cb["id"])
     init_user(cid)
+    if msg.get("message_id"):
+        _operation_start(cid, "⏳ در حال پردازش…", message_id=msg["message_id"])
+        _ctx.callback_operation = True
+    if getattr(_ctx, "operation", None):
+        _ctx.operation["requester"] = _ctx.requester
     log.info("CB cid=%d data=%r", cid, data)
+    if data.startswith("cv_menu:"):
+        _conversion_menu(cid, _ctx.requester, data.split(":", 1)[1])
+        return
+    if data.startswith("cv_do:"):
+        parts = data.split(":")
+        if len(parts) == 3:
+            _conversion_start(cid, _ctx.requester, parts[1], parts[2])
+        return
+    if data == "mode_convert":
+        clear_state(cid)
+        set_state(cid, mode="convert")
+        send_message(cid, "🔄 فایل عکس، صدا یا ویدیو را بفرستید؛ یا روی فایل با /convert پاسخ دهید.", reply_markup=cancel_kb())
+        return
 
     st = get_state(cid)
 
@@ -10898,12 +15486,164 @@ def handle_callback(cb: dict):
         send_message(cid, "🏠 منوی اصلی:", reply_markup=main_menu_kb())
         return
 
+    if data.startswith("mode_") or data in ("nav_read", "nav_download", "library", "rss_subscriptions"):
+        clear_state(cid)
+        st = get_state(cid)
+    if data in ("nav_read", "nav_download"):
+        send_message(cid, "🔎 جستجو و خواندن:" if data == "nav_read" else "📥 دانلود و شبکه‌ها:", reply_markup=category_kb(data))
+        return
+
+    # ── Post-download actions ──────────────────────────────────────────────────
+    if data == "redownload_quality":
+        _status(cid, "🔁 برای انتخاب کیفیت، لینک منبع را دوباره بفرستید.", reply_markup=home_kb(), final=True)
+        return
+
+    if data == "delete_this_msg":
+        # Delete this message (the one with the buttons)
+        try:
+            api("deleteMessage", chat_id=cid, message_id=msg["message_id"])
+        except Exception as e:
+            log.warning("delete_this_msg: %s", e)
+        return
+
     if data == "mode_social":
         send_message(cid, "📲 شبکه‌های اجتماعی:", reply_markup=social_menu_kb())
         return
 
-    if data == "help":
-        send_message(cid, HELP_TEXT, parse_mode="Markdown")
+    if data == "library":
+        send_message(cid, "⭐️ کتابخانه من — اطلاعات لینک‌ها فقط ذخیره می‌شود:", reply_markup=library_kb())
+        return
+
+    if data == "library_saved":
+        _library_list(cid)
+        return
+
+    if data == "library_watchlist":
+        _library_list(cid, watchlist_only=True)
+        return
+
+    m = re.match(r"lib_page_watch_(\d+)$", data)
+    if m:
+        _library_list(cid, watchlist_only=True, page=int(m.group(1)))
+        return
+
+    m = re.match(r"lib_page_saved_(\d+)$", data)
+    if m:
+        _library_list(cid, page=int(m.group(1)))
+        return
+
+    if data == "library_history":
+        _library_history(cid)
+        return
+
+    m = re.match(r"lib_item_(\d+)$", data)
+    if m:
+        _library_item(cid, int(m.group(1)))
+        return
+
+    m = re.match(r"lib_watch_(\d+)$", data)
+    if m:
+        item = durable_store.toggle_watchlist(_platform(), cid, int(m.group(1)))
+        if not item:
+            _status(cid, "❌ این مورد در کتابخانه نیست.", final=True)
+        else:
+            _status(cid, "✅ به فهرست تماشا اضافه شد." if item.get("watchlist") else "✅ از فهرست تماشا حذف شد.", final=True)
+        return
+
+    m = re.match(r"lib_retry_(\d+)$", data)
+    if m:
+        item = durable_store.get_library_item(_platform(), cid, int(m.group(1)))
+        if not item:
+            _status(cid, "❌ این مورد دیگر در کتابخانه نیست.", final=True)
+        else:
+            _retry_url(cid, item.get("url", ""))
+        return
+
+    m = re.match(r"hist_page_(\d+)$", data)
+    if m:
+        _library_history(cid, page=int(m.group(1)))
+        return
+
+    m = re.match(r"hist_item_(\d+)$", data)
+    if m:
+        _history_item(cid, int(m.group(1)))
+        return
+
+    m = re.match(r"hist_retry_(\d+)$", data)
+    if m:
+        entry = durable_store.get_usage_entry(_platform(), cid, int(m.group(1)))
+        if not entry:
+            _status(cid, "❌ این تاریخچه منقضی شده است.", final=True)
+        else:
+            _retry_url(cid, str((entry.get("details") or {}).get("url") or ""))
+        return
+
+    m = re.match(r"lib_save_([a-z0-9]+)_(\w+)$", data)
+    if m:
+        _save_library_url(cid, m.group(1), m.group(2))
+        return
+
+    if data == "mode_tools":
+        send_message(cid, "🧰 ابزارهای رایگان:", reply_markup=tools_kb())
+        return
+
+    if data == "mode_translate_fa":
+        set_state(cid, mode="translate", target_lang="fa")
+        send_message(cid, "🌐 متن را برای ترجمه به فارسی بفرستید:", reply_markup=cancel_kb())
+        return
+
+    if data == "mode_currency":
+        set_state(cid, mode="currency")
+        send_message(cid, "💱 نمونه: `100 USD to IRR`", reply_markup=cancel_kb())
+        return
+
+    if data == "mode_shorten":
+        set_state(cid, mode="shorten")
+        send_message(cid, "🔗 لینکی را که می‌خواهید کوتاه کنید بفرستید:", reply_markup=cancel_kb())
+        return
+
+    if data == "mode_expand":
+        set_state(cid, mode="expand")
+        send_message(cid, "🔎 لینک کوتاه یا ریدایرکت‌دار را بفرستید:", reply_markup=cancel_kb())
+        return
+
+    if data == "mode_paste":
+        set_state(cid, mode="paste")
+        send_message(cid, "📋 متنی را که می‌خواهید به‌صورت لینک اشتراکی بسازید بفرستید:", reply_markup=cancel_kb())
+        return
+
+    if data == "mode_qr":
+        set_state(cid, mode="qr")
+        send_message(cid, "🔳 متن یا لینکی را برای ساخت QR بفرستید:", reply_markup=cancel_kb())
+        return
+
+    if data == "mode_image_compress":
+        set_state(cid, mode="image_compress")
+        send_message(cid, "🖼 عکس را بفرستید؛ فایل فشرده بدون ذخیره‌سازی دائمی ارسال می‌شود:", reply_markup=cancel_kb())
+        return
+
+    if data == "mode_pdf_extract":
+        set_state(cid, mode="pdf_extract")
+        send_message(cid, "📄 فایل PDF را بفرستید؛ بعد شمارهٔ صفحه‌ها را مثل `1,3-5` وارد کنید:", reply_markup=cancel_kb())
+        return
+
+    if data == "mode_pdf_merge":
+        set_state(cid, mode="pdf_merge")
+        send_message(cid, "📚 فایل‌های PDF را یکی‌یکی بفرستید؛ حداکثر ۵ فایل ادغام می‌شود.", reply_markup=cancel_kb())
+        return
+
+    if data == "mode_video_trim":
+        set_state(cid, mode="video_trim")
+        send_message(cid, "✂️ ویدیو را بفرستید؛ بعد بازهٔ زمانی را مثل `5 30` (شروع و پایان به ثانیه) بفرستید:", reply_markup=cancel_kb())
+        return
+
+    if data == "mode_video_compress":
+        set_state(cid, mode="video_compress")
+        send_message(cid, "🎞 ویدیو را برای فشرده‌سازی محلی بفرستید؛ حداکثر ۴۸ مگابایت:", reply_markup=cancel_kb())
+        return
+
+    if data == "help" or data.startswith("help_"):
+        show_help(cid, data[5:] if data.startswith("help_") else None)
         return
 
     if data == "privacy":
@@ -10911,7 +15651,7 @@ def handle_callback(cb: dict):
         return
 
     if data == "stats":
-        s = user_stats.get(_pkey(cid), {})
+        s = durable_store.get_user_stats(_platform(), cid)
         txt = (
             f"📊 *آمار کاربری*\n\n"
             f"🗓 عضویت: {s.get('joined', '—')}\n"
@@ -10922,6 +15662,28 @@ def handle_callback(cb: dict):
             f"🖼 OCR: {s.get('ocr', 0)}"
         )
         send_message(cid, txt, parse_mode="Markdown", reply_markup=home_kb())
+        return
+
+    # ── Audio format selection ────────────────────────────────────────────────────
+    m = re.match(r"audio_fmt_([a-z0-9]+)_(\d+)$", data)
+    if m:
+        fmt = m.group(1)
+        quality = m.group(2)
+        st = get_state(cid)
+        url = st.get("last_url", "")
+        if not url:
+            _status(cid, "❌ لینک منقضی شده. دوباره امتحان کنید.", reply_markup=home_kb(), final=True)
+            return
+        _do_audio_download(
+            cid,
+            url,
+            source="auto",
+            audio_format=fmt,
+            audio_quality=quality,
+            title=st.get("last_title", ""),
+            artist=st.get("last_artist", ""),
+            track_item=st.get("last_track_item", None),
+        )
         return
 
     # ── Mode launchers ────────────────────────────────────────────────────
@@ -10938,8 +15700,9 @@ def handle_callback(cb: dict):
             "apk",
             "📱 نام اپ یا شناسه پکیج را وارد کنید (مثال: org.telegram.messenger):",
         ),
+        "mode_movie": ("movie", "🎬 نام فیلم یا سریال را بنویسید:"),
         "mode_iplookup": ("iplookup", "🌐 آدرس IP یا دامنه:"),
-        "mode_rss": ("rss", "📰 آدرس فید RSS یا سایت خبری را وارد کنید:"),
+        "rss_subscribe": ("rss_subscribe", "📰 آدرس فید RSS برای اشتراک را وارد کنید:"),
         "mode_virusscan": (
             "virusscan",
             "🛡 فایل خود را ارسال کنید تا بررسی شود\nیا یک آدرس اینترنتی بفرستید تا اسکن شود:",
@@ -10995,6 +15758,14 @@ def handle_callback(cb: dict):
     if data == "yt_search":
         set_state(cid, mode="yt_search")
         send_message(cid, "🔍 کلمه جستجو:", reply_markup=cancel_kb())
+        return
+    if data == "yt_clip":
+        set_state(cid, mode="yt_clip")
+        send_message(cid, "✂️ لینک یوتیوب و بازه را در یک خط بفرستید.\nمثال: `https://youtu.be/... 01:20-03:45`\nحداکثر بازه: ۳۰ دقیقه.", parse_mode="Markdown", reply_markup=cancel_kb())
+        return
+    if data == "yt_playlist":
+        set_state(cid, mode="yt_playlist")
+        send_message(cid, "📃 لینک فهرست پخش یوتیوب را بفرستید.\n۱۰ ویدیوی اول نمایش داده می‌شود.", reply_markup=cancel_kb())
         return
 
     # YouTube result click → show info card with download button
@@ -11090,7 +15861,7 @@ def handle_callback(cb: dict):
         url = vid.get("url", "")
         if audio_only:
             # Audio: skip quality picker, go straight to download
-            url_key = store_url(url)
+            url_key = store_url(url, chat_id=cid)
             info_key = "yti" + url_key
             cache_set(
                 info_key,
@@ -11114,6 +15885,26 @@ def handle_callback(cb: dict):
             )
         else:
             _youtube_quality_picker(cid, url, audio_only=False)
+        return
+
+    # ── YouTube playlist shared preferences ──────────────────────────────────
+    m = re.match(r"yt_plq_(\w+)_(a|360|480|720)$", data)
+    if m:
+        key, choice = m.groups()
+        if not cache_get(key):
+            _status(cid, "❌ فهرست پخش منقضی شده. دوباره امتحان کنید.", final=True)
+            return
+        send_message(cid, "💬 زیرنویس برای همه ویدیوها:", reply_markup=_playlist_subtitle_kb(key, choice == "a"))
+        return
+
+    m = re.match(r"yt_pls_(\w+)_(a|360|480|720)_(fa|en|none)$", data)
+    if m:
+        key, choice, sub_code = m.groups()
+        items = cache_get(key)
+        if not items:
+            _status(cid, "❌ فهرست پخش منقضی شده. دوباره امتحان کنید.", final=True)
+            return
+        _run_youtube_playlist(cid, items, 720 if choice == "a" else int(choice), choice == "a", "" if sub_code == "none" else sub_code)
         return
 
     # ── YouTube quality selection ─────────────────────────────────────────────
@@ -11204,6 +15995,25 @@ def handle_callback(cb: dict):
             do_youtube_search_cmd(cid, query, page)
         return
 
+    # ── Direct file link actions ─────────────────────────────────────────
+    m = re.match(r"dfile_dl_(\w+)$", data)
+    if m:
+        url = get_url_for_chat(m.group(1), cid)
+        if not url:
+            _status(cid, "❌ لینک منقضی شده.", final=True)
+            return
+        do_direct_file_download(cid, url)
+        return
+
+    m = re.match(r"dfile_shot_(\w+)$", data)
+    if m:
+        url = get_url_for_chat(m.group(1), cid)
+        if not url:
+            _status(cid, "❌ لینک منقضی شده.", final=True)
+            return
+        do_open_url(cid, url)
+        return
+
     # ── GitHub ────────────────────────────────────────────────────────────
     if data == "mode_github":
         send_message(cid, "🐙 GitHub:", reply_markup=github_action_kb())
@@ -11289,6 +16099,23 @@ def handle_callback(cb: dict):
             _status(cid, "❌ اطلاعاتی یافت نشد.", reply_markup=home_kb(), final=True)
         return
 
+    # GitHub ZIP-mode repo link → show the same action menu as link detection
+    m = re.match(r"ghact_menu_(.+)$", data)
+    if m:
+        repo = m.group(1).replace("__", "/")
+        send_message(
+            cid,
+            f"🐙 *{repo}*\nیک عملیات انتخاب کنید:",
+            parse_mode="Markdown",
+            reply_markup=gh_repo_action_kb(repo),
+        )
+        return
+
+    # GitHub: back to results (link-opened menus have no results page → home)
+    if data == "gh_back":
+        send_message(cid, "🏠 منوی اصلی:", reply_markup=main_menu_kb())
+        return
+
     # GitHub release asset download
     m = re.match(r"ghrel_dl_(.+)_(\d+)$", data)
     if m:
@@ -11306,8 +16133,8 @@ def handle_callback(cb: dict):
         chat_action(cid, "upload_document")
         d = download_bytes(url, 500 * 1024 * 1024)  # allow up to 500MB download
         if d:
-            smart_send(cid, d, asset["name"], caption=f"📦 {repo}")
-            _status(cid, "✅ ارسال شد.", reply_markup=home_kb(), final=True)
+            ok = smart_send(cid, d, asset["name"], caption=f"📦 {repo}")
+            _status(cid, "✅ ارسال شد." if ok else "❌ ارسال فایل ناموفق بود.", reply_markup=home_kb(), final=True)
         else:
             _status(cid, "❌ دانلود ناموفق.", reply_markup=home_kb(), final=True)
         return
@@ -11336,6 +16163,14 @@ def handle_callback(cb: dict):
         "img_src_pinterest": "pinterest",
         "img_src_pexels": "pexels",
         "img_src_wiki": "wiki",
+        "img_src_deviantart": "deviantart",
+        "img_src_pixiv": "pixiv",
+        "img_src_artstation": "artstation",
+        "img_src_flickr": "flickr",
+        "img_src_tumblr": "tumblr",
+        "img_src_imgur": "imgur",
+        "img_src_kemono": "kemono",
+        "img_src_newgrounds": "newgrounds",
     }
     if data in img_src_map:
         src = img_src_map[data]
@@ -11356,38 +16191,56 @@ def handle_callback(cb: dict):
         do_images(cid, query, source, page)
         return
 
-    # book_ia_{url_key} — download from Internet Archive
-    m = re.match(r"book_ia_(\w+)$", data)
+    # book_iadl_{url_key} — resolve an Archive.org identifier, then download
+    m = re.match(r"book_iadl_(\w+)$", data)
     if m:
         url_key = m.group(1)
-        ia_url = get_url(url_key) or ""
-        # Try to get chat_id from cache, fallback to callback cid
-        cached_cid = get_url_chat(url_key)
-        target_cid = cached_cid if cached_cid else cid
-        if not ia_url:
+        ident = get_url_for_chat(url_key, cid) or ""
+        target_cid = cid
+        if not ident:
             _status(target_cid, "❌ لینک منقضی شده.", reply_markup=home_kb(), final=True)
             return
-        _status(target_cid, "⏳ در حال دانلود از Internet Archive…")
+        _status(target_cid, "⏳ در حال آماده‌سازی فایل از Internet Archive…")
         chat_action(target_cid, "upload_document")
-        sess = _libgen_session()
+        title = "book"
         try:
-            resp = sess.get(
-                ia_url,
-                headers={"User-Agent": UA_DESK},
-                timeout=90,
-                allow_redirects=True,
+            st = get_state(target_cid)
+            cached = cache_get(st.get("cache_key", ""))
+            if isinstance(cached, list):
+                for b in cached:
+                    if str(b.get("ia_url", "")).rstrip("/").split("/")[-1] == ident:
+                        title = b.get("name", "book")
+                        break
+        except Exception:
+            pass
+
+        resolved = _archive_org_best_file(ident)
+        if not resolved:
+            _status(
+                target_cid,
+                "❔ این عنوان در Internet Archive فقط امانتی است و فایل رایگان ندارد.\n"
+                "می‌توانید از سایت خودش امانت بگیرید.",
+                reply_markup={"inline_keyboard": [
+                    [{"text": "🌐 باز کردن Internet Archive",
+                      "url": f"https://archive.org/details/{ident}"}],
+                    [{"text": "🏠 منوی اصلی", "callback_data": "home"}],
+                ]},
+                final=True,
             )
-            if resp.status_code == 200 and len(resp.content) > 5000:
-                fname = ia_url.split("/")[-1].split("?")[0] or "book.pdf"
-                if smart_send(target_cid, resp.content, fname, caption=f"📚 {fname}"):
-                    _status(target_cid, "✅ کتاب ارسال شد.", reply_markup=home_kb(), final=True)
-                else:
-                    _status(target_cid, "❌ ارسال ناموفق بود.", reply_markup=home_kb(), final=True)
-            else:
-                _status(target_cid, "❌ دانلود ناموفق بود.", reply_markup=home_kb(), final=True)
-        except Exception as e:
-            log.warning("book_ia: %s", e)
-            _status(target_cid, "❌ خطا در دانلود.", reply_markup=home_kb(), final=True)
+            return
+
+        dl_url, fname = resolved
+        data_bytes = download_bytes(dl_url, TELEGRAM_MAX_FILE_SIZE)
+        if not data_bytes or len(data_bytes) < 2000:
+            _status(
+                target_cid,
+                "❌ دانلود ناموفق بود. دوباره امتحان کنید.",
+                reply_markup=home_kb(), final=True)
+            return
+        if smart_send(target_cid, data_bytes, fname, caption=f"📚 {fname[:80]}"):
+            _status(target_cid, "✅ کتاب ارسال شد.", reply_markup=home_kb(), final=True)
+        else:
+            _status(target_cid, "❌ ارسال فایل ناموفق بود.", reply_markup=home_kb(), final=True)
         clear_state(target_cid)
         return
 
@@ -11395,9 +16248,8 @@ def handle_callback(cb: dict):
     m = re.match(r"book_ol_(\w+)$", data)
     if m:
         url_key = m.group(1)
-        ol_url = get_url(url_key) or ""
-        cached_cid = get_url_chat(url_key)
-        target_cid = cached_cid if cached_cid else cid
+        ol_url = get_url_for_chat(url_key, cid) or ""
+        target_cid = cid
         if ol_url:
             send_message(target_cid, f"🌐 لینک Open Library:\n{ol_url}", reply_markup=home_kb())
         else:
@@ -11428,12 +16280,20 @@ def handle_callback(cb: dict):
             lines.append(f"🔗 DOI: `{doi}`")
 
         rows = []
+        if paper.get("sources"):
+            lines.append("📚 منابع: " + "، ".join(paper["sources"]))
+        paper_key = make_cache_key("paper", doi or title, 0)
+        cache_set(paper_key, [paper])
+        rows.append([
+            {"text": "📚 استناد APA", "callback_data": f"paper_apa_{paper_key}"},
+            {"text": "📄 BibTeX", "callback_data": f"paper_bib_{paper_key}"},
+        ])
         if doi:
             doi_key = store_url(doi, chat_id=cid)
             rows.append(
                 [
                     {
-                        "text": "📥 دانلود از Sci-Hub",
+                        "text": "📥 دریافت مقاله",
                         "callback_data": f"paper_dl_{doi_key}",
                     }
                 ]
@@ -11462,13 +16322,23 @@ def handle_callback(cb: dict):
         )
         return
 
-    # paper_dl_{doi_key} — download from Sci-Hub
+    m = re.match(r"paper_(apa|bib)_(\w+)$", data)
+    if m:
+        style, key = m.group(1), m.group(2)
+        papers = cache_get(key)
+        if not papers:
+            _status(cid, "❌ اطلاعات مقاله منقضی شده.", final=True)
+            return
+        text = _paper_apa(papers[0]) if style == "apa" else _paper_bibtex(papers[0])
+        send_message(cid, text, parse_mode="Markdown", reply_markup=home_kb())
+        return
+
+    # paper_dl_{doi_key} — download from configured paper sources
     m = re.match(r"paper_dl_(\w+)$", data)
     if m:
         url_key = m.group(1)
-        doi = get_url(url_key) or ""
-        cached_cid = get_url_chat(url_key)
-        target_cid = cached_cid if cached_cid else cid
+        doi = get_url_for_chat(url_key, cid) or ""
+        target_cid = cid
         if not doi:
             _status(target_cid, "❌ DOI یافت نشد.", final=True)
             return
@@ -11479,9 +16349,8 @@ def handle_callback(cb: dict):
     m = re.match(r"paper_oa_(\w+)$", data)
     if m:
         url_key = m.group(1)
-        oa_url = get_url(url_key) or ""
-        cached_cid = get_url_chat(url_key)
-        target_cid = cached_cid if cached_cid else cid
+        oa_url = get_url_for_chat(url_key, cid) or ""
+        target_cid = cid
         if not oa_url:
             _status(target_cid, "❌ لینک یافت نشد.", final=True)
             return
@@ -11527,6 +16396,107 @@ def handle_callback(cb: dict):
         )
         return
 
+    # ── Movie/TV callbacks ──────────────────────────────────────────────────
+    if data == "mode_movie":
+        set_state(cid, mode="movie")
+        send_message(
+            cid,
+            "🎬 *جستجوی فیلم و سریال (TMDb)*\n\n"
+            "نام فیلم یا سریال را بنویسید:",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    # movie_item_{cache_key}_{idx} — user clicked a movie/TV in results
+    m = re.match(r"movie_item_(\w+)_(\d+)$", data)
+    if m:
+        key, idx = m.group(1), int(m.group(2))
+        results = cache_get(key)
+        if not results or idx >= len(results):
+            _status(cid, "❌ نتیجه منقضی شده. دوباره جستجو کنید.", final=True)
+            return
+        item = results[idx]
+        do_movie_show(cid, item, key, idx)
+        return
+
+    # movie_season_{cache_key}_{idx}_{season}
+    m = re.match(r"movie_season_(\w+)_(\d+)_(\d+)$", data)
+    if m:
+        key, idx, season = m.group(1), int(m.group(2)), int(m.group(3))
+        results = cache_get(key)
+        if results and idx < len(results):
+            do_movie_season(cid, results[idx], season, key, idx)
+        return
+
+    # movie_ep_{cache_key}_{idx}_{season}_{episode}
+    m = re.match(r"movie_ep_(\w+)_(\d+)_(\d+)_(\d+)$", data)
+    if m:
+        key, idx, season, ep = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))
+        results = cache_get(key)
+        if results and idx < len(results):
+            do_movie_episode(cid, results[idx], season, ep, key, idx)
+        return
+
+    # movie_subs_{cache_key}_{idx}
+    m = re.match(r"movie_subs_(\w+)_(\d+)$", data)
+    if m:
+        key, idx = m.group(1), int(m.group(2))
+        results = cache_get(key)
+        if results and idx < len(results):
+            do_movie_subs(cid, results[idx])
+        return
+
+    # movie_subsn_{cache_key}_{idx}_{season}
+    m = re.match(r"movie_subsn_(\w+)_(\d+)_(\d+)$", data)
+    if m:
+        key, idx, season = m.group(1), int(m.group(2)), int(m.group(3))
+        results = cache_get(key)
+        if results and idx < len(results):
+            do_movie_subs(cid, results[idx], season=season)
+        return
+
+    # movie_subse_{cache_key}_{idx}_{season}_{episode}
+    m = re.match(r"movie_subse_(\w+)_(\d+)_(\d+)_(\d+)$", data)
+    if m:
+        key, idx, season, ep = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))
+        results = cache_get(key)
+        if results and idx < len(results):
+            do_movie_subs(cid, results[idx], season=season, episode=ep)
+        return
+
+    # movie_watch_{cache_key}_{idx}
+    m = re.match(r"movie_watch_(\w+)_(\d+)$", data)
+    if m:
+        key, idx = m.group(1), int(m.group(2))
+        results = cache_get(key)
+        if results and idx < len(results):
+            do_movie_watch(cid, results[idx])
+        return
+
+    # sub_dl_{index} — download selected subtitle from cached list
+    m = re.match(r"sub_dl_(\d+)$", data)
+    if m:
+        sub_idx = int(m.group(1))
+        # Get the cached subtitle list from the user's state
+        st = get_state(cid)
+        sub_key = st.get("subtitle_cache_key")
+        if sub_key:
+            subs = cache_get(sub_key)
+            if subs and sub_idx < len(subs):
+                entry = subs[sub_idx]
+                res = subtitle_download(entry)
+                if res:
+                    data, fn = res
+                    if smart_send(cid, data, fn, caption=f"📝 زیرنویس فارسی: {entry.get('name','')}"):
+                        send_message(cid, "✅ زیرنویس ارسال شد.", reply_markup=home_kb())
+                        return
+                send_message(cid, "❌ دانلود زیرنویس ناموفق بود.", reply_markup=home_kb())
+                return
+        send_message(cid, "❌ لیست زیرنویس منقضی شده.", reply_markup=home_kb())
+        return
+
+    # ── APK callbacks ─────────────────────────────────────────────────────
     # apk_item_{cache_key}_{idx} — user clicked an app in results
     m = re.match(r"apk_item_(\w+)_(\d+)$", data)
     if m:
@@ -11551,7 +16521,7 @@ def handle_callback(cb: dict):
         return
 
     # apk_gplay_{safe_app_id} — open Google Play page (screenshot)
-    m = re.match(r"apk_gplay_(.+)$", data)
+    m = re.match(r"apk_(?:store|gplay)_(.+)$", data)
     if m:
         safe_id = m.group(1)
         app_id = safe_id.replace("_", ".")
@@ -11575,9 +16545,130 @@ def handle_callback(cb: dict):
                 reply_markup=main_menu_kb(), final=True)
         return
 
+    # ── Audiobook (LibriVox) callbacks ────────────────────────────────────
+    m = re.match(r"abk_item_(\w+)_(\d+)$", data)
+    if m:
+        key, idx = m.group(1), int(m.group(2))
+        results = cache_get(key)
+        if not results or idx >= len(results):
+            _status(cid, "❌ نتیجه منقضی.", final=True)
+            return
+        do_librivox_show(cid, results[idx], key, idx)
+        return
+
+    m = re.match(r"abk_dl_(\w+)_(\d+)$", data)
+    if m:
+        fkey, idx = m.group(1), int(m.group(2))
+        files = cache_get(f"abkf_{fkey}")
+        if not files or idx >= len(files):
+            _status(cid, "❌ لینک منقضی شده.", final=True)
+            return
+        f = files[idx]
+        do_direct_file_download(cid, f["url"])
+        return
+
+    if data == "abk_back":
+        key = st.get("cache_key", "")
+        results = cache_get(key) if key else []
+        if results:
+            send_message(
+                cid,
+                "🎧 نتایج کتاب صوتی — کتاب را انتخاب کنید:",
+                reply_markup=audiobook_results_kb(results, key),
+            )
+        else:
+            send_message(cid, "🎧 جستجوی جدید:", reply_markup=book_kb())
+        return
+
+    # ── Rave Book Search callbacks ────────────────────────────────────────
+    m = re.match(r"rvbk_item_(\w+)_(\d+)$", data)
+    if m:
+        key, idx = m.group(1), int(m.group(2))
+        results = cache_get(key)
+        if not results or idx >= len(results):
+            _status(cid, "❌ نتیجه منقضی.", final=True)
+            return
+        r = results[idx]
+        kurl = store_url(r["url"], chat_id=cid)
+        txt = (
+            f"📚 *{r['name'][:200]}*\n"
+            f"🌐 منبع: `{r.get('host', '—')}`\n\n"
+            "لینک دانلود در سایت منبع است (Rave هیچ فایلی میزبانی نمی‌کند)."
+        )
+        send_message(
+            cid,
+            txt,
+            parse_mode="Markdown",
+            reply_markup={
+                "inline_keyboard": [
+                    [
+                        {"text": "🔗 بازکردن صفحه", "url": r["url"]},
+                        {"text": "🌐 اسکرین‌شات", "callback_data": f"rvbk_shot_{kurl}"},
+                    ],
+                    [
+                        {"text": "📥 دانلود مستقیم", "callback_data": f"dfile_dl_{kurl}"},
+                        {"text": "🔙 نتایج", "callback_data": "rvbk_back"},
+                    ],
+                    [{"text": "🏠 منوی اصلی", "callback_data": "home"}],
+                ]
+            },
+        )
+        return
+
+    if data == "rvbk_back":
+        key = st.get("cache_key", "")
+        results = cache_get(key) if key else []
+        if results:
+            send_message(
+                cid,
+                "📚 نتایج Rave Book Search — نتیجه را انتخاب کنید:",
+                reply_markup=ravebook_results_kb(results, key),
+            )
+        else:
+            send_message(cid, "📚 جستجوی جدید:", reply_markup=book_kb())
+        return
+
+    m = re.match(r"rvbk_shot_(\w+)$", data)
+    if m:
+        url = get_url_for_chat(m.group(1), cid)
+        if not url:
+            _status(cid, "❌ لینک منقضی شده.", final=True)
+            return
+        do_open_url(cid, url)
+        return
+
     # ── Z-Library callbacks ───────────────────────────────────────────────
     if data == "mode_book":
         send_message(cid, "📚 دانلود کتاب و مقاله:", reply_markup=book_kb())
+        return
+
+    if data == "book_sources":
+        send_message(
+            cid,
+            "🔗 *منابع بیشتر کتاب:*\n"
+            "این منابع فایل رایگانِ مستقیم نمی‌دهند، پس لینک مستقیمشان را باز می‌کنیم.\n"
+            "برای دانلود رایگان، از منابع داخل ربات استفاده کنید.",
+            parse_mode="Markdown",
+            reply_markup=book_sources_kb(),
+        )
+        return
+
+    if data == "book_ravebook":
+        set_state(cid, mode="ravebook", ravebook_mode="ebooks")
+        send_message(
+            cid,
+            "📚 جستجو در Rave Book Search (ده‌ها سایت کتاب):\nعنوان کتاب یا نویسنده را بنویسید:",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    if data == "book_ravebook_audio":
+        set_state(cid, mode="audiobook")
+        send_message(
+            cid,
+            "🎧 جستجوی کتاب صوتی:\nعنوان کتاب یا نویسنده را بنویسید:",
+            reply_markup=cancel_kb(),
+        )
         return
 
     if data in ("book_search", "book_search_art"):
@@ -11639,7 +16730,7 @@ def handle_callback(cb: dict):
     m = re.match(r"book_dl_(\w+)$", data)
     if m:
         url_key = m.group(1)
-        stored = get_url(url_key)
+        stored = get_url_for_chat(url_key, cid)
         if not stored:
             _status(cid, "❌ لینک منقضی شده.", final=True)
             return
@@ -11654,94 +16745,161 @@ def handle_callback(cb: dict):
         return
 
     # ── RSS callbacks ─────────────────────────────────────────────────────
-    if data == "mode_rss" or data.startswith("rss_"):
-        if data == "mode_rss":
-            set_state(cid, mode="rss")
-            send_message(
-                cid,
-                "📰 آدرس فید RSS یا سایت خبری را وارد کنید:\n\n"
-                "مثال‌ها:\n"
-                "• `https://www.bbc.com/persian/index.xml`\n"
-                "• `https://www.isna.ir` ← کشف خودکار",
-                parse_mode="Markdown",
-                reply_markup=cancel_kb(),
-            )
-            return
+    if data == "mode_rss":
+        send_message(cid, "📰 اخبار RSS:", reply_markup=rss_menu_kb())
+        return
 
-        # rss_url_{url_key}  — user picked a discovered feed
-        m = re.match(r"rss_url_(\w+)$", data)
-        if m:
-            url_key = m.group(1)
-            url = get_url(url_key)
+    if data == "rss_read":
+        set_state(cid, mode="rss")
+        send_message(cid, "📰 آدرس فید RSS یا سایت خبری را وارد کنید:", reply_markup=cancel_kb())
+        return
+
+    if data == "rss_subscribe":
+        set_state(cid, mode="rss_subscribe")
+        send_message(cid, "🔔 آدرس فید RSS را برای اشتراک خودکار بفرستید:", reply_markup=cancel_kb())
+        return
+
+    if data == "rss_subscriptions":
+        _rss_subscriptions(cid)
+        return
+
+    m = re.match(r"rss_subs_page_(\d+)$", data)
+    if m:
+        _rss_subscriptions(cid, page=int(m.group(1)))
+        return
+
+    m = re.match(r"rss_keep_(\w+)$", data)
+    if m:
+        cache_set_owned("unsub_" + m.group(1), [], _platform(), cid)
+        _rss_subscriptions(cid)
+        return
+
+    m = re.match(r"rss_(unsub|confirm)_(\w+)$", data)
+    if m:
+        action, key = m.groups()
+        url = get_url_for_chat(key, cid)
+        if action == "unsub":
             if not url:
-                _status(cid, "❌ لینک منقضی.", final=True)
+                _status(cid, "❔ دکمه منقضی شده است؛ فهرست اشتراک‌ها را دوباره باز کنید.", reply_markup=rss_menu_kb(), final=True)
                 return
-            _status(cid, "⏳ دریافت فید…")
-            items = rss_fetch(url, 15)
-            if not items:
-                _status(cid, "❌ فید خالی یا نامعتبر.", reply_markup=home_kb(), final=True)
-                return
-            key = make_cache_key("rss", url, 0)
-            cache_set(key, items)
-            set_state(cid, mode="rss", last_query=url, cache_key=key)
-            _display_rss_list(cid, items, key)
-            return
+            cache_set_owned("unsub_" + key, [time.time() + 300], _platform(), cid)
+            send_message(cid, f"🔕 اشتراک این فید لغو شود؟\n{url}", reply_markup={"inline_keyboard": [
+                [{"text": "بله، لغو اشتراک", "callback_data": f"rss_confirm_{key}"}],
+                [{"text": "🔙 حفظ اشتراک", "callback_data": f"rss_keep_{key}"}]]})
+        else:
+            pending = cache_get_owned("unsub_" + key, _platform(), cid)
+            cache_set_owned("unsub_" + key, [], _platform(), cid)
+            if not url or not pending or pending[0] < time.time():
+                _status(cid, "❔ تأیید منقضی شده است؛ اشتراک‌ها را دوباره باز کنید.", reply_markup=rss_menu_kb(), final=True)
+            elif any(sub.get("topic") == url for sub in durable_store.get_subscriptions(_platform(), cid)):
+                durable_store.unsubscribe(_platform(), cid, url)
+                _status(cid, "✅ اشتراک فید لغو شد.", reply_markup=rss_menu_kb(), final=True)
+            else:
+                _status(cid, "ℹ️ این فید دیگر در اشتراک‌های شما نیست.", reply_markup=rss_menu_kb(), final=True)
+        return
 
-        # rss_item_{cache_key}_{idx}
-        m = re.match(r"rss_item_(\w+)_(\d+)$", data)
-        if m:
-            key, idx = m.group(1), int(m.group(2))
-            items = cache_get(key)
-            if not items or idx >= len(items):
-                _status(cid, "❌ خبر منقضی.", final=True)
-                return
-            _show_rss_item(cid, items[idx])
+    m = re.match(r"rss_url_(\w+)$", data)
+    if m:
+        url_key = m.group(1)
+        url = get_url_for_chat(url_key, cid)
+        if not url:
+            _status(cid, "❌ لینک منقضی.", final=True)
             return
+        _status(cid, "⏳ دریافت فید…")
+        items = rss_fetch(url, 15)
+        if not items:
+            _status(cid, "❌ فید خالی یا نامعتبر.", reply_markup=home_kb(), final=True)
+            return
+        key = _rss_cache_key(cid, url, 0)
+        cache_set_owned(key, items, _platform(), cid)
+        set_state(cid, mode="rss", last_query=url, cache_key=key)
+        _display_rss_list(cid, items, key)
+        return
+
+    m = re.match(r"rss_page_(\w+)_(\d+)$", data)
+    if m:
+        key, page = m.group(1), int(m.group(2))
+        items = cache_get_owned(key, _platform(), cid)
+        if not items:
+            _status(cid, "❔ فید منقضی شده است؛ دوباره باز کنید.", final=True)
+            return
+        _display_rss_list(cid, items, key, page=page)
+        return
+
+    m = re.match(r"rss_item_(\w+)_(\d+)$", data)
+    if m:
+        key, idx = m.group(1), int(m.group(2))
+        items = cache_get_owned(key, _platform(), cid)
+        if not items or idx < 0 or idx >= len(items):
+            _status(cid, "❔ خبر منقضی شده است؛ فید را دوباره باز کنید.", final=True)
+            return
+        _show_rss_item(cid, items[idx])
+        return
 
     # ── Site view buttons ─────────────────────────────────────────────────
+    m = re.match(r"site_(tr|scan)_(\w+)$", data)
+    if m:
+        action, url_key = m.group(1), m.group(2)
+        url = get_url_for_chat(url_key, cid)
+        if not url:
+            _status(cid, "❌ لینک منقضی شده.", reply_markup=home_kb(), final=True)
+            return
+        if action == "tr":
+            _status(cid, "⏳ در حال ترجمه متن صفحه…")
+            text = translate_text(page_to_text(url)[:8000], "fa")
+            send_message(cid, f"🌐 ترجمه فارسی صفحه:\n\n{text[:3500]}", reply_markup=home_kb())
+        else:
+            do_virusscan_url(cid, url)
+        return
+
     m = re.match(r"site_(text|html|zip|pdf)_(\w+)$", data)
     if m:
         action, url_key = m.group(1), m.group(2)
-        url = get_url(url_key)
+        url = get_url_for_chat(url_key, cid)
         if not url:
             _status(cid, "❌ لینک منقضی شده.", reply_markup=home_kb(), final=True)
             return
         chat_action(cid, "upload_document")
+        ok = False
         if action == "text":
             txt = page_to_text(url)
-            send_message(cid, f"📝 متن صفحه:\n\n{txt[:3500]}", reply_markup=home_kb())
+            ok = bool(send_message(cid, f"📝 متن صفحه:\n\n{txt[:3500]}", reply_markup=home_kb()).get("ok"))
             if len(txt) > 3500:
-                send_document(cid, txt.encode("utf-8"), "page_text.txt")
+                ok = send_document(cid, txt.encode("utf-8"), "page_text.txt") and ok
         elif action == "html":
             html = fetch_page(url)
             if html:
-                send_document(cid, html, "page.html", caption=f"🌐 {url[:60]}")
+                ok = send_document(cid, html, "page.html", caption=f"🌐 {url[:60]}")
             else:
                 _status(cid, "❌ خطا در دریافت HTML.", reply_markup=home_kb(), final=True)
+                return
         elif action == "zip":
             _status(cid, "⏳ در حال ساخت ZIP…")
             zdata = page_to_zip(url)
             if zdata:
                 domain = urllib.parse.urlparse(url).netloc.replace(".", "_")
-                send_document(cid, zdata, f"{domain}_offline.zip")
+                ok = send_document(cid, zdata, f"{domain}_offline.zip")
             else:
                 _status(cid, "❌ خطا در ZIP.", reply_markup=home_kb(), final=True)
+                return
         elif action == "pdf":
             _status(cid, "⏳ در حال تولید PDF…")
             pdf = page_to_pdf(url)
             if pdf:
                 ext = "pdf" if pdf[:4] == b"%PDF" else "html"
-                send_document(cid, pdf, f"page.{ext}", caption=f"📑 {url[:60]}")
+                ok = send_document(cid, pdf, f"page.{ext}", caption=f"📑 {url[:60]}")
             else:
                 _status(cid, "❌ خطا در PDF.", reply_markup=home_kb(), final=True)
-        _status(cid, "✅", reply_markup=site_view_kb(url_key), final=True)
+                return
+        _status(cid, "✅ ارسال شد." if ok else "❌ ارسال خروجی ناموفق بود.", reply_markup=site_view_kb(url_key), final=True)
         return
 
     # ── Search result click (web, scholar) ────────────────────────────────
     m = re.match(r"res_(\w+)_(\d+)$", data)
     if m:
         key, idx = m.group(1), int(m.group(2))
-        results = cache_get(key)
+        source = _search_source(cid, key)
+        results = source["results"] if source else []
         if not results or idx >= len(results):
             _status(cid, "❌ نتیجه منقضی.", final=True)
             return
@@ -11750,7 +16908,7 @@ def handle_callback(cb: dict):
         link = r.get("link") or r.get("url", "")
         snippet = r.get("snippet") or r.get("meta", "")
         txt = f"🔗 *{r.get('title', '')}*\n\n{snippet[:400]}\n\n[باز کردن لینک]({link})"
-        url_key = store_url(link)
+        url_key = store_url(link, chat_id=cid)
         kb = {
             "inline_keyboard": [
                 [
@@ -11759,7 +16917,7 @@ def handle_callback(cb: dict):
                 ],
                 [
                     {"text": "🌐 HTML", "callback_data": f"site_html_{url_key}"},
-                    {"text": "🔙 برگشت به نتایج", "callback_data": "results_back"},
+                    {"text": "🔙 برگشت به نتایج", "callback_data": f"search_back_{key}"},
                 ],
             ]
         }
@@ -11769,7 +16927,7 @@ def handle_callback(cb: dict):
     m = re.match(r"site_ss_(\w+)$", data)
     if m:
         url_key = m.group(1)
-        url = get_url(url_key)
+        url = get_url_for_chat(url_key, cid)
         if not url:
             _status(cid, "❌ لینک منقضی.", final=True)
             return
@@ -11782,54 +16940,28 @@ def handle_callback(cb: dict):
                 cid, "❌ اسکرین‌شات ممکن نبود.", reply_markup=site_view_kb(url_key), final=True)
         return
 
-    if data == "results_back":
-        query = st.get("last_query", "")
-        page = st.get("page", 0)
-        mode = st.get("mode", "")
-        if "scholar" in mode:
-            do_scholar(cid, query, page)
-        elif query:
-            do_search(cid, query, page)
+    m = re.match(r"search_back_(\w+)$", data) or re.match(r"search_page_(\w+)_(\d+)$", data)
+    if m:
+        action = "back" if data.startswith("search_back_") else "page"
+        key = m.group(1)
+        target = m.group(2) if action == "page" else None
+        source = _search_source(cid, key)
+        if not source:
+            _status(cid, "❔ دکمهٔ جستجو منقضی شده است؛ دوباره جستجو کنید.", reply_markup=home_kb(), final=True)
+        elif action == "back":
+            _show_search_source(cid, source, key)
         else:
-            send_message(cid, "🏠", reply_markup=main_menu_kb())
+            target_key = make_cache_key(source["kind"], f"{_platform()}:{cid}:{source['query']}", int(target))
+            cached = _search_source(cid, target_key)
+            if cached:
+                _show_search_source(cid, cached, target_key)
+            else:
+                handler = {"ws": do_search, "sc": do_scholar, "uni": unified_search}[source["kind"]]
+                handler(cid, source["query"], int(target))
         return
 
-    # ── Pagination (web search, scholar, unified) ─────────────────────────
-    pm = re.match(r"page_(ws|sc|uni)_(\d+)$", data)
-    if pm:
-        kind, page = pm.group(1), int(pm.group(2))
-        query = st.get("last_query", "")
-        if not query:
-            _status(cid, "❌ جستجوی قبلی یافت نشد.", final=True)
-            return
-        if kind == "ws":
-            do_search(cid, query, page)
-        elif kind == "sc":
-            do_scholar(cid, query, page)
-        elif kind == "uni":
-            search_type = st.get("search_type", "combined")
-            if search_type == "paper":
-                do_scholar(cid, query, page)
-            elif search_type == "book":
-                do_book_search(cid, query)
-            else:
-                # Combined search - re-run with page
-                _status(
-                    cid, f"⏳ در حال جستجوی ترکیبی: _{query}_…", parse_mode="Markdown"
-                )
-                scholar_results = scholar_search(query, page)
-                book_results = libgen_search(query, count=5)
-                combined_results = scholar_results + book_results
-                key = make_cache_key("uni", query, page)
-                cache_set(key, combined_results)
-                if not combined_results:
-                    _status(cid, "❌ نتیجه‌ای یافت نشد.", reply_markup=home_kb(), final=True)
-                    return
-                text = f"🔍 *جستجوی ترکیبی:* _{query}_ (صفحه {page + 1})"
-                kb = search_results_kb(
-                    combined_results, key, page, len(combined_results) >= 8, "uni"
-                )
-                send_message(cid, text, parse_mode="Markdown", reply_markup=kb)
+    if data == "results_back" or re.match(r"page_(ws|sc|uni)_\d+$", data):
+        _status(cid, "❔ این دکمه قدیمی است؛ جستجو را دوباره آغاز کنید.", reply_markup=home_kb(), final=True)
         return
 
     # ── Wiki article click ────────────────────────────────────────────────
@@ -11908,6 +17040,23 @@ def handle_callback(cb: dict):
         )
         return
 
+    m_twunroll = re.match(r"tw_unroll_(https?://.+)$", data)
+    if m_twunroll:
+        do_twitter_thread(cid, m_twunroll.group(1))
+        return
+
+    if data == "tw_thread":
+        set_state(cid, mode="twitter_thread")
+        send_message(
+            cid,
+            "🧵 لینک یکی از پست‌های رشته (ترید) را بفرستید:\n"
+            "_(مثال: `https://x.com/user/status/123`)_\n"
+            "رشته به صورت یک متن پیوسته نمایش داده می‌شود.",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
     if data == "tw_dl_translate":
         set_state(cid, mode="twitter_dl_translate")
         send_message(
@@ -11939,6 +17088,16 @@ def handle_callback(cb: dict):
             "📸 لینک پست یا ریل را وارد کنید:\n"
             "_(مثال: `https://www.instagram.com/p/ABC123/`)_",
             parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    if data == "ig_story":
+        set_state(cid, mode="ig_story")
+        send_message(
+            cid,
+            "📸 نام کاربری اینستاگرام را وارد کنید (بدون @):\n"
+            "استوری فعال ۲۴ ساعت اخیر دانلود می‌شود.",
             reply_markup=cancel_kb(),
         )
         return
@@ -11990,6 +17149,99 @@ def handle_callback(cb: dict):
         )
         return
 
+    if data == "tt_sound":
+        set_state(cid, mode="tt_sound")
+        send_message(
+            cid,
+            "🎵 لینک پست TikTok (ویدیو یا عکس) را وارد کنید تا صدایش ارسال شود:",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    # ── Reddit ──────────────────────────────────────────────────────────────
+    if data == "mode_reddit":
+        send_message(cid, "📱 رددیت:", reply_markup=reddit_kb())
+        return
+
+    if data == "reddit_dl":
+        set_state(cid, mode="reddit_dl")
+        send_message(
+            cid,
+            "📱 لینک پست رددیت را وارد کنید:\n"
+            "_(مثال: `https://www.reddit.com/r/subreddit/comments/abc123/`)_",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    if data == "reddit_profile":
+        set_state(cid, mode="reddit_profile")
+        send_message(
+            cid,
+            "📱 نام کاربری رددیت را وارد کنید:\n_(مثال: `spez`)_",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    # ── Twitch ──────────────────────────────────────────────────────────────
+    if data == "mode_twitch":
+        send_message(cid, "🎮 تویچ:", reply_markup=twitch_kb())
+        return
+
+    if data == "twitch_dl":
+        set_state(cid, mode="twitch_dl")
+        send_message(
+            cid,
+            "🎮 لینک VOD یا Clip تویچ را وارد کنید:\n"
+            "_(مثال: `https://www.twitch.tv/videos/123456789` یا `https://clips.twitch.tv/abc123`)_",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    if data == "twitch_user":
+        set_state(cid, mode="twitch_user")
+        send_message(
+            cid,
+            "🎮 نام کاربری تویچ را وارد کنید:\n_(مثال: `shroud`)_",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    # ── Vimeo ───────────────────────────────────────────────────────────────
+    if data == "mode_vimeo":
+        send_message(cid, "🎬 ویمئو:", reply_markup=vimeo_kb())
+        return
+
+    if data == "vimeo_dl":
+        set_state(cid, mode="vimeo_dl")
+        send_message(
+            cid,
+            "🎬 لینک ویدیو ویمئو را وارد کنید:\n"
+            "_(مثال: `https://vimeo.com/123456789`)_",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    # ── Pinterest Video ─────────────────────────────────────────────────────
+    if data == "mode_pinterest_video":
+        send_message(cid, "📌 پینترست ویدیو:", reply_markup=pinterest_kb())
+        return
+
+    if data == "pin_dl":
+        set_state(cid, mode="pin_dl")
+        send_message(
+            cid,
+            "📌 لینک ویدیو پینترست را وارد کنید:\n"
+            "_(مثال: `https://www.pinterest.com/pin/123456789/`)_",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
     # ── Bluesky ───────────────────────────────────────────────────────────
     if data == "mode_bluesky":
         set_state(cid, mode="bluesky")
@@ -12025,10 +17277,8 @@ def handle_callback(cb: dict):
     m_sc = re.match(r"sc_dl_(\w+)$", data)
     if m_sc:
         url_key = m_sc.group(1)
-        url = get_url(url_key)
-        # Try to get chat_id from cache first, fallback to callback's cid
-        cached_cid = get_url_chat(url_key)
-        target_cid = cached_cid if cached_cid else cid
+        url = get_url_for_chat(url_key, cid)
+        target_cid = cid
         if not url:
             _status(target_cid, "❌ لینک منقضی شده.", final=True)
             return
@@ -12036,9 +17286,12 @@ def handle_callback(cb: dict):
         # the new thread would otherwise default to Bale and send to the
         # wrong API if this button was clicked from Telegram.
         captured_platform = _platform()
+        operation = getattr(_ctx, "operation", None)
+        callback_operation = getattr(_ctx, "callback_operation", False)
 
         def _music_thread(cid=target_cid, u=url, plat=captured_platform):
-            _set_platform_ctx(plat)
+            _set_platform_ctx(plat, chat_id=cid, operation=operation,
+                              callback_operation=callback_operation)
             do_music(cid, u)
 
         threading.Thread(target=_music_thread, daemon=True).start()
@@ -12121,11 +17374,113 @@ def handle_callback(cb: dict):
             send_message(cid, "📥 دانلود ویدیو؟", reply_markup=kb)
         return
 
-    # ── Social media download button: soc_dl_{platform}_{url_key} ────────
-    m = re.match(r"soc_dl_(tg|tw|ig|tt)_(\w+)$", data)
+    # ── Reddit item click: reddit_item_{cache_key}_{idx} ───────
+    m = re.match(r"reddit_item_(\w+)_(\d+)$", data)
+    if m:
+        key, idx = m.group(1), int(m.group(2))
+        results = cache_get_owned(key, _platform(), cid)
+        if not results or idx < 0 or idx >= len(results):
+            _status(cid, "❔ نتیجه منقضی شده است؛ دوباره جستجو کنید.", final=True)
+            return
+        item = results[idx]
+        url = item.get("url", "")
+        title = item.get("title", "")
+        dur = item.get("duration", "")
+        thumbnail = item.get("thumbnail", "")
+        text = f"📱 *{title}*" if title else "📱 پست رددیت"
+        if dur:
+            text += f"\n⏱ {dur}"
+        if url:
+            text += f"\n[🔗 لینک]({url})"
+        send_message(cid, text, parse_mode="Markdown")
+        if thumbnail:
+            try:
+                thumb_bytes = download_bytes(thumbnail, MAX_IMAGE_SIZE)
+                if thumb_bytes and len(thumb_bytes) > 500:
+                    send_photo(cid, thumb_bytes, caption="📱")
+            except Exception as e:
+                log.warning("reddit thumb dl: %s", e)
+        set_state(cid, last_caption=title)
+        kb = social_post_kb(url, "reddit", True) if url else home_kb()
+        send_message(cid, "📥 دانلود؟", reply_markup=kb)
+        return
+
+    # ── Twitch item click: twitch_item_{cache_key}_{idx} ───────
+    m = re.match(r"twitch_item_(\w+)_(\d+)$", data)
+    if m:
+        key, idx = m.group(1), int(m.group(2))
+        results = cache_get_owned(key, _platform(), cid)
+        if not results or idx < 0 or idx >= len(results):
+            _status(cid, "❔ نتیجه منقضی شده است؛ دوباره جستجو کنید.", final=True)
+            return
+        item = results[idx]
+        url = item.get("url", "")
+        title = item.get("title", "")
+        dur = item.get("duration", "")
+        thumbnail = item.get("thumbnail", "")
+        text = f"🎮 *{title}*" if title else "🎮 ویدیوی تویچ"
+        if dur:
+            text += f"\n⏱ {dur}"
+        if url:
+            text += f"\n[🔗 لینک]({url})"
+        send_message(cid, text, parse_mode="Markdown")
+        if thumbnail:
+            try:
+                thumb_bytes = download_bytes(thumbnail, MAX_IMAGE_SIZE)
+                if thumb_bytes and len(thumb_bytes) > 500:
+                    send_photo(cid, thumb_bytes, caption="🎮")
+            except Exception as e:
+                log.warning("twitch thumb dl: %s", e)
+        set_state(cid, last_caption=title)
+        kb = social_post_kb(url, "twitch", True) if url else home_kb()
+        send_message(cid, "📥 دانلود؟", reply_markup=kb)
+        return
+
+    # ── Social media quality picker: soc_dl_quality_{platform}_{url_key} ────────
+    m = re.match(r"soc_dl_quality_(reddit|twitch|vimeo|pinterest|hls)_(\w+)$", data)
     if m:
         platform, url_key = m.group(1), m.group(2)
-        url = get_url(url_key) or ""
+        url = get_url_for_chat(url_key, cid) or ""
+        if not url:
+            _status(cid, "❌ لینک منقضی.", final=True)
+            return
+        _status(cid, "🔍 دریافت کیفیت‌های موجود…")
+        try:
+            result = subprocess.run(
+                [YTDLP_BIN, "-j", "--no-warnings", url],
+                capture_output=True, text=True, timeout=30
+            )
+            info = json.loads(result.stdout.strip().split("\n")[-1])
+            formats = info.get("formats", [])
+            video_formats = [f for f in formats if f.get("vcodec") != "none" and f.get("acodec") != "none"]
+            if not video_formats:
+                video_formats = [f for f in formats if f.get("vcodec") != "none"]
+
+            # Sort by height descending
+            video_formats.sort(key=lambda x: x.get("height", 0), reverse=True)
+
+            rows = []
+            for f in video_formats[:8]:  # Max 8 options
+                h = f.get("height", "?")
+                ext = f.get("ext", "mp4")
+                fps = f.get("fps", "")
+                size = f.get("filesize", 0) or f.get("filesize_approx", 0)
+                size_str = f" ({size/1024/1024:.1f}MB)" if size else ""
+                fps_str = f"@{fps}fps" if fps else ""
+                label = f"{h}p {ext}{fps_str}{size_str}"
+                fmt_id = f.get("format_id", "")
+                rows.append([{"text": label, "callback_data": f"soc_dl_fmt_{platform}_{url_key}_{fmt_id}"}])
+
+            rows.append([{"text": "❌ انصراف", "callback_data": "cancel"}])
+            send_message(cid, "🎬 کیفیت ویدیو را انتخاب کنید:", reply_markup={"inline_keyboard": rows})
+        except Exception as e:
+            log.error("quality picker error: %s", e)
+            _status(cid, "❌ خطا در دریافت کیفیت‌ها.", final=True)
+        return
+    m = re.match(r"soc_dl_(tg|tw|ig|tt|reddit|twitch|vimeo|pinterest|hls)_(\w+)$", data)
+    if m:
+        platform, url_key = m.group(1), m.group(2)
+        url = get_url_for_chat(url_key, cid) or ""
         if not url:
             _status(cid, "❌ لینک منقضی.", final=True)
             return
@@ -12137,6 +17492,114 @@ def handle_callback(cb: dict):
             do_instagram_dl(cid, url)
         elif platform == "tt":
             do_tiktok_dl(cid, url)
+        elif platform == "reddit":
+            do_reddit_dl(cid, url)
+        elif platform == "twitch":
+            do_twitch_dl(cid, url)
+        elif platform == "vimeo":
+            do_vimeo_dl(cid, url)
+        elif platform == "pinterest":
+            do_pinterest_video_dl(cid, url)
+        return
+
+    # ── Social media audio-only download: soc_dl_audio_{platform}_{url_key} ────────
+    m = re.match(r"soc_dl_audio_(tg|tw|ig|tt|reddit|twitch|vimeo|pinterest)_(\w+)$", data)
+    if m:
+        platform, url_key = m.group(1), m.group(2)
+        url = get_url_for_chat(url_key, cid) or ""
+        if not url:
+            _status(cid, "❌ لینک منقضی.", final=True)
+            return
+        if platform == "reddit":
+            do_reddit_dl(cid, url, audio_only=True)
+        elif platform == "twitch":
+            do_twitch_dl(cid, url, audio_only=True)
+        elif platform == "vimeo":
+            do_vimeo_dl(cid, url, audio_only=True)
+        elif platform == "pinterest":
+            do_pinterest_video_dl(cid, url, audio_only=True)
+        elif platform == "tg":
+            do_tg_dl_media(cid, url, audio_only=True)
+        elif platform == "tw":
+            do_twitter_dl(cid, url, audio_only=True)
+        elif platform == "ig":
+            do_instagram_dl(cid, url, audio_only=True)
+        elif platform == "tt":
+            do_tiktok_dl(cid, url, audio_only=True)
+        return
+
+    # ── Social media quality picker: soc_dl_quality_{platform}_{url_key} ────────
+    m = re.match(r"soc_dl_quality_(reddit|twitch|vimeo|pinterest|hls)_(\w+)$", data)
+    if m:
+        platform, url_key = m.group(1), m.group(2)
+        url = get_url_for_chat(url_key, cid) or ""
+        if not url:
+            _status(cid, "❌ لینک منقضی.", final=True)
+            return
+        # Probe formats via yt-dlp
+        _status(cid, "🔍 در حال بررسی کیفیت‌های موجود...")
+        try:
+            import subprocess, json
+            result = subprocess.run(
+                ["yt-dlp", "-j", url],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode != 0:
+                _status(cid, "❌ خطا در دریافت اطلاعات ویدیو.", final=True)
+                return
+            info = json.loads(result.stdout.strip().split('\n')[-1])
+            formats = info.get("formats", [])
+            # Filter video-only formats (with height)
+            video_formats = []
+            seen = set()
+            for f in formats:
+                h = f.get("height")
+                if h and h not in seen and f.get("vcodec") != "none":
+                    seen.add(h)
+                    video_formats.append({
+                        "height": h,
+                        "ext": f.get("ext", "mp4"),
+                        "format_id": f.get("format_id"),
+                    })
+            video_formats.sort(key=lambda x: x["height"], reverse=True)
+            if not video_formats:
+                _status(cid, "❌ فرمت ویدیو یافت نشد.", final=True)
+                return
+            # Build quality keyboard
+            rows = []
+            for vf in video_formats[:6]:  # Max 6 options
+                label = f"{vf['height']}p ({vf['ext']})"
+                rows.append([{
+                    "text": label,
+                    "callback_data": f"soc_dl_fmt_{platform}_{url_key}_{vf['format_id']}",
+                }])
+            rows.append([{"text": "❌ انصراف", "callback_data": "cancel"}])
+            send_message(cid, "🎬 کیفیت مورد نظر را انتخاب کنید:", reply_markup={"inline_keyboard": rows})
+        except Exception as e:
+            log.error("quality probe: %s", e)
+            _status(cid, "❌ دریافت لیست کیفیت‌ها ناموفق بود.\n" + friendly_error(e),
+                    reply_markup=home_kb(), final=True)
+        return
+
+    # ── Social media format selection: soc_dl_fmt_{platform}_{url_key}_{format_id} ────────
+    m = re.match(r"soc_dl_fmt_(reddit|twitch|vimeo|pinterest|hls)_(\w+)_(.+)$", data)
+    if m:
+        platform, url_key, fmt_id = m.group(1), m.group(2), m.group(3)
+        url = get_url_for_chat(url_key, cid) or ""
+        if not url:
+            _status(cid, "❌ لینک منقضی.", final=True)
+            return
+        _status(cid, f"⬇️ دانلود با فرمت {fmt_id}...")
+        if platform == "reddit":
+            do_reddit_dl(cid, url, format_id=fmt_id)
+        elif platform == "twitch":
+            do_twitch_dl(cid, url, format_id=fmt_id)
+        elif platform == "vimeo":
+            do_vimeo_dl(cid, url, format_id=fmt_id)
+        elif platform == "pinterest":
+            do_pinterest_video_dl(cid, url, format_id=fmt_id)
+        elif platform == "hls":
+            do_hls_dl(cid, url, format_id=fmt_id)
         return
 
     # ── Music track click: mu_dl_{cache_key}_{idx} ───────────────────────
@@ -12178,9 +17641,9 @@ def handle_callback(cb: dict):
             except Exception as e:
                 log.warning("music thumb: %s", e)
 
-        _do_audio_download(
-            cid, url, source=source, title=title, artist=artist, track_item=track
-        )
+        # Store track info in state for audio format selection
+        set_state(cid, last_url=url, last_title=title, last_artist=artist, last_track_item=track)
+        send_message(cid, "🎵 فرمت صوتی را انتخاب کنید:", reply_markup=audio_format_kb())
         return
 
     # ── Generic search results: res_{cache_key}_{idx} (Scholar, Wiki, etc.) ───
@@ -12220,7 +17683,7 @@ def handle_callback(cb: dict):
                         [
                             {
                                 "text": "🔗 مشاهده در Google Scholar",
-                                "callback_data": f"open_url_{store_url(link)}",
+                                "callback_data": f"open_url_{store_url(link, chat_id=cid)}",
                             }
                         ],
                         [{"text": "🏠 منوی اصلی", "callback_data": "home"}],
@@ -12234,8 +17697,13 @@ def handle_callback(cb: dict):
         # But for safety, fall through to unhandled
         pass
 
-    # ── Images query entry ────────────────────────────────────────────────
+    # ── Unknown/stale callback: stop the spinner and return to a safe menu ──
     log.warning("Unhandled callback: %r", data)
+    _status(
+        cid,
+        "⚠️ این گزینه دیگر معتبر نیست؛ لطفاً از منوی اصلی دوباره انتخاب کنید.",
+        reply_markup=main_menu_kb(), final=True,
+    )
 
 
 def handle_message_images_query(cid: int, text: str, st: dict):
@@ -12260,26 +17728,71 @@ _orig_dispatch_key = "images_query"
 # Each platform has its own polling thread; handler threads are shared.
 from concurrent.futures import ThreadPoolExecutor
 
-_update_executor = ThreadPoolExecutor(max_workers=40, thread_name_prefix="upd")
+_UPDATE_WORKERS = int(os.getenv("MAX_CONCURRENT_UPDATES", "12"))
+_UPDATE_OUTSTANDING = int(os.getenv("MAX_QUEUED_UPDATES", "24"))
+_update_executor = ThreadPoolExecutor(max_workers=_UPDATE_WORKERS, thread_name_prefix="upd")
+_update_admission = _threading.BoundedSemaphore(_UPDATE_OUTSTANDING)
+_update_chat_locks: dict[tuple[str, int], dict] = {}
+_update_chat_locks_lock = _threading.Lock()
+
+
+def _update_chat_id(update: dict):
+    body = update.get("message") or (update.get("callback_query") or {}).get("message") or {}
+    return (body.get("chat") or {}).get("id")
+
+
+def _chat_update_lock(platform: str, update: dict):
+    cid = _update_chat_id(update)
+    if cid is None:
+        return None, _threading.Lock()
+    key = (platform, cid)
+    with _update_chat_locks_lock:
+        entry = _update_chat_locks.setdefault(key, {"lock": _threading.Lock(), "pending": 0})
+        entry["pending"] += 1
+        return key, entry["lock"]
+
+
+def _submit_update(executor, platform: str, update: dict):
+    """Bound backlog and serialize one chat without retaining idle chat locks."""
+    _update_admission.acquire()
+    key, lock = _chat_update_lock(platform, update)
+
+    def run():
+        try:
+            with lock:
+                return _handle_update_safe(platform, update)
+        finally:
+            if key is not None:
+                with _update_chat_locks_lock:
+                    entry = _update_chat_locks.get(key)
+                    if entry:
+                        entry["pending"] -= 1
+                        if not entry["pending"]:
+                            _update_chat_locks.pop(key, None)
+            _update_admission.release()
+
+    return executor.submit(run)
 
 
 def _handle_update_safe(platform: str, update: dict):
     """Set platform context then dispatch — runs inside the shared thread pool."""
-    _set_platform_ctx(platform)  # make api/send_* use the right endpoint
+    cid = _update_chat_id(update)
+    _set_platform_ctx(platform, chat_id=cid)
     try:
         handle_update(update)
+    except _BrowserBusy:
+        if cid:
+            _status(cid, _BUSY_TEXT, reply_markup=home_kb(), final=True)
     except Exception as e:
         log.error("[%s] handle_update: %s", platform, e, exc_info=True)
-        try:
-            cid = None
-            if "message" in update:
-                cid = update["message"]["chat"]["id"]
-            elif "callback_query" in update:
-                cid = update["callback_query"]["message"]["chat"]["id"]
-            if cid:
-                _notify_bale_error(cid)
-        except Exception:
-            pass
+        if cid:
+            # Finalize any stuck status bubble so it stops spinning/typing.
+            try:
+                _status(cid, "❌ " + friendly_error(e),
+                        reply_markup=home_kb(), final=True)
+            except Exception:
+                pass
+            _notify_bale_error(cid)
 
 
 def handle_update(update: dict):
@@ -12322,7 +17835,7 @@ def _poll_platform(platform: str, token: str):
             failures = 0
             for update in resp.get("result", []):
                 offset = update["update_id"] + 1
-                _update_executor.submit(_handle_update_safe, platform, update)
+                _submit_update(_update_executor, platform, update)
         except requests.exceptions.ReadTimeout:
             # Normal for long-poll — server held the connection open but no updates
             pass
@@ -12340,7 +17853,37 @@ def _poll_platform(platform: str, token: str):
             time.sleep(min(5 * failures, 60))
 
 
+def _init_durable_store():
+    durable_store.init_db()
+    # Revoke only the two accidental cross-platform dev grants; preserve pro tiers
+    # and unrelated grants. Keep correction and intended grants atomic.
+    now = int(time.time())
+    with durable_store._get_conn() as conn:
+        conn.executemany(
+            "UPDATE user_tiers SET tier='normal', updated_at=? "
+            "WHERE platform=? AND chat_id=? AND tier='dev'",
+            [(now, "telegram", 867555398), (now, "bale", 96734183)],
+        )
+        conn.executemany(
+            "INSERT INTO user_tiers (platform, chat_id, tier, created_at, updated_at) "
+            "VALUES (?, ?, 'dev', ?, ?) ON CONFLICT(platform, chat_id) DO UPDATE "
+            "SET tier='dev', updated_at=excluded.updated_at",
+            [(platform, cid, now, now) for platform, cid in
+             (("telegram", 96734183), ("bale", 867555398))],
+        )
+        conn.commit()
+
+
 def run():
+    instance_lock = _acquire_instance_lock()
+    if instance_lock is None:
+        log.critical("Another bot process already owns /tmp/baleghorbanbot.lock; exiting")
+        return
+    try:
+        _init_durable_store()
+    except Exception as e:
+        log.critical("SQLite initialization failed: %s", e)
+        return
     threads = []
 
     if BALE_TOKEN:
@@ -12373,6 +17916,7 @@ def run():
         log.critical("No tokens set! Set BALE_TOKEN and/or TELEGRAM_TOKEN in .env")
         return
 
+    _start_rss_scheduler()
     log.info("Bot running on %d platform(s). Press Ctrl+C to stop.", len(threads))
     try:
         while True:

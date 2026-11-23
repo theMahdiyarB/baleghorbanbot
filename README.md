@@ -26,7 +26,7 @@
 | 🌐 **IP / دامنه** | موقعیت، اپراتور، منطقه زمانی |
 | 🔒 **حریم خصوصی** | توضیح کامل نحوه عدم ذخیره داده |
 | 🛡 **اسکن ویروس** | اسکن فایل و URL با VirusTotal (نیاز به API key) |
-| 🦋 **بلواسکای** | دانلود پست، متن و رسانه از Bluesky |
+| 🎬 **فیلم و سریال** | جستجوی TMDb/OMDb + جزئیات کامل (بازیگران، کارگردان، ژانر، امتیاز، زمان) + انتخاب فصل/قسمت + **لینک مستقیم DDL** از open-directory mirrors + **زیرنویس فارسی** (OpenSubtitles API + subf2m fallback) + **پخش/دانلود** (استریم JustWatch برای IR/US + YTS torrent + DDL) |
 | 📄 **مقاله علمی** | جستجو via Semantic Scholar + دانلود PDF از Sci-Hub/LibGen/Unpaywall — بازیابی خودکار در صورت پاسخ خالی/HTML |
 
 ### 🔗 تشخیص خودکار لینک
@@ -114,7 +114,27 @@ export INSTAGRAM_COOKIES_FILE=/path/instagram_cookies.txt
 export SPOTIFY_CLIENT_ID=your_client_id
 export SPOTIFY_CLIENT_SECRET=your_client_secret
 
-# Z-Library: ایمیل و رمز حساب از z-library.sk/login
+# ─── Movie/TV (فیلم و سریال) ───────────────────────────────────────────────
+
+# TMDb API key — رایگان از https://www.themoviedb.org/settings/api
+export TMDB_API_KEY=your_tmdb_key
+
+# OMDb API key — fallback از https://www.omdbapi.com/apikey.aspx
+export OMDB_API_KEY=your_omdb_key
+
+# OpenSubtitles API key — بهترین زیرنویس فارسی از https://www.opensubtitles.com/en/consumers
+export OPENSUBTITLES_API_KEY=your_opensubtitles_key
+
+# Direct-download mirrors (پیش‌فرض کار می‌کند، برای اضافه/تغییر mirrors)
+# Movies: /Movies/{year}/{imdb_id}/file.mp4
+export DDL_MOVIE_HOSTS=https://berlin.saymyname.website
+# Series: /Series/{FirstLetter}/{Show Name}/S{NN}/{quality}/file.mkv
+export DDL_SERIES_HOSTS=https://rio.ggusers.com,https://nairobi.saymyname.website
+
+# Local Telegram Bot API server for 2000MB uploads (Telegram only)
+# export TELEGRAM_API_BASE=http://127.0.0.1:8081
+
+# ─── VirusTotal ─────────────────────────────────────────────────────────────
 export ZLIB_EMAIL=your@email.com
 export ZLIB_PASSWORD=your_password
 

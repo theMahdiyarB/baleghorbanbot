@@ -39,3 +39,20 @@ Thumbs.db
 .mypy_cache/
 # Pytest cache
 .pytest_cache/
+
+# Runtime state, credentials, and local output
+# Keep these on the server; never commit them.
+yt_cookies.txt
+*.session
+bot_data.sqlite3
+bot_data.sqlite3-*
+bale_bot.out
+core
+
+# Accidental project-root Python virtual environment
+/bin/
+/include/
+/lib/
+/lib64
+/share/
+/pyvenv.cfg
