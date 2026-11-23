@@ -1,257 +1,221 @@
-# 🤖 بله قربان — Bale & Telegram Web Assistant Bot
+# 🤖 بله قربان — دستیار وب برای بله و تلگرام
 
-یک ربات جامع و **دو-پلتفرمه** (بله + تلگرام، هم‌زمان) با قابلیت‌های متعدد جستجو، دانلود، شبکه‌های اجتماعی و بیشتر. هر دو پلتفرم مستقل از هم و ایزوله اجرا می‌شوند — پیام‌ها، وضعیت کاربر و دکمه‌ها هرگز بین بله و تلگرام قاطی نمی‌شوند، حتی اگر یک chat ID عددی مشترک بین‌شان پیش بیاید.
+ربات فارسی برای جستجو، دریافت محتوای وب، دانلود رسانه و ابزارهای فایل؛ با پشتیبانی هم‌زمان از **بله و تلگرام**. منطق اصلی و مدیریت قابلیت‌ها در `bale_bot.py` نگه داشته شده است.
+
+کاربرد مهم پروژه، رساندن محتوا و فایل به کاربران بله هنگامی است که دسترسی مستقیم آن‌ها به منابع خارجی محدود است، اما سرور همچنان اینترنت دارد. **ربات آفلاین نیست**؛ عملکرد آن به دسترسی کاربر به پیام‌رسان، اتصال سرور و در دسترس بودن منابع بستگی دارد.
 
 ## ✨ قابلیت‌ها
 
-| ابزار | توضیح |
-|------|--------|
-| 🔎 **جستجو در وب** | تا ۱۰ نتیجه از DuckDuckGo — نتایج قابل کلیک با صفحه‌بندی |
-| 🌐 **مشاهده سایت** | اسکرین‌شات ۱۹۲۰×۱۰۸۰ + دکمه‌های متن / HTML / ZIP / PDF |
-| 📚 **مقاله علمی** | جستجوی Google Scholar با صفحه‌بندی و نتایج قابل کلیک |
-| 📖 **ویکی‌پدیا** | جستجو + خواندن مقاله کامل (فارسی و انگلیسی) |
-| 📺 **یوتیوب** | جستجو با تامبنیل + توضیحات کامل (پیام جدا برای توضیحات طولانی)، **انتخاب کیفیت با نمایش حجم فایل** (360p–1080p+)، **انتخاب زیرنویس**، دانلود صدا، **۳ استراتژی yt-dlp** + **Cobalt fallback** |
-| 🎵 **موسیقی MP3** | دانلود صوتی از YouTube Music / SoundCloud / Spotify / JioSaavn / Deezer |
-| 🖼 **دانلود عکس** | Bing (پارس واقعی نتایج، نه regex حدسی) / Pinterest (fallback چندلایه) / Pixabay (نیاز API key) / Wikimedia (رتبه‌بندی هوشمند) — دانلود با هدر و بررسی content-type برای جلوگیری از ارسال صفحه خطا به‌جای عکس |
-| 🐙 **GitHub** | جستجوی مخازن + دانلود ZIP + دانلود Release |
-| ✈️ **کانال تلگرام** | خواندن پیام‌های کانال عمومی (scrape) یا MTProto |
-| 🐦 **توییتر / X** | تایم‌لاین کاربر + دانلود عکس خودکار + دانلود ویدیو |
-| 📸 **اینستاگرام** | پست‌های پروفایل + دانلود عکس خودکار + دانلود ریل (۳ استراتژی: instaloader → yt-dlp → Cobalt API) |
-| 🎵 **تیک‌تاک** | لیست ویدیوها با تامبنیل + دانلود مستقیم (Cobalt API + بررسی وجود صدا در ویدیوهای طولانی) |
-| 📱 **APK دانلود** | جستجو در Google Play + دانلود APK از APKPure / APKMirror / Aptoide / F-Droid |
-| 📰 **اخبار RSS** | دریافت فید + کشف خودکار فید از سایت |
-| 📚 **دانلود کتاب و مقاله** | جستجو و دانلود کتاب الکترونیکی از **Library Genesis + Anna's Archive + Open Library** (PDF، EPUB، MOBI، FB2) |
-| 🌐 **ترجمه** | ترجمه به فارسی، انگلیسی، عربی، آلمانی، فرانسوی، روسی |
-| 🖼 **OCR** | استخراج متن از عکس + خروجی PDF |
-| 🌐 **IP / دامنه** | موقعیت، اپراتور، منطقه زمانی |
-| 🔒 **حریم خصوصی** | توضیح کامل نحوه عدم ذخیره داده |
-| 🛡 **اسکن ویروس** | اسکن فایل و URL با VirusTotal (نیاز به API key) |
-| 🎬 **فیلم و سریال** | جستجوی TMDb/OMDb + جزئیات کامل (بازیگران، کارگردان، ژانر، امتیاز، زمان) + انتخاب فصل/قسمت + **لینک مستقیم DDL** از open-directory mirrors + **زیرنویس فارسی** (OpenSubtitles API + subf2m fallback) + **پخش/دانلود** (استریم JustWatch برای IR/US + YTS torrent + DDL) |
-| 📄 **مقاله علمی** | جستجو via Semantic Scholar + دانلود PDF از Sci-Hub/LibGen/Unpaywall — بازیابی خودکار در صورت پاسخ خالی/HTML |
+- **وب و مطالعه:** جستجوی وب، ویکی‌پدیا، نمایش متن سایت، اسکرین‌شات و خروجی HTML، ZIP و PDF.
+- **یوتیوب:** جستجو، انتخاب کیفیت و زیرنویس، دریافت صدا، کلیپ و گردش‌کار دانلود پلی‌لیست.
+- **موسیقی:** جستجو و دریافت از منابعی مانند YouTube Music، SoundCloud و Spotify با مسیرهای جایگزین.
+- **شبکه‌های اجتماعی:** دریافت محتوای X/Twitter، رشته‌توییت، Instagram و استوری، TikTok، Reddit، Twitch، Vimeo و ویدیوی Pinterest؛ همچنین لینک‌های HLS.
+- **عکس:** جستجو و دریافت از چند منبع عمومی؛ برخی منابع به کلید API نیاز دارند.
+- **کتاب و مقاله:** جستجوی کتاب، مقاله علمی و کتاب صوتی؛ منابعی مانند LibGen، Anna’s Archive، Open Library، LibriVox و Internet Archive، به‌همراه ابزارهای ارجاع APA و BibTeX.
+- **فیلم و سریال:** جستجوی TMDb/OMDb، جزئیات، فصل و قسمت، منابع تماشا، لینک‌های مستقیم و زیرنویس؛ نمایش لینک به معنی میزبانی محتوا یا تضمین کارکرد آن نیست.
+- **GitHub:** جستجوی مخزن و دریافت ZIP یا فایل‌های Release.
+- **تلگرام:** خواندن کانال‌های عمومی؛ مسیر MTProto اختیاری به تنظیمات و دسترسی مجاز حساب نیاز دارد.
+- **APK:** جستجوی Google Play و تلاش برای دریافت از چند منبع جایگزین.
+- **RSS:** کشف فید، مطالعه خبرها، اشتراک و ارسال دوره‌ای/خلاصه با جلوگیری از ارسال تکراری.
+- **کتابخانه و تاریخچه:** نگهداری لینک‌ها، مرور درخواست‌های قبلی و تلاش دوباره.
+- **ابزارها:** ترجمه، OCR تصویر، اطلاعات IP/دامنه و بررسی فایل/لینک با VirusTotal در صورت تنظیم کلید.
+- **فایل:** استخراج صفحات و ادغام PDF، کاهش حجم عکس، برش و کاهش حجم ویدیو و تغییر قالب رسانه.
 
-### 🔗 تشخیص خودکار لینک
+وجود یک اتصال در کد تضمین نمی‌کند سرویس بیرونی همیشه کار کند. محدودیت منطقه‌ای، احراز هویت، تغییر سایت، سهمیه API و حقوق دسترسی روی نتیجه اثر دارند. فقط محتوایی را دریافت و بازنشر کنید که مجاز به استفاده از آن هستید.
 
-فقط لینک بفرستید — ربات خودکار تشخیص می‌دهد:
+## 🔄 تغییر قالب فایل
 
-- `youtube.com` / `youtu.be` → انتخاب کیفیت + دانلود
-- `tiktok.com` / `vm.tiktok.com` → دانلود ویدیو
-- `twitter.com` / `x.com` → دانلود رسانه
-- `instagram.com` → دانلود پست/ریل
-- `t.me/…` → دانلود رسانه تلگرام
-- سایر لینک‌ها → اسکرین‌شات + گزینه‌های بیشتر
+سه مسیر ورود وجود دارد:
 
-### 📤 ارسال فایل هوشمند
+1. انتخاب ابزار تغییر قالب و ارسال فایل.
+2. استفاده از دکمهٔ تغییر قالب زیر فایل‌های پشتیبانی‌شده‌ای که ربات فرستاده است.
+3. پاسخ به پیام حاوی فایل با `/convert`.
 
-- فایل‌های بزرگ به **قطعه‌های ۲۰MB** (Bale) / **۴۸MB** (Telegram) تقسیم می‌شوند
-- پسوندهای غیر پشتیبانی‌شده در **ZIP** بسته‌بندی می‌شوند
-- پیام ترکیب قطعه‌ها ارسال می‌شود: `cat file.part*of3.ext > file.ext`
+قالب‌های فعلی:
 
-## 🛠 نصب و راه‌اندازی
+- عکس JPG/PNG/WebP به JPG، PNG، WebP یا PDF.
+- صدا به MP3، M4A، OGG یا Opus.
+- ویدیو به MP4، WebM یا استخراج MP3.
 
-### ۱. پیش‌نیازهای سیستم
+محدودیت‌ها:
+
+- ورودی حداکثر **۲۰ MiB**؛ صوت و ویدیو حداکثر **۱۸۰ ثانیه**؛ تصویر حداکثر **۱۶ میلیون پیکسل**.
+- دکمه‌های تبدیل **۳۰ دقیقه** اعتبار دارند و با راه‌اندازی مجدد ربات منقضی می‌شوند.
+- خروجی تبدیل باید در یک سند قابل ارسال جا شود؛ به قطعه‌های باینری تقسیم نمی‌شود.
+- تبدیل فایل Office، تبدیل ورودی PDF و تصاویر متحرک در این ابزار پشتیبانی نمی‌شود. ابزارهای جداگانهٔ ادغام/استخراج PDF همچنان در دسترس‌اند.
+- شفافیت تصویر برای JPG و PDF روی زمینهٔ سفید قرار می‌گیرد.
+- ارسال معمولی عکس همچنان مسیر OCR را حفظ می‌کند؛ برای تغییر قالب از مسیرهای بالا استفاده کنید.
+
+## 📤 دریافت و ارسال رسانه
+
+ربات لینک‌های شناخته‌شده را به مسیر مربوط هدایت می‌کند و برای برخی منابع چند روش دریافت دارد. برای فایل‌های بزرگ، بسته به نوع رسانه و محدودیت پلتفرم، تقسیم یا بسته‌بندی انجام می‌شود. قطعه‌های باینری را باید پس از دریافت همهٔ قسمت‌ها دوباره ترکیب کرد؛ نمونه:
+
+```bash
+cat file.part*of3.ext > file.ext
+```
+
+سقف معمول ارسال در مسیرهای فعلی حدود ۲۰ MiB در بله و ۴۸ MiB در تلگرام است. تنظیم سرور محلی Telegram Bot API می‌تواند مسیر ارسال تلگرام را تغییر دهد؛ محدودیت بله مستقل است.
+
+## 🛠 نصب
+
+### ۱. پیش‌نیازها
+
+محیط مجازی Python توصیه می‌شود؛ محیط اجرایی فعلی پروژه Python 3.12 است. برای OCR، ویدیو و مرورگر:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y \
-  tesseract-ocr tesseract-ocr-fas tesseract-ocr-eng \
-  ffmpeg wkhtmltopdf python3-pip python3-dev
+sudo apt-get install -y python3-venv python3-dev python3-pip \
+  ffmpeg tesseract-ocr tesseract-ocr-fas tesseract-ocr-eng wkhtmltopdf
+
+git clone https://github.com/themahdiyarb/baleghorbanbot.git
+cd baleghorbanbot
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m playwright install chromium
+sudo .venv/bin/python -m playwright install-deps chromium
 ```
 
-### ۲. نصب کتابخانه‌های Python
+بسته‌های مرورگر، FFmpeg و Tesseract وابستگی سیستمی‌اند و صرفاً با نصب `requirements.txt` فراهم نمی‌شوند.
+
+### ۲. تنظیمات
 
 ```bash
-pip install -r requirements.txt
-python -m playwright install chromium
-python -m playwright install-deps chromium
+cp env.example .env
+chmod 600 .env
 ```
 
-### ۳. متغیرهای محیطی (ضروری)
+فایل `.env` را ویرایش کنید؛ برای راه‌اندازی فعلی `BALE_TOKEN` را تنظیم کنید. `TELEGRAM_TOKEN` برای فعال‌سازی هم‌زمان تلگرام اختیاری است:
+
+```dotenv
+BALE_TOKEN=your_bale_bot_token
+TELEGRAM_TOKEN=
+DB_PATH=bot_data.sqlite3
+REDIS_URL=
+```
+
+SQLite برای ذخیره‌سازی پایدار استفاده می‌شود؛ Redis اختیاری است. مسیر نسبی پایگاه داده نسبت به پوشهٔ اجرای برنامه تفسیر می‌شود. فایل `.env` از پوشهٔ پروژه خوانده می‌شود؛ برنامه را از همان پوشه اجرا کنید.
+
+تنظیمات اختیاری متناسب با قابلیت مورد نیاز:
+
+- دریافت رسانه: `YOUTUBE_COOKIES_FILE`، `TWITTER_COOKIES_FILE`، `INSTAGRAM_COOKIES_FILE`، `WARP_PROXY` و `COBALT_URL`.
+- موسیقی: `SPOTIFY_CLIENT_ID` و `SPOTIFY_CLIENT_SECRET`.
+- GitHub: `GITHUB_TOKEN` برای افزایش سهمیه API.
+- کانال تلگرام با MTProto: `TG_API_ID`، `TG_API_HASH` و فایل نشست مجاز.
+- فیلم/سریال: `TMDB_API_KEY`، `OMDB_API_KEY`، `OPENSUBTITLES_API_KEY` و میزبان‌های `DDL_MOVIE_HOSTS` / `DDL_SERIES_HOSTS`.
+- سایر ابزارها: `VIRUSTOTAL_API_KEY`، `PIXABAY_KEY` و `UNPAYWALL_EMAIL`.
+- سرور محلی تلگرام: `TELEGRAM_API_BASE`.
+
+`env.example` نمونهٔ تنظیمات است؛ وجود نام یک متغیر در نمونه به‌تنهایی تضمین اتصال فعال آن به همهٔ مسیرهای برنامه نیست. کوکی یا حساب خصوصی فقط باید متعلق به اپراتور و دارای دسترسی مجاز باشد؛ فایل‌های نشست و کوکی مانند رمز عبور محرمانه‌اند.
+
+### ۳. اجرا
 
 ```bash
-# توکن ربات بله (الزامی)
-export BALE_TOKEN="توکن_ربات_شما"
-
-# اختیاری: ربات تلگرام همزمان (برای پشتیبانی دوplatform)
-export TELEGRAM_TOKEN="توکن_ربات_تلگرام_شما"
+.venv/bin/python bale_bot.py
 ```
 
-### ۴. متغیرهای اختیاری
+برای اجرای دائمی، **یک** مدیر پردازش مانند systemd یا PM2 انتخاب کنید؛ یک نسخهٔ ربات را هم‌زمان با هر دو اجرا نکنید.
 
-```bash
-# YouTube — کوکی مرورگر (توصیه‌شده برای سرورهای دیتاسنتر)
-yt-dlp --cookies-from-browser chrome --cookies /path/yt_cookies.txt https://youtube.com
-export YOUTUBE_COOKIES_FILE=/path/yt_cookies.txt
-
-# WARP Proxy — Cloudflare proxy برای دور زدن بلاک دیتاسنتر (اختیاری)
-# نصب: https://pkg.cloudflareclient.com/
-# warp-cli set-mode proxy && warp-cli connect
-export WARP_PROXY=socks5://127.0.0.1:40000
-
-# Cobalt API — fallback نهایی بعد از شکست تمام استراتژی‌های yt-dlp
-# self-host: https://github.com/imputnet/cobalt
-# برای غیرفعال کردن: خالی بگذارید
-export COBALT_URL=http://localhost:9000
-
-# GitHub — افزایش rate limit API
-export GITHUB_TOKEN=your_github_personal_token
-
-# Telegram MTProto — خواندن کانال‌های خصوصی
-# از https://my.telegram.org بگیرید
-export TG_API_ID=12345678
-export TG_API_HASH=abcdef1234567890abcdef1234567890
-
-# Twitter — کوکی برای دانلود توییت‌های محدودشده
-export TWITTER_COOKIES_FILE=/path/twitter_cookies.txt
-
-# Instagram — برای پروفایل‌های خصوصی‌ها
-export INSTAGRAM_USER=your_username
-export INSTAGRAM_PASS=your_password
-# کوکی فایل برای yt-dlp (جایگزین user/pass)
-export INSTAGRAM_COOKIES_FILE=/path/instagram_cookies.txt
-
-# Spotify — اختیاری، برای پلیلیست‌ها مفید است
-# از https://developer.spotify.com/dashboard بگیرید
-export SPOTIFY_CLIENT_ID=your_client_id
-export SPOTIFY_CLIENT_SECRET=your_client_secret
-
-# ─── Movie/TV (فیلم و سریال) ───────────────────────────────────────────────
-
-# TMDb API key — رایگان از https://www.themoviedb.org/settings/api
-export TMDB_API_KEY=your_tmdb_key
-
-# OMDb API key — fallback از https://www.omdbapi.com/apikey.aspx
-export OMDB_API_KEY=your_omdb_key
-
-# OpenSubtitles API key — بهترین زیرنویس فارسی از https://www.opensubtitles.com/en/consumers
-export OPENSUBTITLES_API_KEY=your_opensubtitles_key
-
-# Direct-download mirrors (پیش‌فرض کار می‌کند، برای اضافه/تغییر mirrors)
-# Movies: /Movies/{year}/{imdb_id}/file.mp4
-export DDL_MOVIE_HOSTS=https://berlin.saymyname.website
-# Series: /Series/{FirstLetter}/{Show Name}/S{NN}/{quality}/file.mkv
-export DDL_SERIES_HOSTS=https://rio.ggusers.com,https://nairobi.saymyname.website
-
-# Local Telegram Bot API server for 2000MB uploads (Telegram only)
-# export TELEGRAM_API_BASE=http://127.0.0.1:8081
-
-# ─── VirusTotal ─────────────────────────────────────────────────────────────
-export ZLIB_EMAIL=your@email.com
-export ZLIB_PASSWORD=your_password
-
-# VirusTotal — اسکن فایل و URL (حداقل ۴ درخواست در دقیقه، ۵۰۰ در روز)
-export VIRUSTOTAL_API_KEY=your_64char_vt_key_here
-
-# Pixabay — کلید API برای جستجوی عکس (اختیاری - دریافت از pixabay.com/api/docs/)
-export PIXABAY_KEY=your_pixabay_key
-
-# Unpaywall — ایمیل برای دانلود مقاله علمی (اختیاری - ثبت‌نام در unpaywall.org)
-export UNPAYWALL_EMAIL=your_email@example.com
-
-# محدودیت دانلود هم‌زمان — چند دانلود سنگین (yt-dlp/ffmpeg) هم‌زمان مجاز باشد
-# پیش‌فرض ۶ — برای سرور قوی‌تر می‌توانید بیشتر کنید، برای VPS ضعیف کمتر
-export MAX_CONCURRENT_DOWNLOADS=6
-```
-
-### ۵. اجرا
-
-```bash
-python bale_bot.py
-```
-
-## 🚀 اجرا به‌عنوان سرویس (systemd)
+نمونهٔ `/etc/systemd/system/bale-bot.service`؛ کاربر و مسیرها را مطابق سرور تغییر دهید:
 
 ```ini
 [Unit]
-Description=بله قربان Bot
-After=network.target
+Description=Baleghorbanbot
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=YOUR_USER
-WorkingDirectory=/path/to/bot
-EnvironmentFile=/path/to/bot/.env
-ExecStart=/usr/bin/python3 /path/to/bot/bale_bot.py
-Restart=always
+WorkingDirectory=/path/to/baleghorbanbot
+EnvironmentFile=/path/to/baleghorbanbot/.env
+ExecStart=/path/to/baleghorbanbot/.venv/bin/python /path/to/baleghorbanbot/bale_bot.py
+Restart=on-failure
 RestartSec=10
-StandardOutput=append:/var/log/bale_bot.log
-StandardError=append:/var/log/bale_bot.log
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-فایل `.env`:
 ```bash
-BALE_TOKEN=your_token_here
-TELEGRAM_TOKEN=optional_telegram_token
-YOUTUBE_COOKIES_FILE=/path/yt_cookies.txt
-GITHUB_TOKEN=optional_token
-# WARP_PROXY=socks5://127.0.0.1:40000
-# COBALT_URL=http://localhost:9000
-# TG_API_ID=12345678
-# TG_API_HASH=abcdef1234567890abcdef1234567890
-# TWITTER_COOKIES_FILE=/path/twitter_cookies.txt
-# INSTAGRAM_USER=your_username
-# INSTAGRAM_PASS=your_password
-# INSTAGRAM_COOKIES_FILE=/path/instagram_cookies.txt
-# SPOTIFY_CLIENT_ID=your_client_id
-# SPOTIFY_CLIENT_SECRET=your_client_secret
-# ZLIB_EMAIL=your@email.com
-# ZLIB_PASSWORD=your_password
-# VIRUSTOTAL_API_KEY=your_64char_vt_key_here
-# PIXABAY_KEY=your_pixabay_key
-# UNPAYWALL_EMAIL=your_email@example.com
-# MAX_CONCURRENT_DOWNLOADS=6
+sudo systemctl daemon-reload
+sudo systemctl enable --now bale-bot
+sudo journalctl -u bale-bot -f
 ```
 
-```bash
-sudo systemctl enable bale-bot
-sudo systemctl start bale-bot
-sudo systemctl status bale-bot
-sudo journalctl -u bale-bot -f   # مشاهده لاگ
-```
+## 📋 دستورات
 
-## 📊 معماری فنی
+- `/start` — منوی اصلی.
+- `/help` — راهنما و محدودیت ابزارها.
+- `/stats` — آمار کاربری.
+- `/ocr` — استخراج متن با پاسخ به عکس.
+- `/convert` — ورود به تغییر قالب یا تبدیل فایل مورد پاسخ.
+- `/cancel` — پاک‌کردن وضعیت گفت‌وگو؛ **توقف قطعی دانلود یا FFmpeg فعال را تضمین نمی‌کند**.
 
-- **دو-پلتفرمه (Bale + Telegram)** — هر پلتفرم poll loop مستقل خودش را دارد؛ هر آپدیت با پلتفرم واقعی‌اش به یک `ThreadPoolExecutor` مشترک (۴۰ worker) سپرده می‌شود
-- **ایزولاسیون کامل state بین پلتفرم‌ها** — `user_state`/`user_stats` با کلید `platform:chat_id` ذخیره می‌شوند (نه فقط `chat_id`)، تا اگر یک عدد chat ID مشترک بین بله و تلگرام باشد، وضعیت دو کاربر با هم قاطی نشود؛ Thread-های پس‌زمینه (مثل دانلود موزیک) پلتفرم را قبل از start شدن capture می‌کنند تا به API اشتباه نفرستند
-- **محدودیت دانلود هم‌زمان** — یک semaphore سراسری (`MAX_CONCURRENT_DOWNLOADS`, پیش‌فرض ۶) تعداد دانلودهای سنگین (yt-dlp/ffmpeg) هم‌زمان را محدود می‌کند تا با ده‌ها کاربر همزمان، CPU سرور خفه نشود
-- **Long Polling** — بدون نیاز به IP ثابت یا دامنه
-- **result_cache** — نتایج جستجو ذخیره موقت برای دکمه‌های callback
-- **url_cache** — ذخیره URL برای دکمه‌های site-view و download
-- **smart_send** — ارسال هوشمند با chunking 20MB (Bale) / 48MB (Telegram)
-- **YouTube ۴ مرحله** — تامبنیل+توضیحات (پیام جدا برای توضیحات طولانی‌تر از حد caption) → انتخاب کیفیت (با حجم فایل) → انتخاب زیرنویس → دانلود
-- **YouTube ۳ استراتژی** — probe+download (5 client) → safety-net → Cobalt fallback
-- **youtube_get_formats** — probe واقعی فرمت‌های موجود برای نمایش picker دقیق با حجم فایل
-- **Instagram ۳ استراتژی** — instaloader → yt-dlp (با کوکی) → Cobalt API
-- **TikTok** — بعد از دانلود، وجود stream صدا با ffprobe بررسی می‌شود؛ اگر فرمت انتخابی صامت باشد، استراتژی بعدی امتحان می‌شود (مشکل رایج در کلیپ‌های طولانی)
-- **APK ۴ استراتژی** — APKPure → APKMirror → Aptoide → F-Droid
-- **کتاب/مقاله** — libgen.li/lc → **Anna's Archive** (جدید) → Open Library، با دانلود md5 مشترک بین منابع؛ پارس دفاعی JSON برای جلوگیری از کرش‌های نامنظم API
-- **Sci-Hub/Unpaywall** — بازیابی خودکار در صورت پاسخ خالی (retry با هدر ساده‌تر) + ایمیل fallback معتبر برای خطای ۴۲۲ Unpaywall
-- **Image Search** — Bing با پارس واقعی نتایج (به‌جای regex حدسی که گاهی همان یک عکس اشتباه را برمی‌گرداند)، دانلود با هدر/Referer صحیح و بررسی content-type، Wikimedia با رتبه‌بندی امتیاز، Pinterest با fallback چندلایه
-- **همه پیام‌ها فارسی** — تمام متن‌های ارسالی به کاربر به زبان فارسی است
+بقیهٔ ابزارها از منوها و دکمه‌ها در دسترس‌اند.
 
-## 📋 دستورات ربات
+## 🗃 ساختار پروژه
 
-| دستور | عملکرد |
-|------|--------|
-| `/start` | شروع و نمایش منوی اصلی |
-| `/help` | نمایش راهنمای کامل |
-| `/stats` | نمایش آمار کاربری |
-| `/cancel` | لغو عملیات جاری |
-| `/ocr` | ریپلای روی عکس → استخراج متن |
-
-## 📁 ساختار فایل
-
-```
+```text
 baleghorbanbot/
-├── bale_bot.py        ← فایل اصلی ربات (۱۲۷۰۰+ خط)
-├── requirements.txt   ← کتابخانه‌های مورد نیاز + مستندات پکیج‌های سیستمی
-├── env.example        ← نمونه تنظیمات محیطی
-├── README.md          ← این فایل
-├── bale_bot.log       ← فایل لاگ (ایجاد می‌شود)
-└── tg_session.session ← نشست Telethon (ایجاد می‌شود)
+├── bale_bot.py              # منطق اصلی، پیام‌ها و ابزارهای ربات
+├── storage.py               # ذخیره‌سازی SQLite و پشتیبانی Redis
+├── config.py                # خواندن و اعتبارسنجی تنظیمات
+├── logging_config.py        # ثبت رویداد برای ماژول‌های پشتیبان
+├── requirements.txt         # وابستگی‌های اجرا
+├── requirements-dev.txt     # ابزار تست؛ فعلاً pytest
+├── pytest.ini
+├── tests/                   # تست‌ها و بررسی‌های دستی
+├── scripts/
+│   └── backup_database.py   # ابزار نگهداری؛ بخشی از اجرای ربات نیست
+├── deploy/                  # واحدهای اختیاری پشتیبان‌گیری systemd
+├── env.example
+├── .gitignore
+└── README.md
 ```
 
-> **© ۱۴۰۵ — بله قربان**  
-> ربات با ♥ در ایران توسعه یافته و حریم خصوصی کاربران را به شدت محترم می‌دارد. هیچ داده‌ای از کاربران ذخیره نمی‌شود.
+فایل‌های قدیمی `router.py`، `health.py` و `__init__.py` جزو نیازهای راه‌اندازی مستقیم مونولیت نیستند. اگر آن‌ها را از نسخهٔ انتشار حذف می‌کنید، تست‌های وابسته را نیز متناسب اصلاح کنید؛ عبور مجموعه‌تست قبلی تأیید نسخهٔ کاهش‌یافته نیست.
+
+## 🧪 بررسی و تست
+
+روی نسخهٔ کامل سورس با تست‌های متناظر:
+
+```bash
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q -W error::pytest.PytestUnhandledThreadExceptionWarning
+.venv/bin/python tests/menu_check.py
+.venv/bin/python -m py_compile bale_bot.py storage.py config.py logging_config.py
+```
+
+تست‌ها شامل تبدیل‌های کوچک واقعی و بررسی‌های حمل‌ونقل شبیه‌سازی‌شده، مالکیت فایل، انقضا، تحویل، پاک‌سازی، ذخیره‌سازی و منوها هستند. اسکریپت‌های بررسی زنده در `tests/` به شبکه و تنظیمات مناسب نیاز دارند. موفقیت تست خودکار جای آزمون ارسال واقعی در **هر دو پیام‌رسان** را نمی‌گیرد.
+
+## 💾 پشتیبان‌گیری
+
+برای نسخهٔ سازگار SQLite، به‌جای کپی سادهٔ فایل در حال استفاده:
+
+```bash
+.venv/bin/python scripts/backup_database.py bot_data.sqlite3 /secure/backups/baleghorbanbot --keep 14
+```
+
+اسکریپت از SQLite Backup API استفاده می‌کند، یکپارچگی نسخه را می‌سنجد و پس از ذخیرهٔ موفق، نسخه‌های قدیمی را مطابق `--keep` پاک می‌کند. مسیر مبدأ را مطابق `DB_PATH` تنظیم کنید. برای بازیابی، ابتدا ربات را متوقف کنید و فایل‌های WAL/SHM را نیز با توجه به وضعیت پایگاه داده مدیریت کنید.
+
+واحدهای `deploy/baleghorbanbot-backup.service` و `.timer` اختیاری و شامل مسیرهای مخصوص سرور هستند؛ پیش از نصب، کاربر، مسیر پروژه، پایگاه داده و مقصد نسخه‌ها را بازبینی کنید. اضافه‌کردن آن‌ها به مخزن زمان‌بندی را خودکار فعال نمی‌کند. نسخهٔ روی همان سرور جای پشتیبان خارج از سرور را نمی‌گیرد.
+
+## 🔒 داده و حریم خصوصی
+
+**این ربات بدون ذخیره‌سازی داده نیست.** شناسه‌های کاربر/گفت‌وگو و اطلاعات لازم برای وضعیت، آمار، سطح دسترسی، تاریخچه، کتابخانه و اشتراک‌ها می‌توانند در پایگاه داده ذخیره شوند. نتایج جستجو و مرجع فایل‌ها نیز ممکن است به‌طور موقت نگهداری شوند. سرویس‌های بیرونی درخواست‌های مرتبط با ابزار خود را دریافت می‌کنند.
+
+دسترسی به پایگاه داده، لاگ، کوکی، نشست و نسخه‌های پشتیبان را محدود کنید. فایل‌های موقت رسانه در مسیرهای پردازش پاک‌سازی می‌شوند؛ این به معنی تضمین حذف در صورت خرابی سیستم یا عدم وجود هیچ دادهٔ ماندگار نیست.
+
+هرگز این موارد را در Git یا فایل انتشار عمومی قرار ندهید:
+
+```text
+.env، توکن‌ها، رمزها و کوکی‌ها
+*.session و فایل‌های وابسته
+پایگاه داده و فایل‌های WAL/SHM
+نسخه‌های پشتیبان و لاگ‌ها
+.venv/ و کش‌ها
+فایل‌های دانلودشده یا خروجی خصوصی کاربران
+```
+
+فقط نمونه‌های فاقد اطلاعات واقعی منتشر کنید؛ `.gitignore` به‌تنهایی رازهایی را که قبلاً commit شده‌اند از تاریخچه پاک نمی‌کند.
